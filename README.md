@@ -154,8 +154,8 @@ Archive/Delete
 
 ## Related Projects
 
-- [Alopex DB](https://github.com/alopex-rs/alopex) - Vector-enabled embedded database
-- [Alopex Chirps](https://github.com/alopex-rs/chirps) - Cluster mesh networking (QUIC + SWIM + Raft)
+- [Alopex DB](https://github.com/alopex-db/alopex) - Vector-enabled embedded database
+- [Alopex Chirps](https://github.com/alopex-db/alopex-chirps) - Cluster mesh networking (QUIC + SWIM + Raft)
 
 ## License
 
