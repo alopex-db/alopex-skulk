@@ -130,6 +130,26 @@ pub struct TimeSeriesMemTable {
 }
 
 impl TimeSeriesMemTable {
+    /// Returns the elapsed time since this MemTable was created.
+    /// Useful for monitoring and debugging.
+    pub fn age(&self) -> Duration {
+        self.created_at.elapsed()
+    }
+
+    /// Creates a MemTable with a custom creation time for testing purposes.
+    #[cfg(test)]
+    pub(crate) fn with_created_at(partition: TimePartition, created_at: Instant) -> Self {
+        Self {
+            partition,
+            series_data: HashMap::new(),
+            series_meta: HashMap::new(),
+            stats: MemTableStats::new(),
+            created_at,
+        }
+    }
+}
+
+impl TimeSeriesMemTable {
     /// Creates a new TimeSeriesMemTable for the given partition.
     ///
     /// # Arguments
@@ -473,5 +493,124 @@ mod tests {
         assert!(data.is_some());
         assert_eq!(data.unwrap().len(), 1);
         assert_eq!(data.unwrap().get(&1000), Some(&0.75));
+    }
+
+    #[test]
+    fn test_should_flush_age_threshold() {
+        // Create a memtable with a creation time in the past (beyond age threshold)
+        let old_created_at = Instant::now() - FLUSH_AGE_THRESHOLD - Duration::from_secs(1);
+        let memtable = TimeSeriesMemTable::with_created_at(make_partition(), old_created_at);
+
+        // Should flush due to age, even with no data
+        assert!(memtable.should_flush());
+
+        // Create a fresh memtable
+        let fresh_memtable = TimeSeriesMemTable::new(make_partition());
+
+        // Fresh memtable should not flush (neither size nor age threshold exceeded)
+        assert!(!fresh_memtable.should_flush());
+    }
+
+    #[test]
+    fn test_age_method() {
+        let memtable = TimeSeriesMemTable::new(make_partition());
+
+        // Age should be very small (just created)
+        let age = memtable.age();
+        assert!(age < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_get_series_meta() {
+        let mut memtable = TimeSeriesMemTable::new(make_partition());
+
+        let labels = vec![("host".to_string(), "server1".to_string())];
+        let point = DataPoint::new("cpu.usage", labels.clone(), 1000, 0.75);
+        memtable.insert(&point).unwrap();
+
+        let (series_id, _) = memtable.get_or_create_series("cpu.usage", &labels);
+
+        let meta = memtable.get_series_meta(series_id);
+        assert!(meta.is_some());
+        let meta = meta.unwrap();
+        assert_eq!(meta.metric_name, "cpu.usage");
+        assert_eq!(meta.labels.len(), 1);
+        assert_eq!(meta.labels[0], ("host".to_string(), "server1".to_string()));
+    }
+
+    #[test]
+    fn test_series_ids_iterator() {
+        let mut memtable = TimeSeriesMemTable::new(make_partition());
+
+        // Insert points for 3 different series
+        let points = vec![
+            DataPoint::new("metric1", vec![], 100, 1.0),
+            DataPoint::new("metric2", vec![], 200, 2.0),
+            DataPoint::new("metric3", vec![], 300, 3.0),
+        ];
+        memtable.insert_batch(&points).unwrap();
+
+        let series_ids: Vec<_> = memtable.series_ids().collect();
+        assert_eq!(series_ids.len(), 3);
+    }
+
+    #[test]
+    fn test_series_count_and_point_count() {
+        let mut memtable = TimeSeriesMemTable::new(make_partition());
+
+        assert_eq!(memtable.series_count(), 0);
+        assert_eq!(memtable.point_count(), 0);
+
+        // Insert multiple points for same series
+        let points = vec![
+            DataPoint::new("metric", vec![], 100, 1.0),
+            DataPoint::new("metric", vec![], 200, 2.0),
+        ];
+        memtable.insert_batch(&points).unwrap();
+
+        assert_eq!(memtable.series_count(), 1);
+        assert_eq!(memtable.point_count(), 2);
+
+        // Insert point for different series
+        let point = DataPoint::new("other_metric", vec![], 300, 3.0);
+        memtable.insert(&point).unwrap();
+
+        assert_eq!(memtable.series_count(), 2);
+        assert_eq!(memtable.point_count(), 3);
+    }
+
+    #[test]
+    fn test_scan_empty_range() {
+        let mut memtable = TimeSeriesMemTable::new(make_partition());
+
+        let points = vec![
+            DataPoint::new("metric", vec![], 100, 1.0),
+            DataPoint::new("metric", vec![], 200, 2.0),
+        ];
+        memtable.insert_batch(&points).unwrap();
+
+        // Scan a range that contains no points
+        let range = TimeRange::new(500, 600);
+        let scanned: Vec<_> = memtable.scan(range).collect();
+        assert!(scanned.is_empty());
+    }
+
+    #[test]
+    fn test_overwrite_existing_point() {
+        let mut memtable = TimeSeriesMemTable::new(make_partition());
+
+        let point1 = DataPoint::new("metric", vec![], 100, 1.0);
+        memtable.insert(&point1).unwrap();
+
+        // Insert another point with same timestamp (should overwrite)
+        let point2 = DataPoint::new("metric", vec![], 100, 2.0);
+        memtable.insert(&point2).unwrap();
+
+        // Point count increases (we don't deduplicate in stats for performance)
+        // but the BTreeMap will have only one entry for that timestamp
+        let (series_id, _) = memtable.get_or_create_series("metric", &[]);
+        let data = memtable.get_series(series_id).unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data.get(&100), Some(&2.0)); // Latest value wins
     }
 }
