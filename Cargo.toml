@@ -1,0 +1,44 @@
+[workspace]
+members = ["crates/skulk"]
+resolver = "2"
+
+[workspace.dependencies]
+# Alopex core
+alopex-core = { path = "../alopex/crates/alopex-core" }
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Compression and checksums
+crc32fast = "1.4"
+bitvec = "1.0"
+bytes = "1.5"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Testing
+criterion = "0.5"
+rand = "0.8"
+proptest = "1.4"
+tempfile = "3.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+
+[profile.test]
+opt-level = 1

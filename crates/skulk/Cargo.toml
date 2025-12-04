@@ -1,0 +1,42 @@
+[package]
+name = "skulk"
+version = "0.1.0"
+edition = "2021"
+description = "Alopex Skulk - Time Series Storage Engine"
+license = "Apache-2.0 OR MIT"
+
+[features]
+default = []
+
+[dependencies]
+# Alopex core for WAL and MemTable traits
+alopex-core = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Compression and checksums
+crc32fast = { workspace = true }
+bitvec = { workspace = true }
+bytes = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+criterion = { workspace = true }
+rand = { workspace = true }
+proptest = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[bench]]
+name = "tsm_bench"
+harness = false
