@@ -25,6 +25,7 @@ thiserror = { workspace = true }
 crc32fast = { workspace = true }
 bitvec = { workspace = true }
 bytes = { workspace = true }
+xxhash-rust = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

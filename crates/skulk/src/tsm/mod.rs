@@ -9,9 +9,9 @@
 //! - [`CompressedBlock`]: Gorilla-compressed data block
 //! - [`TsmWriter`] / [`TsmReader`]: File I/O for TSM format
 
+pub mod file;
 pub mod gorilla;
 pub mod memtable;
-// pub mod file; // TODO: Phase 4
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -128,6 +128,12 @@ impl TimeRange {
 }
 
 // Re-export main types from submodules
+pub use file::{
+    BloomFilter, CompressionType, SectionFlags, SeriesIndex, SeriesIndexEntry,
+    TimestampEncoding, TsmDataBlock, TsmFileHandle, TsmFooter, TsmHeader, TsmReader,
+    TsmScanIterator, TsmWriter, ValueEncoding, FOOTER_SIZE, HEADER_SIZE, TSM_MAGIC,
+    TSM_MAGIC_REVERSE, TSM_VERSION,
+};
 pub use gorilla::CompressedBlock;
 pub use memtable::TimeSeriesMemTable;
 

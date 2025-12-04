@@ -5,8 +5,10 @@
 
 use crate::error::{Result, TsmError};
 use crate::tsm::{DataPoint, SeriesId, SeriesMeta, TimePartition, TimeRange, Timestamp};
+use crate::tsm::{TsmFileHandle, TsmWriter};
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -318,11 +320,56 @@ impl TimeSeriesMemTable {
     pub fn point_count(&self) -> u64 {
         self.stats.point_count()
     }
+
+    /// Flushes the MemTable contents to a TSM file.
+    ///
+    /// This creates a TSM file at the given path containing all series data
+    /// from this MemTable, compressed using Gorilla compression.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The path where the TSM file should be written
+    ///
+    /// # Returns
+    ///
+    /// A `TsmFileHandle` containing the header and footer of the written file,
+    /// which can be used for subsequent reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The file cannot be created
+    /// - Any I/O operation fails during writing
+    pub fn flush(&self, path: &Path) -> Result<TsmFileHandle> {
+        let mut writer = TsmWriter::new(path)?;
+
+        // Write each series with its metadata and data points
+        for (&series_id, data) in &self.series_data {
+            if data.is_empty() {
+                continue;
+            }
+
+            // Get the metadata for this series
+            let meta = self
+                .series_meta
+                .get(&series_id)
+                .cloned()
+                .unwrap_or_else(|| SeriesMeta::new("unknown", vec![]));
+
+            // Write the series
+            writer.write_series(series_id, &meta, data)?;
+        }
+
+        // Finalize and return the handle
+        writer.finish()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tsm::TsmReader;
+    use tempfile::TempDir;
 
     fn make_partition() -> TimePartition {
         TimePartition::new(0, Duration::from_secs(3600)) // 1 hour
@@ -612,5 +659,133 @@ mod tests {
         let data = memtable.get_series(series_id).unwrap();
         assert_eq!(data.len(), 1);
         assert_eq!(data.get(&100), Some(&2.0)); // Latest value wins
+    }
+
+    #[test]
+    fn test_flush_to_tsm_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.skulk");
+
+        let mut memtable = TimeSeriesMemTable::new(make_partition());
+
+        // Insert data for multiple series
+        let points = vec![
+            DataPoint::new(
+                "cpu.usage",
+                vec![("host".to_string(), "server1".to_string())],
+                1000,
+                0.75,
+            ),
+            DataPoint::new(
+                "cpu.usage",
+                vec![("host".to_string(), "server1".to_string())],
+                2000,
+                0.80,
+            ),
+            DataPoint::new(
+                "cpu.usage",
+                vec![("host".to_string(), "server2".to_string())],
+                1500,
+                0.65,
+            ),
+            DataPoint::new("memory.free", vec![], 1000, 4096.0),
+            DataPoint::new("memory.free", vec![], 2000, 3500.0),
+        ];
+
+        memtable.insert_batch(&points).unwrap();
+
+        assert_eq!(memtable.series_count(), 3);
+        assert_eq!(memtable.point_count(), 5);
+
+        // Flush to TSM file
+        let handle = memtable.flush(&file_path).unwrap();
+
+        // Verify the handle
+        assert_eq!(handle.header.series_count, 3);
+        assert_eq!(handle.footer.total_point_count, 5);
+
+        // Verify we can read the file back
+        let reader = TsmReader::open(&file_path).unwrap();
+        assert_eq!(reader.header().series_count, 3);
+
+        // Verify file CRC
+        assert!(reader.verify_file_checksum().unwrap());
+    }
+
+    #[test]
+    fn test_flush_empty_memtable() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("empty.skulk");
+
+        let memtable = TimeSeriesMemTable::new(make_partition());
+
+        // Flush empty memtable
+        let handle = memtable.flush(&file_path).unwrap();
+
+        // Should create a valid file with no series
+        assert_eq!(handle.header.series_count, 0);
+        assert_eq!(handle.footer.total_point_count, 0);
+    }
+
+    #[test]
+    fn test_flush_and_read_back_data() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("roundtrip.skulk");
+
+        let mut memtable = TimeSeriesMemTable::new(make_partition());
+
+        // Insert known data
+        let labels = vec![("host".to_string(), "server1".to_string())];
+        for i in 0..100 {
+            let point = DataPoint::new("cpu.usage", labels.clone(), i * 1000, (i as f64) * 0.01);
+            memtable.insert(&point).unwrap();
+        }
+
+        // Get the series ID for later lookup
+        let (series_id, _) = memtable.get_or_create_series("cpu.usage", &labels);
+
+        // Flush
+        memtable.flush(&file_path).unwrap();
+
+        // Read back
+        let reader = TsmReader::open(&file_path).unwrap();
+        let read_points = reader.read_series(series_id).unwrap().unwrap();
+
+        // Verify all points match
+        assert_eq!(read_points.len(), 100);
+        for (i, (ts, val)) in read_points.iter().enumerate() {
+            assert_eq!(*ts, (i as i64) * 1000);
+            assert!((val - (i as f64) * 0.01).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn test_flush_preserves_series_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("meta.skulk");
+
+        let mut memtable = TimeSeriesMemTable::new(make_partition());
+
+        let labels = vec![
+            ("host".to_string(), "server1".to_string()),
+            ("env".to_string(), "production".to_string()),
+        ];
+        let point = DataPoint::new("cpu.usage", labels.clone(), 1000, 0.75);
+        memtable.insert(&point).unwrap();
+
+        // Get series ID
+        let (series_id, _) = memtable.get_or_create_series("cpu.usage", &labels);
+
+        // Flush
+        let handle = memtable.flush(&file_path).unwrap();
+
+        // Verify metadata was written (series count)
+        assert_eq!(handle.header.series_count, 1);
+
+        // Read back and verify data exists
+        let reader = TsmReader::open(&file_path).unwrap();
+        let read_points = reader.read_series(series_id).unwrap();
+        assert!(read_points.is_some());
+        assert_eq!(read_points.unwrap().len(), 1);
     }
 }
