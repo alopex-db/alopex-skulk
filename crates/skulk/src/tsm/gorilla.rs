@@ -472,66 +472,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_timestamp_encoder_zero_delta() {
-        let mut encoder = TimestampEncoder::new();
-        let mut output = BitVec::<u8, Msb0>::new();
-
-        // Regular interval timestamps (delta-of-delta = 0)
-        encoder.encode(1000, &mut output);
-        encoder.encode(1010, &mut output); // delta = 10
-        encoder.encode(1020, &mut output); // delta = 10, dod = 0
-
-        // After first 64-bit raw + first delta (varies), third should be 1 bit
-        // The third encoding should be '0' (1 bit) for zero delta-of-delta
-    }
-
-    #[test]
-    fn test_timestamp_encoder_small_delta() {
-        let mut encoder = TimestampEncoder::new();
-        let mut output = BitVec::<u8, Msb0>::new();
-
-        encoder.encode(1000, &mut output);
-        encoder.encode(1010, &mut output); // delta = 10
-        encoder.encode(1025, &mut output); // delta = 15, dod = 5 (in [-63, 64])
-    }
-
-    #[test]
-    fn test_timestamp_encoder_large_delta() {
-        let mut encoder = TimestampEncoder::new();
-        let mut output = BitVec::<u8, Msb0>::new();
-
-        encoder.encode(1000, &mut output);
-        encoder.encode(1010, &mut output); // delta = 10
-        encoder.encode(10000, &mut output); // delta = 8990, dod = 8980 (large)
-    }
-
-    #[test]
-    fn test_value_encoder_identical() {
-        let mut encoder = ValueEncoder::new();
-        let mut output = BitVec::<u8, Msb0>::new();
-
-        encoder.encode(1.0, &mut output);
-        let initial_len = output.len();
-
-        encoder.encode(1.0, &mut output);
-        // Identical value should add only 1 bit
-        assert_eq!(output.len(), initial_len + 1);
-    }
-
-    #[test]
-    fn test_value_encoder_varying() {
-        let mut encoder = ValueEncoder::new();
-        let mut output = BitVec::<u8, Msb0>::new();
-
-        encoder.encode(1.0, &mut output);
-        encoder.encode(1.1, &mut output);
-        encoder.encode(1.2, &mut output);
-
-        // Should have encoded 3 values
-        assert!(output.len() > 64); // At least first value (64 bits) + some more
-    }
-
-    #[test]
     fn test_compressed_block_roundtrip() {
         let points = vec![
             (1000_i64, 1.0_f64),
@@ -607,5 +547,343 @@ mod tests {
         assert_eq!(decompressed.len(), 1);
         assert_eq!(decompressed[0].0, points[0].0);
         assert!((decompressed[0].1 - points[0].1).abs() < f64::EPSILON);
+    }
+
+    // =====================================================
+    // Phase 2: Additional unit tests for Gorilla compression
+    // =====================================================
+
+    #[test]
+    fn test_timestamp_encoder_zero_delta() {
+        // Test case where delta-of-delta is 0 (regular intervals)
+        // Should encode as single '0' bit for each subsequent timestamp
+        let timestamps = vec![1000_i64, 1010, 1020, 1030, 1040];
+        // Interval is constant 10, so delta-of-delta = 0 after first two
+
+        let mut output = BitVec::<u8, Msb0>::new();
+        let mut encoder = TimestampEncoder::new();
+        for &ts in &timestamps {
+            encoder.encode(ts, &mut output);
+        }
+
+        let mut decoder = TimestampDecoder::new(&output);
+        for &expected in &timestamps {
+            let decoded = decoder.decode_next().expect("should decode");
+            assert_eq!(expected, decoded);
+        }
+
+        // Verify compression efficiency: with zero delta-of-delta,
+        // after first two timestamps, each should use only 1 bit
+        // First: 64 bits, Second: 64 bits (delta), Rest: 1 bit each
+        // Total expected: 64 + 64 + 3 = 131 bits (approximately)
+        assert!(output.len() < 150, "Zero delta should compress well");
+    }
+
+    #[test]
+    fn test_timestamp_encoder_small_delta() {
+        // Test case where delta-of-delta is in [-63, 64] range
+        // Should encode as '10' + 7 bits
+        let timestamps = vec![1000_i64, 1010, 1025, 1035, 1055];
+        // Deltas: 10, 15, 10, 20
+        // Delta-of-delta: 5, -5, 10 (all in [-63, 64])
+
+        let mut output = BitVec::<u8, Msb0>::new();
+        let mut encoder = TimestampEncoder::new();
+        for &ts in &timestamps {
+            encoder.encode(ts, &mut output);
+        }
+
+        let mut decoder = TimestampDecoder::new(&output);
+        for &expected in &timestamps {
+            let decoded = decoder.decode_next().expect("should decode");
+            assert_eq!(expected, decoded);
+        }
+    }
+
+    #[test]
+    fn test_timestamp_encoder_medium_delta() {
+        // Test case where delta-of-delta is in [-255, 256] range
+        // Should encode as '110' + 9 bits
+        let timestamps = vec![1000_i64, 1100, 1350, 1400];
+        // Deltas: 100, 250, 50
+        // Delta-of-delta: 150, -200 (in [-255, 256] range)
+
+        let mut output = BitVec::<u8, Msb0>::new();
+        let mut encoder = TimestampEncoder::new();
+        for &ts in &timestamps {
+            encoder.encode(ts, &mut output);
+        }
+
+        let mut decoder = TimestampDecoder::new(&output);
+        for &expected in &timestamps {
+            let decoded = decoder.decode_next().expect("should decode");
+            assert_eq!(expected, decoded);
+        }
+    }
+
+    #[test]
+    fn test_timestamp_encoder_large_delta() {
+        // Test case where delta-of-delta is in [-2047, 2048] range
+        // Should encode as '1110' + 12 bits
+        let timestamps = vec![1000_i64, 2000, 5000, 5500];
+        // Deltas: 1000, 3000, 500
+        // Delta-of-delta: 2000, -2500
+
+        let mut output = BitVec::<u8, Msb0>::new();
+        let mut encoder = TimestampEncoder::new();
+        for &ts in &timestamps {
+            encoder.encode(ts, &mut output);
+        }
+
+        let mut decoder = TimestampDecoder::new(&output);
+        for &expected in &timestamps {
+            let decoded = decoder.decode_next().expect("should decode");
+            assert_eq!(expected, decoded);
+        }
+    }
+
+    #[test]
+    fn test_timestamp_encoder_very_large_delta() {
+        // Test case where delta-of-delta exceeds [-2047, 2048]
+        // Should encode as '1111' + 32 bits
+        let timestamps = vec![0_i64, 1_000_000, 100_000_000, 100_001_000];
+        // Very irregular intervals
+
+        let mut output = BitVec::<u8, Msb0>::new();
+        let mut encoder = TimestampEncoder::new();
+        for &ts in &timestamps {
+            encoder.encode(ts, &mut output);
+        }
+
+        let mut decoder = TimestampDecoder::new(&output);
+        for &expected in &timestamps {
+            let decoded = decoder.decode_next().expect("should decode");
+            assert_eq!(expected, decoded);
+        }
+    }
+
+    #[test]
+    fn test_value_encoder_identical() {
+        // Test case where all values are identical
+        // XOR = 0, should encode as single '0' bit each
+        let values = vec![42.5_f64; 10];
+
+        let mut output = BitVec::<u8, Msb0>::new();
+        let mut encoder = ValueEncoder::new();
+        for &val in &values {
+            encoder.encode(val, &mut output);
+        }
+
+        let mut decoder = ValueDecoder::new(&output);
+        for &expected in &values {
+            let decoded = decoder.decode_next().expect("should decode");
+            assert!((expected - decoded).abs() < f64::EPSILON);
+        }
+
+        // First value: 64 bits, subsequent: 1 bit each
+        // Total: 64 + 9 = 73 bits
+        assert!(
+            output.len() < 80,
+            "Identical values should compress to ~73 bits"
+        );
+    }
+
+    #[test]
+    fn test_value_encoder_varying() {
+        // Test case with varying values
+        let values = vec![1.0_f64, 1.5, 2.0, 2.5, 3.0, 100.0, -50.0, 0.0];
+
+        let mut output = BitVec::<u8, Msb0>::new();
+        let mut encoder = ValueEncoder::new();
+        for &val in &values {
+            encoder.encode(val, &mut output);
+        }
+
+        let mut decoder = ValueDecoder::new(&output);
+        for &expected in &values {
+            let decoded = decoder.decode_next().expect("should decode");
+            assert!((expected - decoded).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn test_value_encoder_same_window_reuse() {
+        // Test that encoder reuses leading/trailing zeros window
+        // when XOR has similar bit patterns
+        let values = vec![1.0_f64, 1.0000001, 1.0000002, 1.0000003];
+        // Small differences should have similar XOR patterns
+
+        let mut output = BitVec::<u8, Msb0>::new();
+        let mut encoder = ValueEncoder::new();
+        for &val in &values {
+            encoder.encode(val, &mut output);
+        }
+
+        let mut decoder = ValueDecoder::new(&output);
+        for &expected in &values {
+            let decoded = decoder.decode_next().expect("should decode");
+            assert!((expected - decoded).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn test_edge_case_min_max_timestamps() {
+        // Test with a range of timestamps that have reasonable deltas
+        // The Gorilla algorithm uses 32-bit deltas, so we test within those bounds
+        // This tests various edge cases within the algorithm's design constraints
+        let base = 1_000_000_000_000i64; // 1 trillion nanos (~16 min from epoch)
+        let timestamps = vec![
+            base,
+            base + 1_000_000_000,                   // +1 second
+            base + 2_000_000_000,                   // +1 second (regular)
+            base + 2_000_000_001,                   // +1 nano (tiny delta)
+            base + 2_100_000_000,                   // +~100ms
+            base + 2_100_000_000 + i32::MAX as i64, // max positive i32 delta
+        ];
+
+        let mut output = BitVec::<u8, Msb0>::new();
+        let mut encoder = TimestampEncoder::new();
+        for &ts in &timestamps {
+            encoder.encode(ts, &mut output);
+        }
+
+        let mut decoder = TimestampDecoder::new(&output);
+        for &expected in &timestamps {
+            let decoded = decoder.decode_next().expect("should decode");
+            assert_eq!(expected, decoded);
+        }
+    }
+
+    #[test]
+    fn test_edge_case_special_floats() {
+        // Test special float values (excluding NaN which doesn't equal itself)
+        let values = vec![
+            0.0_f64,
+            -0.0,
+            f64::MIN,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            f64::EPSILON,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+
+        let mut output = BitVec::<u8, Msb0>::new();
+        let mut encoder = ValueEncoder::new();
+        for &val in &values {
+            encoder.encode(val, &mut output);
+        }
+
+        let mut decoder = ValueDecoder::new(&output);
+        for &expected in &values {
+            let decoded = decoder.decode_next().expect("should decode");
+            // Handle infinity comparison
+            if expected.is_infinite() {
+                assert_eq!(expected.is_sign_positive(), decoded.is_sign_positive());
+                assert!(decoded.is_infinite());
+            } else {
+                assert!(
+                    (expected - decoded).abs() < f64::EPSILON
+                        || (expected == 0.0 && decoded == 0.0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_compressed_block_large_dataset() {
+        // Test with larger dataset typical of time series
+        let count = 1000;
+        let start_ts = 1_000_000_000_i64;
+        let interval = 1_000_000_000_i64; // 1 second in nanos
+
+        let points: Vec<(i64, f64)> = (0..count)
+            .map(|i| {
+                let ts = start_ts + i as i64 * interval;
+                let value = 50.0 + (i as f64 * 0.1).sin() * 10.0;
+                (ts, value)
+            })
+            .collect();
+
+        let block = CompressedBlock::compress(&points);
+        assert_eq!(block.count, count);
+
+        let decompressed = block.decompress();
+        assert_eq!(decompressed.len(), count as usize);
+
+        for (original, decoded) in points.iter().zip(decompressed.iter()) {
+            assert_eq!(original.0, decoded.0);
+            assert!((original.1 - decoded.1).abs() < f64::EPSILON);
+        }
+
+        // Verify compression ratio
+        let raw_size = count as usize * std::mem::size_of::<(i64, f64)>();
+        let compressed_size = (block.timestamps.len() + block.values.len()).div_ceil(8);
+        let ratio = raw_size as f64 / compressed_size as f64;
+
+        // With varying values (sine wave), expect modest compression
+        // Regular intervals compress well, but varying values use more bits
+        assert!(
+            ratio > 1.5,
+            "Expected compression ratio >1.5:1, got {:.2}:1",
+            ratio
+        );
+    }
+
+    #[test]
+    fn test_compressed_block_irregular_intervals() {
+        // Test with irregular timestamp intervals
+        let points = vec![
+            (1000_i64, 1.0),
+            (1001, 1.1),
+            (1100, 2.0),
+            (5000, 3.0),
+            (5001, 3.1),
+            (10000, 4.0),
+        ];
+
+        let block = CompressedBlock::compress(&points);
+        let decompressed = block.decompress();
+
+        for (original, decoded) in points.iter().zip(decompressed.iter()) {
+            assert_eq!(original.0, decoded.0);
+            assert!((original.1 - decoded.1).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn test_negative_timestamps() {
+        // Test with negative timestamps (historical data)
+        let timestamps = vec![-1_000_000_000_i64, -999_999_000, -999_998_000, 0, 1000];
+
+        let mut output = BitVec::<u8, Msb0>::new();
+        let mut encoder = TimestampEncoder::new();
+        for &ts in &timestamps {
+            encoder.encode(ts, &mut output);
+        }
+
+        let mut decoder = TimestampDecoder::new(&output);
+        for &expected in &timestamps {
+            let decoded = decoder.decode_next().expect("should decode");
+            assert_eq!(expected, decoded);
+        }
+    }
+
+    #[test]
+    fn test_negative_values() {
+        // Test with negative float values
+        let values = vec![-100.0_f64, -50.0, -1.0, -0.5, 0.0, 0.5, 1.0, 50.0, 100.0];
+
+        let mut output = BitVec::<u8, Msb0>::new();
+        let mut encoder = ValueEncoder::new();
+        for &val in &values {
+            encoder.encode(val, &mut output);
+        }
+
+        let mut decoder = ValueDecoder::new(&output);
+        for &expected in &values {
+            let decoded = decoder.decode_next().expect("should decode");
+            assert!((expected - decoded).abs() < f64::EPSILON);
+        }
     }
 }
