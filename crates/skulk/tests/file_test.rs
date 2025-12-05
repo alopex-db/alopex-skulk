@@ -1,6 +1,6 @@
 //! Integration tests for TSM file format.
 
-use skulk::tsm::{CompressionType, SeriesMeta, SectionFlags, TimeRange, TsmReader, TsmWriter};
+use skulk::tsm::{CompressionType, SectionFlags, SeriesMeta, TimeRange, TsmReader, TsmWriter};
 use std::collections::BTreeMap;
 use tempfile::TempDir;
 
@@ -26,7 +26,10 @@ fn test_write_read_roundtrip() {
     let file_path = temp_dir.path().join("roundtrip.skulk");
 
     let series_id = 1u64;
-    let meta = SeriesMeta::new("cpu.usage", vec![("host".to_string(), "server1".to_string())]);
+    let meta = SeriesMeta::new(
+        "cpu.usage",
+        vec![("host".to_string(), "server1".to_string())],
+    );
     let points = generate_points(1_000_000_000, 1_000_000_000, 3600, 50.0); // 1 hour of data at 1s interval
 
     // Write
@@ -333,10 +336,7 @@ fn test_various_data_patterns() {
     // Test with various data patterns
     let patterns: Vec<(&str, BTreeMap<i64, f64>)> = vec![
         // Constant values
-        (
-            "constant",
-            (0..100).map(|i| (i * 1000, 42.0)).collect(),
-        ),
+        ("constant", (0..100).map(|i| (i * 1000, 42.0)).collect()),
         // Monotonically increasing
         (
             "increasing",
@@ -359,16 +359,12 @@ fn test_various_data_patterns() {
         // Very small values
         (
             "small",
-            (0..100)
-                .map(|i| (i * 1000, (i as f64) * 1e-10))
-                .collect(),
+            (0..100).map(|i| (i * 1000, (i as f64) * 1e-10)).collect(),
         ),
         // Very large values
         (
             "large",
-            (0..100)
-                .map(|i| (i * 1000, (i as f64) * 1e10))
-                .collect(),
+            (0..100).map(|i| (i * 1000, (i as f64) * 1e10)).collect(),
         ),
     ];
 
@@ -392,9 +388,7 @@ fn test_various_data_patterns() {
             let read_points = reader.read_series(i as u64 + 1).unwrap().unwrap();
             assert_eq!(read_points.len(), original_points.len());
 
-            for ((ts, val), (orig_ts, orig_val)) in
-                read_points.iter().zip(original_points.iter())
-            {
+            for ((ts, val), (orig_ts, orig_val)) in read_points.iter().zip(original_points.iter()) {
                 assert_eq!(*ts, *orig_ts);
                 // Use relative comparison for floating point
                 if orig_val.abs() > f64::EPSILON {

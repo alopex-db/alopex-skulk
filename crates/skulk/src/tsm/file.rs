@@ -575,8 +575,9 @@ impl SeriesIndexEntry {
         let metric_len = u16::from_le_bytes(buf2) as usize;
         let mut metric_bytes = vec![0u8; metric_len];
         reader.read_exact(&mut metric_bytes)?;
-        let metric_name = String::from_utf8(metric_bytes)
-            .map_err(|e| TsmError::DecompressionError(format!("Invalid UTF-8 in metric name: {}", e)))?;
+        let metric_name = String::from_utf8(metric_bytes).map_err(|e| {
+            TsmError::DecompressionError(format!("Invalid UTF-8 in metric name: {}", e))
+        })?;
 
         // Labels (count + entries)
         reader.read_exact(&mut buf2)?;
@@ -588,16 +589,18 @@ impl SeriesIndexEntry {
             let key_len = u16::from_le_bytes(buf2) as usize;
             let mut key_bytes = vec![0u8; key_len];
             reader.read_exact(&mut key_bytes)?;
-            let key = String::from_utf8(key_bytes)
-                .map_err(|e| TsmError::DecompressionError(format!("Invalid UTF-8 in label key: {}", e)))?;
+            let key = String::from_utf8(key_bytes).map_err(|e| {
+                TsmError::DecompressionError(format!("Invalid UTF-8 in label key: {}", e))
+            })?;
 
             // Value
             reader.read_exact(&mut buf2)?;
             let value_len = u16::from_le_bytes(buf2) as usize;
             let mut value_bytes = vec![0u8; value_len];
             reader.read_exact(&mut value_bytes)?;
-            let value = String::from_utf8(value_bytes)
-                .map_err(|e| TsmError::DecompressionError(format!("Invalid UTF-8 in label value: {}", e)))?;
+            let value = String::from_utf8(value_bytes).map_err(|e| {
+                TsmError::DecompressionError(format!("Invalid UTF-8 in label value: {}", e))
+            })?;
 
             labels.push((key, value));
         }
@@ -1026,8 +1029,8 @@ impl TsmDataBlock {
 
         // Value encoding (1 byte)
         reader.read_exact(&mut buf1)?;
-        let val_encoding = ValueEncoding::from_u8(buf1[0])
-            .ok_or(TsmError::UnsupportedVersion(buf1[0] as u16))?;
+        let val_encoding =
+            ValueEncoding::from_u8(buf1[0]).ok_or(TsmError::UnsupportedVersion(buf1[0] as u16))?;
 
         // Timestamp data size (4 bytes)
         reader.read_exact(&mut buf4)?;
@@ -1220,28 +1223,32 @@ impl TsmWriter {
         self.total_point_count += point_count as u64;
 
         // Compress the data based on compression type
-        let (ts_encoding, val_encoding, ts_data, val_data) = if self.compression
-            == CompressionType::Gorilla
-        {
-            let compressed = CompressedBlock::compress(&point_vec);
-            let ts_bytes = compressed.timestamps.as_raw_slice().to_vec();
-            let val_bytes = compressed.values.as_raw_slice().to_vec();
-            (
-                TimestampEncoding::DeltaOfDelta,
-                ValueEncoding::GorillaXor,
-                ts_bytes,
-                val_bytes,
-            )
-        } else {
-            // Raw encoding: write timestamps and values separately
-            let mut ts_data = Vec::with_capacity(point_vec.len() * 8);
-            let mut val_data = Vec::with_capacity(point_vec.len() * 8);
-            for (ts, val) in &point_vec {
-                ts_data.extend_from_slice(&ts.to_le_bytes());
-                val_data.extend_from_slice(&val.to_le_bytes());
-            }
-            (TimestampEncoding::Raw, ValueEncoding::Raw, ts_data, val_data)
-        };
+        let (ts_encoding, val_encoding, ts_data, val_data) =
+            if self.compression == CompressionType::Gorilla {
+                let compressed = CompressedBlock::compress(&point_vec);
+                let ts_bytes = compressed.timestamps.as_raw_slice().to_vec();
+                let val_bytes = compressed.values.as_raw_slice().to_vec();
+                (
+                    TimestampEncoding::DeltaOfDelta,
+                    ValueEncoding::GorillaXor,
+                    ts_bytes,
+                    val_bytes,
+                )
+            } else {
+                // Raw encoding: write timestamps and values separately
+                let mut ts_data = Vec::with_capacity(point_vec.len() * 8);
+                let mut val_data = Vec::with_capacity(point_vec.len() * 8);
+                for (ts, val) in &point_vec {
+                    ts_data.extend_from_slice(&ts.to_le_bytes());
+                    val_data.extend_from_slice(&val.to_le_bytes());
+                }
+                (
+                    TimestampEncoding::Raw,
+                    ValueEncoding::Raw,
+                    ts_data,
+                    val_data,
+                )
+            };
 
         // Create data block
         let block = TsmDataBlock::new(
@@ -1355,9 +1362,10 @@ impl TsmWriter {
 
         // Flush and sync
         self.writer.flush()?;
-        let file = self.writer.into_inner().map_err(|e| {
-            std::io::Error::other(e.to_string())
-        })?;
+        let file = self
+            .writer
+            .into_inner()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         file.sync_all()?;
 
         Ok(TsmFileHandle {
@@ -1435,12 +1443,7 @@ impl<'a> TsmScanIterator<'a> {
                 .into_iter()
                 .filter(|(ts, _)| self.range.contains(*ts))
                 .map(|(ts, val)| {
-                    DataPoint::new(
-                        entry.metric_name.clone(),
-                        entry.labels.clone(),
-                        ts,
-                        val,
-                    )
+                    DataPoint::new(entry.metric_name.clone(), entry.labels.clone(), ts, val)
                 })
                 .collect();
 
@@ -1651,7 +1654,11 @@ impl TsmReader {
                 values: val_bitvec,
                 count: block.point_count,
             };
-            compressed.decompress().into_iter().map(|(ts, _)| ts).collect()
+            compressed
+                .decompress()
+                .into_iter()
+                .map(|(ts, _)| ts)
+                .collect()
         } else {
             // Raw format: read timestamps directly
             let mut cursor = std::io::Cursor::new(&block.ts_data);
@@ -1673,7 +1680,11 @@ impl TsmReader {
                 values: val_bitvec,
                 count: block.point_count,
             };
-            compressed.decompress().into_iter().map(|(_, val)| val).collect()
+            compressed
+                .decompress()
+                .into_iter()
+                .map(|(_, val)| val)
+                .collect()
         } else {
             // Raw format: read values directly
             let mut cursor = std::io::Cursor::new(&block.val_data);
@@ -1931,26 +1942,10 @@ mod tests {
     fn test_series_index() {
         let mut index = SeriesIndex::with_capacity(100);
 
-        let entry1 = SeriesIndexEntry::new(
-            1,
-            "metric1".to_string(),
-            vec![],
-            100,
-            50,
-            100,
-            1000,
-            2000,
-        );
-        let entry2 = SeriesIndexEntry::new(
-            2,
-            "metric2".to_string(),
-            vec![],
-            200,
-            60,
-            200,
-            3000,
-            4000,
-        );
+        let entry1 =
+            SeriesIndexEntry::new(1, "metric1".to_string(), vec![], 100, 50, 100, 1000, 2000);
+        let entry2 =
+            SeriesIndexEntry::new(2, "metric2".to_string(), vec![], 200, 60, 200, 3000, 4000);
 
         index.insert(entry1);
         index.insert(entry2);
@@ -2009,8 +2004,8 @@ mod tests {
             2000000,
             TimestampEncoding::DeltaOfDelta,
             ValueEncoding::GorillaXor,
-            vec![1, 2, 3, 4],    // ts_data
-            vec![5, 6, 7, 8],    // val_data
+            vec![1, 2, 3, 4], // ts_data
+            vec![5, 6, 7, 8], // val_data
         );
 
         assert!(block.verify_crc());
@@ -2025,8 +2020,8 @@ mod tests {
             2000000,
             TimestampEncoding::DeltaOfDelta,
             ValueEncoding::GorillaXor,
-            vec![1, 2, 3, 4, 5],     // ts_data
-            vec![6, 7, 8, 9, 10],    // val_data
+            vec![1, 2, 3, 4, 5],  // ts_data
+            vec![6, 7, 8, 9, 10], // val_data
         );
 
         let mut buf = Vec::new();
@@ -2055,8 +2050,8 @@ mod tests {
             2000000,
             TimestampEncoding::Raw,
             ValueEncoding::Raw,
-            vec![1, 2, 3],  // ts_data
-            vec![4, 5],     // val_data
+            vec![1, 2, 3], // ts_data
+            vec![4, 5],    // val_data
         );
 
         let mut buf = Vec::new();
@@ -2081,7 +2076,10 @@ mod tests {
 
         // Create test data
         let series_id = 12345u64;
-        let meta = SeriesMeta::new("cpu.usage", vec![("host".to_string(), "server1".to_string())]);
+        let meta = SeriesMeta::new(
+            "cpu.usage",
+            vec![("host".to_string(), "server1".to_string())],
+        );
         let mut points = std::collections::BTreeMap::new();
         for i in 0..100 {
             points.insert(1000000 + i * 1000, 50.0 + (i as f64) * 0.1);
@@ -2124,8 +2122,14 @@ mod tests {
         // Create test data for multiple series
         let series1_id = 1u64;
         let series2_id = 2u64;
-        let meta1 = SeriesMeta::new("cpu.usage", vec![("host".to_string(), "server1".to_string())]);
-        let meta2 = SeriesMeta::new("memory.usage", vec![("host".to_string(), "server1".to_string())]);
+        let meta1 = SeriesMeta::new(
+            "cpu.usage",
+            vec![("host".to_string(), "server1".to_string())],
+        );
+        let meta2 = SeriesMeta::new(
+            "memory.usage",
+            vec![("host".to_string(), "server1".to_string())],
+        );
 
         let mut points1 = std::collections::BTreeMap::new();
         let mut points2 = std::collections::BTreeMap::new();
