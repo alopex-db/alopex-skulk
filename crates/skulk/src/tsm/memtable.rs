@@ -2,10 +2,22 @@
 //!
 //! This module provides the in-memory buffer for time series data points
 //! before they are flushed to TSM files on disk.
+//!
+//! # WAL Integration
+//!
+//! For durability, the write path should follow:
+//! ```text
+//! Client → WAL append → batch fsync → MemTable insert → Ack
+//! ```
+//!
+//! Use the [`TimeSeriesMemTable::insert_with_wal`] and
+//! [`TimeSeriesMemTable::insert_batch_with_wal`] methods to ensure data is
+//! written to WAL before being inserted into the MemTable.
 
 use crate::error::{Result, TsmError};
 use crate::tsm::{DataPoint, SeriesId, SeriesMeta, TimePartition, TimeRange, Timestamp};
 use crate::tsm::{TsmFileHandle, TsmWriter};
+use crate::wal::{Wal, WalEntry};
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -177,14 +189,12 @@ impl TimeSeriesMemTable {
         &self.stats
     }
 
-    /// Generates or retrieves the series ID for a metric and labels.
+    /// Computes the series ID for a given metric and labels without modifying state.
     ///
-    /// The series ID is computed by hashing the metric name and sorted labels.
-    pub fn get_or_create_series(
-        &mut self,
-        metric: &str,
-        labels: &[(String, String)],
-    ) -> (SeriesId, bool) {
+    /// This is a pure function that can be used to compute the series ID
+    /// before committing to WAL, ensuring no MemTable mutation occurs
+    /// until the WAL write succeeds.
+    pub fn compute_series_id(metric: &str, labels: &[(String, String)]) -> SeriesId {
         // Sort labels for consistent hashing
         let mut sorted_labels = labels.to_vec();
         sorted_labels.sort();
@@ -196,12 +206,30 @@ impl TimeSeriesMemTable {
             k.hash(&mut hasher);
             v.hash(&mut hasher);
         }
-        let series_id = hasher.finish();
+        hasher.finish()
+    }
+
+    /// Gets or creates a series entry for the given metric and labels.
+    ///
+    /// Returns the series ID and whether the series was newly created.
+    /// Note: This method modifies MemTable state. For WAL-integrated writes,
+    /// use [`compute_series_id`] first to get the ID without side effects,
+    /// write to WAL, then call this method only after WAL success.
+    pub fn get_or_create_series(
+        &mut self,
+        metric: &str,
+        labels: &[(String, String)],
+    ) -> (SeriesId, bool) {
+        let series_id = Self::compute_series_id(metric, labels);
 
         // Check if series exists
         let is_new = !self.series_meta.contains_key(&series_id);
 
         if is_new {
+            // Sort labels for storage
+            let mut sorted_labels = labels.to_vec();
+            sorted_labels.sort();
+
             // Create new series entry
             self.series_meta.insert(
                 series_id,
@@ -263,6 +291,137 @@ impl TimeSeriesMemTable {
             self.insert(point)?;
         }
         Ok(())
+    }
+
+    /// Inserts a single data point with WAL durability.
+    ///
+    /// This method follows the write path durability contract:
+    /// 1. Generate series ID
+    /// 2. Write to WAL and fsync
+    /// 3. Insert into MemTable
+    ///
+    /// Only after WAL write succeeds should the operation be acknowledged.
+    ///
+    /// # Arguments
+    ///
+    /// * `point` - The data point to insert
+    /// * `wal` - The WAL to write to before inserting
+    ///
+    /// # Returns
+    ///
+    /// The WAL sequence number of the written entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The point's timestamp is outside this partition
+    /// - WAL write fails
+    pub fn insert_with_wal(&mut self, point: &DataPoint, wal: &mut Wal) -> Result<u64> {
+        // Validate timestamp is within partition
+        if !self.partition.contains(point.timestamp) {
+            return Err(TsmError::PartitionMismatch {
+                point_ts: point.timestamp,
+                start: self.partition.start_ts,
+                end: self.partition.end_ts(),
+            });
+        }
+
+        // Compute series_id WITHOUT modifying MemTable state
+        // This ensures MemTable remains unchanged if WAL write fails
+        let series_id = Self::compute_series_id(&point.metric, &point.labels);
+
+        // Write to WAL first (this includes fsync)
+        // If this fails, MemTable is unchanged - durability contract preserved
+        let entry = WalEntry::new(series_id, point.timestamp, point.value);
+        let seq = wal.append(entry)?;
+        wal.sync()?; // Ensure durability before MemTable insert
+
+        // WAL write succeeded - now safe to mutate MemTable
+        // get_or_create_series will create series entry if needed
+        let (_, _is_new) = self.get_or_create_series(&point.metric, &point.labels);
+
+        // Insert data point
+        if let Some(series) = self.series_data.get_mut(&series_id) {
+            series.insert(point.timestamp, point.value);
+        }
+
+        // Update stats
+        self.stats.increment_points(1);
+        self.stats.update_timestamp(point.timestamp);
+        self.stats.add_memory(std::mem::size_of::<(i64, f64)>());
+
+        Ok(seq)
+    }
+
+    /// Inserts multiple data points with WAL durability.
+    ///
+    /// This method follows the write path durability contract:
+    /// 1. Generate series IDs for all points
+    /// 2. Write batch to WAL and fsync
+    /// 3. Insert all points into MemTable
+    ///
+    /// # Arguments
+    ///
+    /// * `points` - The data points to insert
+    /// * `wal` - The WAL to write to before inserting
+    ///
+    /// # Returns
+    ///
+    /// The WAL sequence numbers of the written entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Any point's timestamp is outside this partition
+    /// - WAL write fails
+    pub fn insert_batch_with_wal(
+        &mut self,
+        points: &[DataPoint],
+        wal: &mut Wal,
+    ) -> Result<Vec<u64>> {
+        // Validate all timestamps first
+        for point in points {
+            if !self.partition.contains(point.timestamp) {
+                return Err(TsmError::PartitionMismatch {
+                    point_ts: point.timestamp,
+                    start: self.partition.start_ts,
+                    end: self.partition.end_ts(),
+                });
+            }
+        }
+
+        // Compute series IDs WITHOUT modifying MemTable state
+        // This ensures MemTable remains unchanged if WAL write fails
+        let mut wal_entries = Vec::with_capacity(points.len());
+        let mut series_ids = Vec::with_capacity(points.len());
+
+        for point in points {
+            let series_id = Self::compute_series_id(&point.metric, &point.labels);
+            series_ids.push(series_id);
+            wal_entries.push(WalEntry::new(series_id, point.timestamp, point.value));
+        }
+
+        // Write batch to WAL (includes fsync)
+        // If this fails, MemTable is unchanged - durability contract preserved
+        let sequences = wal.append_batch(&wal_entries)?;
+
+        // WAL write succeeded - now safe to mutate MemTable
+        for (point, &series_id) in points.iter().zip(series_ids.iter()) {
+            // Create series entry if needed (now safe to mutate)
+            let _ = self.get_or_create_series(&point.metric, &point.labels);
+
+            // Insert data point
+            if let Some(series) = self.series_data.get_mut(&series_id) {
+                series.insert(point.timestamp, point.value);
+            }
+
+            // Update stats
+            self.stats.increment_points(1);
+            self.stats.update_timestamp(point.timestamp);
+            self.stats.add_memory(std::mem::size_of::<(i64, f64)>());
+        }
+
+        Ok(sequences)
     }
 
     /// Returns true if the MemTable should be flushed to disk.
@@ -787,5 +946,168 @@ mod tests {
         let read_points = reader.read_series(series_id).unwrap();
         assert!(read_points.is_some());
         assert_eq!(read_points.unwrap().len(), 1);
+    }
+
+    // WAL Integration Tests
+
+    #[test]
+    fn test_insert_with_wal() {
+        use crate::wal::{SyncMode, WalConfig};
+
+        let temp_dir = TempDir::new().unwrap();
+        let wal_dir = temp_dir.path().join("wal");
+
+        let config = WalConfig {
+            batch_size: 100,
+            batch_timeout: Duration::from_millis(10),
+            segment_size: 1024 * 1024,
+            sync_mode: SyncMode::None, // Fast for testing
+        };
+        let mut wal = Wal::new(&wal_dir, config).unwrap();
+        let mut memtable = TimeSeriesMemTable::new(make_partition());
+
+        let point = DataPoint::new(
+            "cpu.usage",
+            vec![("host".to_string(), "server1".to_string())],
+            1000,
+            0.75,
+        );
+
+        let seq = memtable.insert_with_wal(&point, &mut wal).unwrap();
+
+        assert_eq!(seq, 1);
+        assert_eq!(memtable.stats.point_count(), 1);
+        assert_eq!(memtable.stats.series_count(), 1);
+    }
+
+    #[test]
+    fn test_insert_batch_with_wal() {
+        use crate::wal::{SyncMode, WalConfig};
+
+        let temp_dir = TempDir::new().unwrap();
+        let wal_dir = temp_dir.path().join("wal");
+
+        let config = WalConfig {
+            batch_size: 100,
+            batch_timeout: Duration::from_millis(10),
+            segment_size: 1024 * 1024,
+            sync_mode: SyncMode::None,
+        };
+        let mut wal = Wal::new(&wal_dir, config).unwrap();
+        let mut memtable = TimeSeriesMemTable::new(make_partition());
+
+        let points = vec![
+            DataPoint::new(
+                "cpu.usage",
+                vec![("host".to_string(), "server1".to_string())],
+                1000,
+                0.75,
+            ),
+            DataPoint::new(
+                "cpu.usage",
+                vec![("host".to_string(), "server1".to_string())],
+                2000,
+                0.80,
+            ),
+            DataPoint::new(
+                "memory.free",
+                vec![],
+                1500,
+                4096.0,
+            ),
+        ];
+
+        let sequences = memtable.insert_batch_with_wal(&points, &mut wal).unwrap();
+
+        assert_eq!(sequences.len(), 3);
+        assert_eq!(sequences[0], 1);
+        assert_eq!(sequences[1], 2);
+        assert_eq!(sequences[2], 3);
+        assert_eq!(memtable.stats.point_count(), 3);
+        assert_eq!(memtable.stats.series_count(), 2);
+    }
+
+    #[test]
+    fn test_wal_recovery_and_memtable_replay() {
+        use crate::wal::{SyncMode, WalConfig};
+
+        let temp_dir = TempDir::new().unwrap();
+        let wal_dir = temp_dir.path().join("wal");
+
+        // Write some data with WAL
+        let labels = vec![("host".to_string(), "server1".to_string())];
+        let (series_id, _) = {
+            let config = WalConfig {
+                batch_size: 100,
+                batch_timeout: Duration::from_millis(10),
+                segment_size: 1024 * 1024,
+                sync_mode: SyncMode::Fsync, // Use Fsync for durability test
+            };
+            let mut wal = Wal::new(&wal_dir, config).unwrap();
+            let mut memtable = TimeSeriesMemTable::new(make_partition());
+
+            for i in 0..10 {
+                let point = DataPoint::new("cpu.usage", labels.clone(), i * 1000, i as f64 * 0.1);
+                memtable.insert_with_wal(&point, &mut wal).unwrap();
+            }
+
+            // Return series_id for later verification
+            memtable.get_or_create_series("cpu.usage", &labels)
+        };
+
+        // Simulate crash and recovery: recover WAL entries
+        let recovered_entries = Wal::recover(&wal_dir).unwrap();
+        assert_eq!(recovered_entries.len(), 10);
+
+        // Replay into a new MemTable
+        let mut new_memtable = TimeSeriesMemTable::new(make_partition());
+        for entry in &recovered_entries {
+            // In real recovery, we'd need to reconstruct metric/labels from series_meta
+            // Here we use insert() directly for simplicity since we know the series_id
+            if let Some(series) = new_memtable.series_data.get_mut(&entry.series_id) {
+                series.insert(entry.timestamp, entry.value);
+            } else {
+                // Create series with recovered data (in real code, we'd have metric/labels persisted)
+                new_memtable.series_data.insert(entry.series_id, BTreeMap::new());
+                if let Some(series) = new_memtable.series_data.get_mut(&entry.series_id) {
+                    series.insert(entry.timestamp, entry.value);
+                }
+            }
+            new_memtable.stats.increment_points(1);
+        }
+
+        // Verify recovered data
+        let data = new_memtable.series_data.get(&series_id).unwrap();
+        assert_eq!(data.len(), 10);
+
+        for i in 0..10 {
+            let ts = i * 1000;
+            let expected_value = i as f64 * 0.1;
+            assert!((data.get(&ts).unwrap() - expected_value).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn test_insert_with_wal_partition_mismatch() {
+        use crate::wal::{SyncMode, WalConfig};
+
+        let temp_dir = TempDir::new().unwrap();
+        let wal_dir = temp_dir.path().join("wal");
+
+        let config = WalConfig {
+            batch_size: 100,
+            batch_timeout: Duration::from_millis(10),
+            segment_size: 1024 * 1024,
+            sync_mode: SyncMode::None,
+        };
+        let mut wal = Wal::new(&wal_dir, config).unwrap();
+
+        let partition = TimePartition::new(1000, Duration::from_nanos(100));
+        let mut memtable = TimeSeriesMemTable::new(partition);
+
+        // Point outside partition
+        let point = DataPoint::new("metric", vec![], 999, 1.0);
+        let result = memtable.insert_with_wal(&point, &mut wal);
+        assert!(matches!(result, Err(TsmError::PartitionMismatch { .. })));
     }
 }

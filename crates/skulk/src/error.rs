@@ -64,4 +64,19 @@ pub enum TsmError {
         /// Start timestamp of the partition that is flushing.
         start_ts: i64,
     },
+
+    /// WAL write failed.
+    #[error("WAL write error: {0}")]
+    WalWriteError(String),
+
+    /// WAL recovery failed.
+    #[error("WAL recovery error: {0}")]
+    WalRecoveryError(String),
+
+    /// WAL entry is corrupted.
+    #[error("WAL entry corrupted at sequence {sequence}")]
+    WalEntryCorrupted {
+        /// Sequence number of the corrupted entry.
+        sequence: u64,
+    },
 }

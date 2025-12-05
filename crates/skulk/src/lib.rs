@@ -35,8 +35,10 @@
 
 pub mod error;
 pub mod tsm;
+pub mod wal;
 
 pub use error::{Result, TsmError};
 pub use tsm::{
     CompressedBlock, DataPoint, SeriesId, SeriesMeta, TimePartition, TimeRange, Timestamp,
 };
+pub use wal::{Wal, WalConfig, WalEntry, SyncMode};

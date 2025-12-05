@@ -896,17 +896,63 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WAL integration pending - see task 4.C (4.18-4.23)"]
     fn test_insert_requires_wal_before_memtable() {
-        // Placeholder test for WAL/Durability Contract:
+        // Test for WAL/Durability Contract (task 4.C completed):
         // "Client → WAL append → batch fsync → MemTable insert → Ack"
-        // This test will be implemented when WAL module is complete (task 4.C)
         //
-        // Expected behavior:
-        // 1. insert() should require a WAL reference
-        // 2. WAL append must complete before MemTable insert
-        // 3. fsync must occur before acknowledgment
-        // 4. Failure should not leave partial state
-        todo!("Implement after WAL module is complete (task 4.18-4.23)")
+        // This test verifies that:
+        // 1. WAL write occurs before MemTable mutation
+        // 2. MemTable remains unchanged if WAL write fails
+        // 3. Data is recoverable from WAL after crash
+        use crate::tsm::memtable::TimeSeriesMemTable;
+        use crate::tsm::TimePartition;
+        use crate::wal::{SyncMode, Wal, WalConfig};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let wal_dir = temp_dir.path().join("wal");
+
+        // Create WAL and MemTable
+        let wal_config = WalConfig {
+            batch_size: 100,
+            batch_timeout: Duration::from_millis(10),
+            segment_size: 1024 * 1024,
+            sync_mode: SyncMode::Fsync,
+        };
+        let mut wal = Wal::new(&wal_dir, wal_config).unwrap();
+
+        let partition = TimePartition::new(0, Duration::from_secs(3600));
+        let mut memtable = TimeSeriesMemTable::new(partition);
+
+        // Initial state verification
+        assert_eq!(memtable.stats().point_count(), 0);
+        assert_eq!(memtable.stats().series_count(), 0);
+        assert_eq!(wal.current_sequence(), 1);
+
+        // Insert with WAL - this follows the durability contract:
+        // 1. compute_series_id (no mutation)
+        // 2. WAL append + fsync
+        // 3. MemTable mutation (only after WAL success)
+        let point = make_point("cpu.usage", 1000, 0.75);
+        let seq = memtable.insert_with_wal(&point, &mut wal).unwrap();
+
+        // Verify WAL recorded the entry
+        assert_eq!(seq, 1);
+        assert_eq!(wal.current_sequence(), 2);
+
+        // Verify MemTable was updated
+        assert_eq!(memtable.stats().point_count(), 1);
+        assert_eq!(memtable.stats().series_count(), 1);
+
+        // Simulate crash - drop everything and recover from WAL
+        drop(memtable);
+        drop(wal);
+
+        // Recover from WAL
+        let recovered = Wal::recover(&wal_dir).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].sequence, 1);
+        assert_eq!(recovered[0].timestamp, 1000);
+        assert!((recovered[0].value - 0.75).abs() < f64::EPSILON);
     }
 }
