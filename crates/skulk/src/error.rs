@@ -57,4 +57,11 @@ pub enum TsmError {
         /// End timestamp of the partition (exclusive).
         end: i64,
     },
+
+    /// Partition is currently being flushed and cannot accept writes.
+    #[error("Partition {start_ts} is currently flushing, cannot accept writes")]
+    PartitionFlushing {
+        /// Start timestamp of the partition that is flushing.
+        start_ts: i64,
+    },
 }

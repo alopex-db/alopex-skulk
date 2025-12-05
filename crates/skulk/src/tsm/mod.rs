@@ -6,12 +6,14 @@
 //! - [`SeriesId`]: Unique identifier for a time series
 //! - [`DataPoint`]: A single time series data point
 //! - [`TimeSeriesMemTable`]: In-memory buffer for data points
+//! - [`PartitionManager`]: Multi-partition routing and management
 //! - [`CompressedBlock`]: Gorilla-compressed data block
 //! - [`TsmWriter`] / [`TsmReader`]: File I/O for TSM format
 
 pub mod file;
 pub mod gorilla;
 pub mod memtable;
+pub mod partition;
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -129,13 +131,17 @@ impl TimeRange {
 
 // Re-export main types from submodules
 pub use file::{
-    BloomFilter, CompressionType, SectionFlags, SeriesIndex, SeriesIndexEntry,
-    TimestampEncoding, TsmDataBlock, TsmFileHandle, TsmFooter, TsmHeader, TsmReader,
-    TsmScanIterator, TsmWriter, ValueEncoding, FOOTER_SIZE, HEADER_SIZE, TSM_MAGIC,
-    TSM_MAGIC_REVERSE, TSM_VERSION,
+    BloomFilter, CompressionType, SectionFlags, SeriesIndex, SeriesIndexEntry, TimestampEncoding,
+    TsmDataBlock, TsmFileHandle, TsmFooter, TsmHeader, TsmReader, TsmScanIterator, TsmWriter,
+    ValueEncoding, FOOTER_SIZE, HEADER_SIZE, TSM_MAGIC, TSM_MAGIC_REVERSE, TSM_VERSION,
 };
 pub use gorilla::CompressedBlock;
 pub use memtable::TimeSeriesMemTable;
+pub use partition::{
+    FlushPriority, PartitionManager, PartitionManagerConfig, PartitionManagerStats,
+    DEFAULT_MAX_ACTIVE_PARTITIONS, DEFAULT_PARTITION_AGE_THRESHOLD, DEFAULT_PARTITION_DURATION,
+    DEFAULT_PARTITION_SIZE_THRESHOLD,
+};
 
 #[cfg(test)]
 mod tests {
