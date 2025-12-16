@@ -1827,8 +1827,10 @@ mod tests {
 
     #[test]
     fn test_footer_invalid_magic() {
-        let mut footer = TsmFooter::default();
-        footer.magic_reverse = *b"XXXX";
+        let footer = TsmFooter {
+            magic_reverse: *b"XXXX",
+            ..Default::default()
+        };
 
         let mut buf = Vec::new();
         footer.write_to(&mut buf).unwrap();

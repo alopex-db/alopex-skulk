@@ -95,7 +95,7 @@ fn test_large_file_handling() {
         assert_eq!(handle.header.series_count, NUM_SERIES as u32);
         assert_eq!(
             handle.footer.total_point_count,
-            (NUM_SERIES as u64) * (POINTS_PER_SERIES as u64)
+            NUM_SERIES * (POINTS_PER_SERIES as u64)
         );
     }
 

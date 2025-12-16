@@ -346,7 +346,8 @@ impl Wal {
                     if ext == SEGMENT_EXTENSION {
                         if let Some(stem) = path.file_stem() {
                             if let Some(s) = stem.to_str() {
-                                if let Some(id_str) = s.strip_prefix(&format!("{}_", SEGMENT_PREFIX))
+                                if let Some(id_str) =
+                                    s.strip_prefix(&format!("{}_", SEGMENT_PREFIX))
                                 {
                                     if let Ok(id) = u64::from_str_radix(id_str, 16) {
                                         // Track max segment ID (use Option to distinguish "no segments" from "segment 0")
@@ -383,14 +384,21 @@ impl Wal {
         };
 
         // Sequence numbers start at 1, so if max_sequence is 0 (no entries), next is 1
-        let next_sequence = if max_sequence == 0 { 1 } else { max_sequence + 1 };
+        let next_sequence = if max_sequence == 0 {
+            1
+        } else {
+            max_sequence + 1
+        };
 
         Ok((next_segment_id, next_sequence))
     }
 
     /// Generates the path for a segment file.
     fn segment_path(log_dir: &Path, segment_id: u64) -> PathBuf {
-        log_dir.join(format!("{}_{:016x}.{}", SEGMENT_PREFIX, segment_id, SEGMENT_EXTENSION))
+        log_dir.join(format!(
+            "{}_{:016x}.{}",
+            SEGMENT_PREFIX, segment_id, SEGMENT_EXTENSION
+        ))
     }
 
     /// Reads all entries from a segment file.
@@ -593,10 +601,7 @@ impl Wal {
         self.current_segment = writer;
         self.current_segment_size = SegmentHeader::SIZE;
 
-        debug!(
-            "Rotated to new WAL segment: {}",
-            segment_path.display()
-        );
+        debug!("Rotated to new WAL segment: {}", segment_path.display());
 
         Ok(())
     }
@@ -780,7 +785,7 @@ mod tests {
         let config = WalConfig {
             batch_size: 10,
             batch_timeout: Duration::from_millis(10),
-            segment_size: 1024, // Small segments for testing
+            segment_size: 1024,        // Small segments for testing
             sync_mode: SyncMode::None, // Fast for testing
         };
         let wal = Wal::new(temp_dir.path(), config).unwrap();
@@ -977,7 +982,7 @@ mod tests {
 
     #[test]
     fn test_wal_entry_serialization() {
-        let entry = WalEntry::with_sequence(42, 12345, 1000000000, 3.14159);
+        let entry = WalEntry::with_sequence(42, 12345, 1000000000, std::f64::consts::PI);
         let bytes = entry.to_bytes();
         let recovered = WalEntry::from_bytes(&bytes).unwrap();
 
@@ -1122,11 +1127,7 @@ mod tests {
 
         // Verify all entries are preserved (original + new)
         let all_entries = Wal::recover(temp_dir.path()).unwrap();
-        assert_eq!(
-            all_entries.len(),
-            8,
-            "All 8 entries should be preserved"
-        );
+        assert_eq!(all_entries.len(), 8, "All 8 entries should be preserved");
 
         // Verify original entries were not corrupted
         for (i, entry) in all_entries.iter().take(5).enumerate() {

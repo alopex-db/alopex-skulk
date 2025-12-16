@@ -119,20 +119,24 @@ fn test_full_write_path_multiple_series() {
 
     // Create multiple series
     let series_configs = vec![
-        ("cpu.usage", vec![("host".to_string(), "server1".to_string())]),
-        ("cpu.usage", vec![("host".to_string(), "server2".to_string())]),
-        ("memory.free", vec![("host".to_string(), "server1".to_string())]),
+        (
+            "cpu.usage",
+            vec![("host".to_string(), "server1".to_string())],
+        ),
+        (
+            "cpu.usage",
+            vec![("host".to_string(), "server2".to_string())],
+        ),
+        (
+            "memory.free",
+            vec![("host".to_string(), "server1".to_string())],
+        ),
         ("disk.io", vec![]),
     ];
 
     for (metric, labels) in &series_configs {
         for i in 0..100 {
-            let point = DataPoint::new(
-                *metric,
-                labels.clone(),
-                i * 1_000_000,
-                (i as f64) * 1.5,
-            );
+            let point = DataPoint::new(*metric, labels.clone(), i * 1_000_000, (i as f64) * 1.5);
             memtable.insert_with_wal(&point, &mut wal).unwrap();
         }
     }
@@ -298,7 +302,11 @@ fn test_wal_survives_multiple_reopens() {
         for i in 50..100 {
             let point = DataPoint::new("metric1", vec![], i * 1000, i as f64);
             let seq = memtable.insert_with_wal(&point, &mut wal).unwrap();
-            assert_eq!(seq, (i + 1) as u64, "Sequence should continue from previous session");
+            assert_eq!(
+                seq,
+                (i + 1) as u64,
+                "Sequence should continue from previous session"
+            );
         }
     }
 
@@ -342,7 +350,12 @@ fn test_recovery_with_partial_entries() {
     let segments: Vec<_> = std::fs::read_dir(&wal_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map(|ext| ext == "wal").unwrap_or(false))
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "wal")
+                .unwrap_or(false)
+        })
         .collect();
 
     if let Some(segment) = segments.last() {
@@ -379,7 +392,13 @@ fn test_memtable_flush_creates_valid_tsm() {
     let mut memtable = TimeSeriesMemTable::new(partition);
 
     // Insert varied data patterns using Box<dyn Fn> for different closures
-    let patterns: Vec<(&str, Vec<(String, String)>, std::ops::Range<usize>, Box<dyn Fn(usize) -> f64>)> = vec![
+    type Pattern = (
+        &'static str,
+        Vec<(String, String)>,
+        std::ops::Range<usize>,
+        Box<dyn Fn(usize) -> f64>,
+    );
+    let patterns: Vec<Pattern> = vec![
         ("constant", vec![], 0..100, Box::new(|_: usize| 42.0)),
         (
             "increasing",
@@ -397,12 +416,8 @@ fn test_memtable_flush_creates_valid_tsm() {
 
     for (metric, labels, range, value_fn) in &patterns {
         for i in range.clone() {
-            let point = DataPoint::new(
-                *metric,
-                labels.clone(),
-                (i as i64) * 1_000_000,
-                value_fn(i),
-            );
+            let point =
+                DataPoint::new(*metric, labels.clone(), (i as i64) * 1_000_000, value_fn(i));
             memtable.insert(&point).unwrap();
         }
     }
@@ -420,7 +435,7 @@ fn test_memtable_flush_creates_valid_tsm() {
     assert!(reader.verify_file_checksum().unwrap());
 
     // Verify each series
-    for (metric, labels, range, value_fn) in &patterns {
+    for (metric, labels, _range, value_fn) in &patterns {
         let series_id = TimeSeriesMemTable::compute_series_id(metric, labels);
         let points = reader.read_series(series_id).unwrap().unwrap();
         assert_eq!(points.len(), 100);
@@ -517,8 +532,8 @@ fn test_partition_manager_atomic_flush() {
 /// Tests that flush failure preserves partition data.
 #[test]
 fn test_flush_failure_preserves_data() {
-    let config = PartitionManagerConfig::default()
-        .with_partition_duration(Duration::from_secs(3600));
+    let config =
+        PartitionManagerConfig::default().with_partition_duration(Duration::from_secs(3600));
 
     let mut manager = PartitionManager::new(config);
 
@@ -557,8 +572,8 @@ fn test_flush_failure_preserves_data() {
 /// Tests writes are blocked during flush (immutable partition).
 #[test]
 fn test_writes_blocked_during_flush() {
-    let config = PartitionManagerConfig::default()
-        .with_partition_duration(Duration::from_secs(3600));
+    let config =
+        PartitionManagerConfig::default().with_partition_duration(Duration::from_secs(3600));
 
     let mut manager = PartitionManager::new(config);
 
@@ -723,12 +738,12 @@ fn test_tsm_time_range_scan() {
 
     // Test various scan ranges
     let test_cases = vec![
-        (0, 100 * 1_000_000, 100),           // First 100 points
-        (500 * 1_000_000, 600 * 1_000_000, 100), // Middle 100 points
+        (0, 100 * 1_000_000, 100),                // First 100 points
+        (500 * 1_000_000, 600 * 1_000_000, 100),  // Middle 100 points
         (900 * 1_000_000, 1100 * 1_000_000, 100), // Last 100 points (including beyond range)
-        (0, 1000 * 1_000_000, 1000),          // All points
-        (1000 * 1_000_000, 2000 * 1_000_000, 0), // Beyond range (empty)
-        (-100, 0, 0),                         // Before range (empty)
+        (0, 1000 * 1_000_000, 1000),              // All points
+        (1000 * 1_000_000, 2000 * 1_000_000, 0),  // Beyond range (empty)
+        (-100, 0, 0),                             // Before range (empty)
     ];
 
     for (start, end, expected_count) in test_cases {
@@ -760,8 +775,8 @@ fn test_tsm_time_range_scan() {
 /// Tests cross-partition scan in PartitionManager.
 #[test]
 fn test_partition_manager_cross_partition_scan() {
-    let config = PartitionManagerConfig::default()
-        .with_partition_duration(Duration::from_secs(3600));
+    let config =
+        PartitionManagerConfig::default().with_partition_duration(Duration::from_secs(3600));
 
     let mut manager = PartitionManager::new(config);
 
@@ -794,7 +809,7 @@ fn test_partition_manager_cross_partition_scan() {
     let range = TimeRange::new(duration_nanos / 2, duration_nanos + duration_nanos / 2);
     let results: Vec<_> = manager.scan(range).collect();
     // Should include points from both partitions within the range
-    assert!(results.len() > 0);
+    assert!(!results.is_empty());
     for point in &results {
         assert!(
             point.timestamp >= duration_nanos / 2

@@ -213,7 +213,7 @@ impl TimeSeriesMemTable {
     ///
     /// Returns the series ID and whether the series was newly created.
     /// Note: This method modifies MemTable state. For WAL-integrated writes,
-    /// use [`compute_series_id`] first to get the ID without side effects,
+    /// use [`Self::compute_series_id`] first to get the ID without side effects,
     /// write to WAL, then call this method only after WAL success.
     pub fn get_or_create_series(
         &mut self,
@@ -1009,12 +1009,7 @@ mod tests {
                 2000,
                 0.80,
             ),
-            DataPoint::new(
-                "memory.free",
-                vec![],
-                1500,
-                4096.0,
-            ),
+            DataPoint::new("memory.free", vec![], 1500, 4096.0),
         ];
 
         let sequences = memtable.insert_batch_with_wal(&points, &mut wal).unwrap();
@@ -1068,7 +1063,9 @@ mod tests {
                 series.insert(entry.timestamp, entry.value);
             } else {
                 // Create series with recovered data (in real code, we'd have metric/labels persisted)
-                new_memtable.series_data.insert(entry.series_id, BTreeMap::new());
+                new_memtable
+                    .series_data
+                    .insert(entry.series_id, BTreeMap::new());
                 if let Some(series) = new_memtable.series_data.get_mut(&entry.series_id) {
                     series.insert(entry.timestamp, entry.value);
                 }

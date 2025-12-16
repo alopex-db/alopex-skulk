@@ -322,12 +322,8 @@ fn bench_wal_recovery(c: &mut Criterion) {
                         let mut memtable = TimeSeriesMemTable::new(partition);
 
                         for i in 0..size {
-                            let point = DataPoint::new(
-                                "metric",
-                                vec![],
-                                (i as i64) * 1_000_000,
-                                i as f64,
-                            );
+                            let point =
+                                DataPoint::new("metric", vec![], (i as i64) * 1_000_000, i as f64);
                             memtable.insert_with_wal(&point, &mut wal).unwrap();
                         }
                     }
@@ -480,7 +476,8 @@ fn bench_partition_manager_insert(c: &mut Criterion) {
                             DataPoint::new(
                                 "cpu.usage",
                                 vec![],
-                                ((i / 1000) as i64) * duration_nanos + (i % 1000) as i64 * 1_000_000,
+                                ((i / 1000) as i64) * duration_nanos
+                                    + (i % 1000) as i64 * 1_000_000,
                                 i as f64,
                             )
                         })
@@ -502,8 +499,8 @@ fn bench_partition_manager_insert(c: &mut Criterion) {
 }
 
 fn bench_partition_manager_scan(c: &mut Criterion) {
-    let config = PartitionManagerConfig::default()
-        .with_partition_duration(Duration::from_secs(3600));
+    let config =
+        PartitionManagerConfig::default().with_partition_duration(Duration::from_secs(3600));
     let mut manager = PartitionManager::new(config);
 
     let duration_nanos = Duration::from_secs(3600).as_nanos() as i64;

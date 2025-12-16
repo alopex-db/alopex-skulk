@@ -174,4 +174,4 @@ pub use error::{Result, TsmError};
 pub use tsm::{
     CompressedBlock, DataPoint, SeriesId, SeriesMeta, TimePartition, TimeRange, Timestamp,
 };
-pub use wal::{Wal, WalConfig, WalEntry, SyncMode};
+pub use wal::{SyncMode, Wal, WalConfig, WalEntry};
