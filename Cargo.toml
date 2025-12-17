@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Alopex core
-alopex-core = { path = "../alopex/crates/alopex-core" }
+alopex-core = "0.3"
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
