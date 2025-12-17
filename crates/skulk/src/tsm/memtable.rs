@@ -702,9 +702,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore)] // Windows Instant cannot represent times before system boot
     fn test_should_flush_age_threshold() {
         // Create a memtable with a creation time in the past (beyond age threshold)
-        let old_created_at = Instant::now() - FLUSH_AGE_THRESHOLD - Duration::from_secs(1);
+        // Note: This may panic on Windows if FLUSH_AGE_THRESHOLD exceeds system uptime
+        let old_created_at = Instant::now()
+            .checked_sub(FLUSH_AGE_THRESHOLD + Duration::from_secs(1))
+            .expect("System uptime should exceed flush age threshold");
         let memtable = TimeSeriesMemTable::with_created_at(make_partition(), old_created_at);
 
         // Should flush due to age, even with no data

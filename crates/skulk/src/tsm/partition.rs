@@ -789,6 +789,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore)] // Windows has different atomic rename semantics
     fn test_flush_partition_atomic_path() {
         // Test that flush uses atomic tmp file + rename pattern
         // per requirements.md "Flush Durability Contract": tmp→fsync→rename→fsync(dir)
