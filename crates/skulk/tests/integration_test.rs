@@ -475,6 +475,7 @@ fn test_flush_empty_memtable() {
 
 /// Tests PartitionManager flush with atomic durability.
 #[test]
+#[cfg_attr(windows, ignore)] // Windows has different atomic rename semantics
 fn test_partition_manager_atomic_flush() {
     let temp_dir = TempDir::new().unwrap();
     let tsm_dir = temp_dir.path().join("tsm");
