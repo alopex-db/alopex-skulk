@@ -5,11 +5,11 @@
 //! - Crash recovery from WAL
 //! - MemTable → TSM flush with atomic durability
 
-use skulk::tsm::{
+use alopex_skulk::tsm::{
     DataPoint, PartitionManager, PartitionManagerConfig, TimePartition, TimeRange,
     TimeSeriesMemTable, TsmReader,
 };
-use skulk::wal::{SyncMode, Wal, WalConfig};
+use alopex_skulk::wal::{SyncMode, Wal, WalConfig};
 use std::time::Duration;
 use tempfile::TempDir;
 

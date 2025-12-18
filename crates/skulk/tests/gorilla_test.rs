@@ -6,8 +6,8 @@
 //! deltas exceeding i32::MAX/MIN will not roundtrip correctly. These tests
 //! constrain inputs to realistic time series data that stays within bounds.
 
+use alopex_skulk::tsm::CompressedBlock;
 use proptest::prelude::*;
-use skulk::tsm::CompressedBlock;
 
 /// Strategy for generating realistic timestamps with bounded deltas.
 /// Timestamps are sorted and have deltas that fit within 32-bit encoding.
