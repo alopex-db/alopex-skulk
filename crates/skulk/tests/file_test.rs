@@ -1,6 +1,8 @@
 //! Integration tests for TSM file format.
 
-use alopex_skulk::tsm::{CompressionType, SectionFlags, SeriesMeta, TimeRange, TsmReader, TsmWriter};
+use alopex_skulk::tsm::{
+    CompressionType, SectionFlags, SeriesMeta, TimeRange, TsmReader, TsmWriter,
+};
 use std::collections::BTreeMap;
 use tempfile::TempDir;
 
