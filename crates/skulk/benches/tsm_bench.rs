@@ -11,12 +11,13 @@
 //! - **End-to-End**: Full write path benchmarks
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use skulk::tsm::{
+use alopex_skulk::tsm::{
     CompressedBlock, DataPoint, PartitionManager, PartitionManagerConfig, SeriesMeta,
     TimePartition, TimeRange, TimeSeriesMemTable, TsmReader, TsmWriter,
 };
-use skulk::wal::{SyncMode, Wal, WalConfig};
+use alopex_skulk::wal::{SyncMode, Wal, WalConfig};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -557,7 +558,7 @@ fn bench_partition_manager_flush(c: &mut Criterion) {
 
                 (temp_dir, manager)
             },
-            |(temp_dir, mut manager)| {
+            |(temp_dir, mut manager): (TempDir, PartitionManager)| {
                 manager.flush_partition(0, temp_dir.path()).unwrap();
             },
             criterion::BatchSize::SmallInput,
@@ -601,7 +602,7 @@ fn bench_full_write_path(c: &mut Criterion) {
 
                 (temp_dir, wal, memtable, tsm_dir, points)
             },
-            |(_temp_dir, mut wal, mut memtable, tsm_dir, points)| {
+            |(_temp_dir, mut wal, mut memtable, tsm_dir, points): (TempDir, Wal, TimeSeriesMemTable, PathBuf, Vec<DataPoint>)| {
                 // WAL + MemTable insert
                 for point in &points {
                     memtable.insert_with_wal(point, &mut wal).unwrap();
