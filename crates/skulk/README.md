@@ -1,9 +1,9 @@
-# Skulk
+# Alopex Skulk
 
 Alopex Skulk - High-performance Time Series Storage Engine for Rust.
 
-[![Crates.io](https://img.shields.io/crates/v/skulk.svg)](https://crates.io/crates/skulk)
-[![Documentation](https://docs.rs/skulk/badge.svg)](https://docs.rs/skulk)
+[![Crates.io](https://img.shields.io/crates/v/alopex-skulk.svg)](https://crates.io/crates/alopex-skulk)
+[![Documentation](https://docs.rs/alopex-skulk/badge.svg)](https://docs.rs/alopex-skulk)
 [![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](LICENSE)
 
 ## Features
@@ -20,7 +20,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-skulk = "0.1"
+alopex-skulk = "0.1"
 ```
 
 ## Architecture
@@ -35,7 +35,7 @@ Skulk implements a TSM-based storage engine with:
 ## Usage
 
 ```rust
-use skulk::tsm::PartitionManager;
+use alopex_skulk::tsm::PartitionManager;
 
 // Create a partition manager
 let manager = PartitionManager::new(config)?;

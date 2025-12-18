@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'skulk-v*'
+      - 'alopex-skulk-v*'
 
 env:
   RUST_BACKTRACE: 1
@@ -38,9 +38,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Publish skulk
-        run: cargo publish -p skulk
-        working-directory: crates/skulk
+      - name: Publish alopex-skulk
+        run: cargo publish -p alopex-skulk
 
   create-release:
     name: Create GitHub Release

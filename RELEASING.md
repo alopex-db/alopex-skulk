@@ -10,21 +10,21 @@
 
 | クレート | 説明 | 依存関係 |
 |---------|------|---------|
-| `skulk` | Time Series ストレージエンジン | alopex-core |
+| `alopex-skulk` | Time Series ストレージエンジン | alopex-core |
 
 ### 現在のバージョン
 
-- skulk: `0.1.0` (crates.io 公開済み)
+- alopex-skulk: `0.1.0`
 
 ## リリースワークフロー
 
 ### タグ形式
 
 ```
-skulk-v{major}.{minor}.{patch}
+alopex-skulk-v{major}.{minor}.{patch}
 ```
 
-例: `skulk-v0.2.0`
+例: `alopex-skulk-v0.2.0`
 
 ### 自動化される処理
 
@@ -51,7 +51,7 @@ cargo test --workspace
 cargo clippy --all-targets --all-features -- -D warnings
 
 # dry-run で公開可能か確認
-cargo publish --dry-run -p skulk
+cargo publish --dry-run -p alopex-skulk
 ```
 
 ### 2. バージョン更新
@@ -93,18 +93,18 @@ GitHub Actions の CI が成功することを確認してください。
 
 ```bash
 # タグ作成
-git tag -a skulk-v0.2.0 -m "Release skulk v0.2.0"
+git tag -a alopex-skulk-v0.2.0 -m "Release alopex-skulk v0.2.0"
 
 # タグをプッシュ（リリースワークフロー発火）
-git push origin skulk-v0.2.0
+git push origin alopex-skulk-v0.2.0
 ```
 
 ### 7. リリース確認
 
 - [ ] GitHub Actions の Release ワークフローが成功
 - [ ] GitHub Releases にリリースノートが作成されている
-- [ ] crates.io に skulk が公開されている
-  - https://crates.io/crates/skulk
+- [ ] crates.io に alopex-skulk が公開されている
+  - https://crates.io/crates/alopex-skulk
 
 ## 手動リリース（緊急時）
 
@@ -113,8 +113,8 @@ git push origin skulk-v0.2.0
 ```bash
 cd /path/to/alopex-db/skulk
 
-# skulk を公開
-cargo publish -p skulk
+# alopex-skulk を公開
+cargo publish -p alopex-skulk
 ```
 
 ## トラブルシューティング
@@ -150,10 +150,10 @@ git commit -m "fix: resolve CI issues"
 git push origin main
 
 # 既存タグを削除して再作成（必要な場合）
-git tag -d skulk-v0.2.0
-git push origin :refs/tags/skulk-v0.2.0
-git tag -a skulk-v0.2.0 -m "Release skulk v0.2.0"
-git push origin skulk-v0.2.0
+git tag -d alopex-skulk-v0.2.0
+git push origin :refs/tags/alopex-skulk-v0.2.0
+git tag -a alopex-skulk-v0.2.0 -m "Release alopex-skulk v0.2.0"
+git push origin alopex-skulk-v0.2.0
 ```
 
 ## 依存関係の更新
@@ -192,4 +192,5 @@ cargo test --workspace
 
 | 日付 | バージョン | 変更内容 |
 |------|-----------|---------|
-| 2024-12-17 | v0.1.0 | 初回 crates.io リリース |
+| 2025-12-18 | - | クレート名を `skulk` → `alopex-skulk` に変更、タグ形式を `alopex-skulk-v*` に変更 |
+| 2024-12-17 | v0.1.0 | 初回リリース手順書作成 |

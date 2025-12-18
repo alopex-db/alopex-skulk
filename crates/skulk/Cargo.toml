@@ -1,12 +1,12 @@
 [package]
-name = "skulk"
+name = "alopex-skulk"
 version = "0.1.0"
 edition = "2021"
 description = "Alopex Skulk - Time Series Storage Engine"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/alopex-db/alopex-skulk"
 homepage = "https://github.com/alopex-db/alopex-skulk"
-documentation = "https://docs.rs/skulk"
+documentation = "https://docs.rs/alopex-skulk"
 keywords = ["time-series", "database", "storage", "tsdb", "alopex"]
 categories = ["database", "data-structures"]
 readme = "README.md"
