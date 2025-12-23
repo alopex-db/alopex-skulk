@@ -980,7 +980,7 @@ mod tests {
 
     #[test]
     fn test_flush_partition_sets_block_max_lsn() {
-        use crate::tsm::{TsmDataBlock, TsmReader};
+        use crate::tsm::{TimeSeriesMemTable, TsmDataBlock, TsmReader};
         use crate::wal::{SyncMode, Wal, WalConfig};
         use std::fs;
         use std::io::Seek;
@@ -988,8 +988,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let wal_dir = temp_dir.path().join("wal");
-        let data_dir = temp_dir.path().join("data");
-        fs::create_dir_all(&data_dir).unwrap();
+        let tsm_path = temp_dir.path().join("data.skulk");
 
         let wal_config = WalConfig {
             batch_size: 100,
@@ -999,25 +998,20 @@ mod tests {
         };
         let mut wal = Wal::new(&wal_dir, wal_config).unwrap();
 
-        let mut manager = make_manager();
+        let partition = TimePartition::new(0, Duration::from_secs(3600));
+        let mut memtable = TimeSeriesMemTable::new(partition);
 
         let point1 = make_point("cpu", 1000, 1.0);
-        let seq1 = {
-            let partition = manager.get_or_create_partition(point1.timestamp);
-            partition.insert_with_wal(&point1, &mut wal).unwrap()
-        };
+        let seq1 = memtable.insert_with_wal(&point1, &mut wal).unwrap();
         let point2 = make_point("cpu", 2000, 2.0);
-        let seq2 = {
-            let partition = manager.get_or_create_partition(point2.timestamp);
-            partition.insert_with_wal(&point2, &mut wal).unwrap()
-        };
+        let seq2 = memtable.insert_with_wal(&point2, &mut wal).unwrap();
         let expected_max_lsn = seq1.max(seq2);
 
-        let handle = manager.flush_partition(0, &data_dir).unwrap().unwrap();
-        let reader = TsmReader::open(&handle.path).unwrap();
+        let _handle = memtable.flush(&tsm_path).unwrap();
+        let reader = TsmReader::open(&tsm_path).unwrap();
         let (_, entry) = reader.index().iter().next().unwrap();
 
-        let file = fs::File::open(&handle.path).unwrap();
+        let file = fs::File::open(&tsm_path).unwrap();
         let mut reader = std::io::BufReader::new(file);
         reader
             .seek(std::io::SeekFrom::Start(entry.block_offset))
