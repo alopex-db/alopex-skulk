@@ -42,7 +42,9 @@
 //! ```
 
 use crate::error::{Result, TsmError};
-use crate::tsm::SeriesId;
+use crate::lifecycle::partition::PartitionLayout;
+use crate::tsm::partition::PartitionState;
+use crate::tsm::{PartitionManager, SeriesId, TimePartition};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -847,6 +849,56 @@ impl Wal {
         Ok(all_entries)
     }
 
+    /// Recovers WAL entries and applies DropPartition entries to the partition manager.
+    ///
+    /// DropPartition entries are idempotent; missing partitions are ignored, existing
+    /// partitions have their on-disk data removed before being marked dropped.
+    pub fn recover_with_partition_manager(
+        log_dir: impl AsRef<Path>,
+        partition_manager: &mut PartitionManager,
+        layout: &PartitionLayout,
+    ) -> Result<Vec<WalEntry>> {
+        let entries = Self::recover(log_dir)?;
+
+        for entry in &entries {
+            if let WalEntry::DropPartition {
+                partition_start,
+                partition_duration_nanos,
+                ..
+            } = entry
+            {
+                let partition = TimePartition::new(
+                    *partition_start,
+                    Duration::from_nanos(*partition_duration_nanos),
+                );
+                Self::delete_partition_files(layout, &partition)?;
+                partition_manager.set_state(*partition_start, PartitionState::Dropped);
+            }
+        }
+
+        Ok(entries)
+    }
+
+    fn delete_partition_files(layout: &PartitionLayout, partition: &TimePartition) -> Result<()> {
+        let dir = layout.partition_dir(partition);
+        if !dir.exists() {
+            return Ok(());
+        }
+
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                fs::remove_dir_all(&path)?;
+            } else {
+                fs::remove_file(&path)?;
+            }
+        }
+
+        fs::remove_dir(&dir)?;
+        Ok(())
+    }
+
     /// Forces a flush of any buffered entries.
     ///
     /// Call this to ensure all pending writes are durable before
@@ -991,6 +1043,53 @@ mod tests {
                 i as f64 * 1.5,
             );
         }
+    }
+
+    #[test]
+    fn test_recover_with_partition_manager_marks_dropped() {
+        use crate::lifecycle::partition::{PartitionDuration, PartitionLayout};
+        use crate::tsm::partition::PartitionState;
+        use crate::tsm::{PartitionManager, PartitionManagerConfig};
+        use std::fs;
+
+        let temp_dir = TempDir::new().unwrap();
+        let partition_start = 0;
+        let data_dir = temp_dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let layout = PartitionLayout::new(&data_dir, PartitionDuration::Hourly);
+
+        {
+            let config = WalConfig {
+                batch_size: 100,
+                batch_timeout: Duration::from_millis(10),
+                segment_size: 10 * 1024,
+                sync_mode: SyncMode::Fsync,
+            };
+            let mut wal = Wal::new(temp_dir.path(), config).unwrap();
+            let entry = WalEntry::new_drop_partition(
+                partition_start,
+                Duration::from_secs(3600).as_nanos() as u64,
+                1234567890,
+            );
+            wal.append(entry).unwrap();
+            wal.sync().unwrap();
+        }
+
+        let partition = TimePartition::new(partition_start, Duration::from_secs(3600));
+        let partition_dir = layout.partition_dir(&partition);
+        fs::create_dir_all(&partition_dir).unwrap();
+        fs::write(partition_dir.join("dummy.skulk"), b"data").unwrap();
+
+        let mut manager = PartitionManager::new(PartitionManagerConfig::default());
+        let entries =
+            Wal::recover_with_partition_manager(temp_dir.path(), &mut manager, &layout).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert!(!partition_dir.exists());
+        assert_eq!(
+            manager.get_state(partition_start),
+            Some(PartitionState::Dropped)
+        );
     }
 
     #[test]

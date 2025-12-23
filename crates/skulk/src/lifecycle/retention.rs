@@ -102,6 +102,12 @@ impl<P: RetentionPolicy> RetentionManager<P> {
             }
         }
 
+        if let Some(safe_lsn) = self.safe_lsn_tracker.calculate_safe_lsn() {
+            if let Err(err) = self.wal.truncate(safe_lsn) {
+                error!("WAL truncate failed at safe_lsn {}: {:?}", safe_lsn, err);
+            }
+        }
+
         Ok(dropped)
     }
 
