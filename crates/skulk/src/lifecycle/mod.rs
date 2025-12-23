@@ -6,3 +6,4 @@ pub mod retention;
 pub mod safe_lsn;
 
 pub use partition::{PartitionDuration, PartitionLayout, TsmFileInfo};
+pub use retention::{DefaultRetentionPolicy, RetentionManager, RetentionPolicy};
