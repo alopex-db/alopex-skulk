@@ -363,8 +363,8 @@ fn bench_tsm_write(c: &mut Criterion) {
                         "cpu.usage",
                         vec![("host".to_string(), "server1".to_string())],
                     );
-                    let points: BTreeMap<i64, f64> = (0..size)
-                        .map(|i| ((i as i64) * 1_000_000, i as f64 * 0.1))
+                    let points: BTreeMap<i64, (f64, u64)> = (0..size)
+                        .map(|i| ((i as i64) * 1_000_000, (i as f64 * 0.1, i as u64)))
                         .collect();
 
                     (temp_dir, file_path, series_id, meta, points)
@@ -392,8 +392,8 @@ fn bench_tsm_read_series(c: &mut Criterion) {
         "cpu.usage",
         vec![("host".to_string(), "server1".to_string())],
     );
-    let points: BTreeMap<i64, f64> = (0..10_000)
-        .map(|i| ((i as i64) * 1_000_000, i as f64 * 0.1))
+    let points: BTreeMap<i64, (f64, u64)> = (0..10_000)
+        .map(|i| ((i as i64) * 1_000_000, (i as f64 * 0.1, i as u64)))
         .collect();
 
     {
@@ -419,8 +419,8 @@ fn bench_tsm_scan(c: &mut Criterion) {
 
     let series_id = 1u64;
     let meta = SeriesMeta::new("cpu.usage", vec![]);
-    let points: BTreeMap<i64, f64> = (0..10_000)
-        .map(|i| ((i as i64) * 1_000_000, i as f64))
+    let points: BTreeMap<i64, (f64, u64)> = (0..10_000)
+        .map(|i| ((i as i64) * 1_000_000, (i as f64, i as u64)))
         .collect();
 
     {

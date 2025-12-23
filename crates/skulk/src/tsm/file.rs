@@ -14,7 +14,7 @@
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │  File Header (32 bytes)                                      │
 //! │  - Magic: "ATSM" (4 bytes)                                   │
-//! │  - Version: u16 (2 bytes) = 2                                │
+//! │  - Version: u16 (2 bytes) = 3                                │
 //! │  - Min Timestamp: i64 (8 bytes)                              │
 //! │  - Max Timestamp: i64 (8 bytes)                              │
 //! │  - Series Count: u32 (4 bytes)                               │
@@ -46,7 +46,7 @@ pub const TSM_MAGIC: [u8; 4] = *b"ATSM";
 pub const TSM_MAGIC_REVERSE: [u8; 4] = *b"MSTA";
 
 /// Current TSM file format version.
-pub const TSM_VERSION: u16 = 2;
+pub const TSM_VERSION: u16 = 3;
 
 /// Header size in bytes.
 pub const HEADER_SIZE: usize = 32;
@@ -189,7 +189,7 @@ impl SectionFlags {
 pub struct TsmHeader {
     /// Magic bytes: "ATSM"
     pub magic: [u8; 4],
-    /// File format version (currently 2).
+    /// File format version (currently 3).
     pub version: u16,
     /// Minimum timestamp in the file.
     pub min_timestamp: i64,
@@ -293,7 +293,7 @@ impl TsmHeader {
 
         // Version (2 bytes)
         let version = u16::from_le_bytes(buf[4..6].try_into().unwrap());
-        if version > TSM_VERSION {
+        if version != TSM_VERSION {
             return Err(TsmError::UnsupportedVersion(version));
         }
 
@@ -871,7 +871,7 @@ impl Default for SeriesIndex {
 /// TSM data block containing compressed time series data.
 ///
 /// Each block contains data for a single series with:
-/// - Block header with metadata
+/// - Block header with metadata (including max_lsn)
 /// - Per-block encoding types for timestamps and values
 /// - Gorilla-compressed timestamps and values
 /// - CRC32 checksum for integrity verification
@@ -885,16 +885,17 @@ impl Default for SeriesIndex {
 /// 0x08    4       point_count (u32 LE)
 /// 0x0C    8       min_timestamp (i64 LE)
 /// 0x14    8       max_timestamp (i64 LE)
-/// 0x1C    1       ts_encoding (u8)
-/// 0x1D    1       val_encoding (u8)
-/// 0x1E    4       ts_data_size (u32 LE)
-/// 0x22    N       ts_data[ts_data_size]
-/// 0x22+N  4       val_data_size (u32 LE)
-/// 0x26+N  M       val_data[val_data_size]
-/// 0x26+N+M 4      block_crc32 (u32 LE)
+/// 0x1C    8       max_lsn (u64 LE)
+/// 0x24    1       ts_encoding (u8)
+/// 0x25    1       val_encoding (u8)
+/// 0x26    4       ts_data_size (u32 LE)
+/// 0x2A    N       ts_data[ts_data_size]
+/// 0x2A+N  4       val_data_size (u32 LE)
+/// 0x2E+N  M       val_data[val_data_size]
+/// 0x2E+N+M 4      block_crc32 (u32 LE)
 /// ```
 #[derive(Debug, Clone)]
-pub struct TsmDataBlock {
+pub struct TsmDataBlockV2 {
     /// Series ID this block belongs to.
     pub series_id: SeriesId,
     /// Number of data points in the block.
@@ -903,6 +904,8 @@ pub struct TsmDataBlock {
     pub min_ts: Timestamp,
     /// Maximum timestamp in the block.
     pub max_ts: Timestamp,
+    /// Maximum LSN in the block.
+    pub max_lsn: u64,
     /// Timestamp encoding type.
     pub ts_encoding: TimestampEncoding,
     /// Value encoding type.
@@ -915,7 +918,10 @@ pub struct TsmDataBlock {
     pub block_crc32: u32,
 }
 
-impl TsmDataBlock {
+/// Alias for the current TSM data block format (v3).
+pub type TsmDataBlock = TsmDataBlockV2;
+
+impl TsmDataBlockV2 {
     /// Creates a new TSM data block with the specified encoding types.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -923,6 +929,7 @@ impl TsmDataBlock {
         point_count: u32,
         min_ts: Timestamp,
         max_ts: Timestamp,
+        max_lsn: u64,
         ts_encoding: TimestampEncoding,
         val_encoding: ValueEncoding,
         ts_data: Vec<u8>,
@@ -933,6 +940,7 @@ impl TsmDataBlock {
             point_count,
             min_ts,
             max_ts,
+            max_lsn,
             ts_encoding,
             val_encoding,
             ts_data,
@@ -945,7 +953,7 @@ impl TsmDataBlock {
 
     /// Calculates the CRC32 checksum of the block data.
     ///
-    /// CRC covers: series_id, point_count, min_ts, max_ts,
+    /// CRC covers: series_id, point_count, min_ts, max_ts, max_lsn,
     /// ts_encoding, val_encoding, ts_data_size, ts_data, val_data_size, val_data
     fn calculate_crc(&self) -> u32 {
         let mut hasher = crc32fast::Hasher::new();
@@ -953,6 +961,7 @@ impl TsmDataBlock {
         hasher.update(&self.point_count.to_le_bytes());
         hasher.update(&self.min_ts.to_le_bytes());
         hasher.update(&self.max_ts.to_le_bytes());
+        hasher.update(&self.max_lsn.to_le_bytes());
         hasher.update(&[self.ts_encoding as u8]);
         hasher.update(&[self.val_encoding as u8]);
         hasher.update(&(self.ts_data.len() as u32).to_le_bytes());
@@ -979,6 +988,8 @@ impl TsmDataBlock {
         writer.write_all(&self.min_ts.to_le_bytes())?;
         // Max timestamp (8 bytes)
         writer.write_all(&self.max_ts.to_le_bytes())?;
+        // Max LSN (8 bytes)
+        writer.write_all(&self.max_lsn.to_le_bytes())?;
         // Timestamp encoding (1 byte)
         writer.write_all(&[self.ts_encoding as u8])?;
         // Value encoding (1 byte)
@@ -1021,6 +1032,10 @@ impl TsmDataBlock {
         reader.read_exact(&mut buf8)?;
         let max_ts = i64::from_le_bytes(buf8);
 
+        // Max LSN (8 bytes)
+        reader.read_exact(&mut buf8)?;
+        let max_lsn = u64::from_le_bytes(buf8);
+
         // Timestamp encoding (1 byte)
         let mut buf1 = [0u8; 1];
         reader.read_exact(&mut buf1)?;
@@ -1057,6 +1072,7 @@ impl TsmDataBlock {
             point_count,
             min_ts,
             max_ts,
+            max_lsn,
             ts_encoding,
             val_encoding,
             ts_data,
@@ -1082,6 +1098,7 @@ impl TsmDataBlock {
         4 + // point_count
         8 + // min_ts
         8 + // max_ts
+        8 + // max_lsn
         1 + // ts_encoding
         1 + // val_encoding
         4 + // ts_data_size
@@ -1203,15 +1220,16 @@ impl TsmWriter {
         &mut self,
         series_id: SeriesId,
         meta: &SeriesMeta,
-        points: &std::collections::BTreeMap<Timestamp, f64>,
+        points: &std::collections::BTreeMap<Timestamp, (f64, u64)>,
     ) -> Result<()> {
         if points.is_empty() {
             return Ok(());
         }
 
         // Collect points for compression
-        let point_vec: Vec<(i64, f64)> = points.iter().map(|(&ts, &v)| (ts, v)).collect();
+        let point_vec: Vec<(i64, f64)> = points.iter().map(|(&ts, &(v, _))| (ts, v)).collect();
         let point_count = point_vec.len() as u32;
+        let max_lsn = points.values().map(|&(_, lsn)| lsn).max().unwrap_or(0);
 
         // Get timestamp range
         let min_ts = *points.keys().next().unwrap();
@@ -1256,6 +1274,7 @@ impl TsmWriter {
             point_count,
             min_ts,
             max_ts,
+            max_lsn,
             ts_encoding,
             val_encoding,
             ts_data,
@@ -2004,6 +2023,7 @@ mod tests {
             100,
             1000000,
             2000000,
+            42,
             TimestampEncoding::DeltaOfDelta,
             ValueEncoding::GorillaXor,
             vec![1, 2, 3, 4], // ts_data
@@ -2020,6 +2040,7 @@ mod tests {
             100,
             1000000,
             2000000,
+            42,
             TimestampEncoding::DeltaOfDelta,
             ValueEncoding::GorillaXor,
             vec![1, 2, 3, 4, 5],  // ts_data
@@ -2036,6 +2057,7 @@ mod tests {
         assert_eq!(block.point_count, read_block.point_count);
         assert_eq!(block.min_ts, read_block.min_ts);
         assert_eq!(block.max_ts, read_block.max_ts);
+        assert_eq!(block.max_lsn, read_block.max_lsn);
         assert_eq!(block.ts_encoding, read_block.ts_encoding);
         assert_eq!(block.val_encoding, read_block.val_encoding);
         assert_eq!(block.ts_data, read_block.ts_data);
@@ -2050,6 +2072,7 @@ mod tests {
             100,
             1000000,
             2000000,
+            100,
             TimestampEncoding::Raw,
             ValueEncoding::Raw,
             vec![1, 2, 3], // ts_data
@@ -2059,8 +2082,8 @@ mod tests {
         let mut buf = Vec::new();
         block.write_to(&mut buf).unwrap();
 
-        // Corrupt the data (after fixed header: 8+4+8+8+1+1+4 = 34 bytes)
-        let data_offset = 34;
+        // Corrupt the data (after fixed header: 8+4+8+8+8+1+1+4 = 42 bytes)
+        let data_offset = 42;
         buf[data_offset] ^= 0xFF;
 
         let mut cursor = Cursor::new(buf);
@@ -2084,7 +2107,7 @@ mod tests {
         );
         let mut points = std::collections::BTreeMap::new();
         for i in 0..100 {
-            points.insert(1000000 + i * 1000, 50.0 + (i as f64) * 0.1);
+            points.insert(1000000 + i * 1000, (50.0 + (i as f64) * 0.1, i as u64));
         }
 
         // Write
@@ -2136,8 +2159,8 @@ mod tests {
         let mut points1 = std::collections::BTreeMap::new();
         let mut points2 = std::collections::BTreeMap::new();
         for i in 0..50 {
-            points1.insert(1000000 + i * 1000, 50.0 + (i as f64) * 0.1);
-            points2.insert(2000000 + i * 1000, 70.0 + (i as f64) * 0.2);
+            points1.insert(1000000 + i * 1000, (50.0 + (i as f64) * 0.1, i as u64));
+            points2.insert(2000000 + i * 1000, (70.0 + (i as f64) * 0.2, i as u64));
         }
 
         // Write
@@ -2180,7 +2203,7 @@ mod tests {
         let meta = SeriesMeta::new("cpu.usage", vec![]);
         let mut points = std::collections::BTreeMap::new();
         for i in 0..100 {
-            points.insert(i * 1000, (i as f64) * 1.0);
+            points.insert(i * 1000, ((i as f64) * 1.0, i as u64));
         }
 
         // Write
@@ -2220,7 +2243,7 @@ mod tests {
         let meta = SeriesMeta::new("test.metric", vec![]);
         let mut points = std::collections::BTreeMap::new();
         for i in 0..10 {
-            points.insert(i * 1000, (i as f64) * 1.0);
+            points.insert(i * 1000, ((i as f64) * 1.0, i as u64));
         }
 
         // Write
@@ -2250,7 +2273,7 @@ mod tests {
         let meta = SeriesMeta::new("test.metric", vec![]);
         let mut points = std::collections::BTreeMap::new();
         for i in 0..10 {
-            points.insert(i * 1000, (i as f64) * 1.0);
+            points.insert(i * 1000, ((i as f64) * 1.0, i as u64));
         }
 
         // Write

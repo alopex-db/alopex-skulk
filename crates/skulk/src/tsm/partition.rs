@@ -907,7 +907,7 @@ mod tests {
         // 3. Data is recoverable from WAL after crash
         use crate::tsm::memtable::TimeSeriesMemTable;
         use crate::tsm::TimePartition;
-        use crate::wal::{SyncMode, Wal, WalConfig};
+        use crate::wal::{SyncMode, Wal, WalConfig, WalEntry};
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
@@ -952,8 +952,15 @@ mod tests {
         // Recover from WAL
         let recovered = Wal::recover(&wal_dir).unwrap();
         assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].sequence, 1);
-        assert_eq!(recovered[0].timestamp, 1000);
-        assert!((recovered[0].value - 0.75).abs() < f64::EPSILON);
+        assert_eq!(recovered[0].sequence(), 1);
+        if let WalEntry::DataPoint {
+            timestamp, value, ..
+        } = &recovered[0]
+        {
+            assert_eq!(*timestamp, 1000);
+            assert!((*value - 0.75).abs() < f64::EPSILON);
+        } else {
+            panic!("Expected data point entry");
+        }
     }
 }

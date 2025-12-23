@@ -65,6 +65,25 @@ pub enum TsmError {
         start_ts: i64,
     },
 
+    /// Partition is currently being dropped and cannot accept writes.
+    #[error("Partition {start_ts} is currently dropping, cannot accept writes")]
+    PartitionDropping {
+        /// Start timestamp of the partition that is dropping.
+        start_ts: i64,
+    },
+
+    /// Error during compaction.
+    #[error("Compaction error: {0}")]
+    CompactionError(String),
+
+    /// Invalid TSM file name.
+    #[error("Invalid TSM file name: {0}")]
+    InvalidTsmFileName(String),
+
+    /// Retention operation failed.
+    #[error("Retention error: {0}")]
+    RetentionError(String),
+
     /// WAL write failed.
     #[error("WAL write error: {0}")]
     WalWriteError(String),

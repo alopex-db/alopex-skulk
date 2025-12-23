@@ -132,8 +132,8 @@ impl TimeRange {
 // Re-export main types from submodules
 pub use file::{
     BloomFilter, CompressionType, SectionFlags, SeriesIndex, SeriesIndexEntry, TimestampEncoding,
-    TsmDataBlock, TsmFileHandle, TsmFooter, TsmHeader, TsmReader, TsmScanIterator, TsmWriter,
-    ValueEncoding, FOOTER_SIZE, HEADER_SIZE, TSM_MAGIC, TSM_MAGIC_REVERSE, TSM_VERSION,
+    TsmDataBlock, TsmDataBlockV2, TsmFileHandle, TsmFooter, TsmHeader, TsmReader, TsmScanIterator,
+    TsmWriter, ValueEncoding, FOOTER_SIZE, HEADER_SIZE, TSM_MAGIC, TSM_MAGIC_REVERSE, TSM_VERSION,
 };
 pub use gorilla::CompressedBlock;
 pub use memtable::TimeSeriesMemTable;

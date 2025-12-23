@@ -134,7 +134,7 @@ pub struct TimeSeriesMemTable {
     /// The time partition this MemTable covers.
     partition: TimePartition,
     /// Data points per series, sorted by timestamp.
-    series_data: HashMap<SeriesId, BTreeMap<Timestamp, f64>>,
+    series_data: HashMap<SeriesId, BTreeMap<Timestamp, (f64, u64)>>,
     /// Metadata for each series.
     series_meta: HashMap<SeriesId, SeriesMeta>,
     /// Statistics for this MemTable.
@@ -269,13 +269,14 @@ impl TimeSeriesMemTable {
 
         // Insert data point
         if let Some(series) = self.series_data.get_mut(&series_id) {
-            series.insert(point.timestamp, point.value);
+            series.insert(point.timestamp, (point.value, 0));
         }
 
         // Update stats
         self.stats.increment_points(1);
         self.stats.update_timestamp(point.timestamp);
-        self.stats.add_memory(std::mem::size_of::<(i64, f64)>());
+        self.stats
+            .add_memory(std::mem::size_of::<(i64, (f64, u64))>());
 
         Ok(())
     }
@@ -342,13 +343,14 @@ impl TimeSeriesMemTable {
 
         // Insert data point
         if let Some(series) = self.series_data.get_mut(&series_id) {
-            series.insert(point.timestamp, point.value);
+            series.insert(point.timestamp, (point.value, seq));
         }
 
         // Update stats
         self.stats.increment_points(1);
         self.stats.update_timestamp(point.timestamp);
-        self.stats.add_memory(std::mem::size_of::<(i64, f64)>());
+        self.stats
+            .add_memory(std::mem::size_of::<(i64, (f64, u64))>());
 
         Ok(seq)
     }
@@ -406,19 +408,22 @@ impl TimeSeriesMemTable {
         let sequences = wal.append_batch(&wal_entries)?;
 
         // WAL write succeeded - now safe to mutate MemTable
-        for (point, &series_id) in points.iter().zip(series_ids.iter()) {
+        for ((point, &series_id), &sequence) in
+            points.iter().zip(series_ids.iter()).zip(sequences.iter())
+        {
             // Create series entry if needed (now safe to mutate)
             let _ = self.get_or_create_series(&point.metric, &point.labels);
 
             // Insert data point
             if let Some(series) = self.series_data.get_mut(&series_id) {
-                series.insert(point.timestamp, point.value);
+                series.insert(point.timestamp, (point.value, sequence));
             }
 
             // Update stats
             self.stats.increment_points(1);
             self.stats.update_timestamp(point.timestamp);
-            self.stats.add_memory(std::mem::size_of::<(i64, f64)>());
+            self.stats
+                .add_memory(std::mem::size_of::<(i64, (f64, u64))>());
         }
 
         Ok(sequences)
@@ -441,7 +446,7 @@ impl TimeSeriesMemTable {
         self.series_data.iter().flat_map(move |(&series_id, data)| {
             let meta = self.series_meta.get(&series_id);
             data.range(range.start..range.end)
-                .map(move |(&ts, &value)| {
+                .map(move |(&ts, &(value, _))| {
                     let (metric, labels) = meta
                         .map(|m| (m.metric_name.clone(), m.labels.clone()))
                         .unwrap_or_default();
@@ -456,7 +461,7 @@ impl TimeSeriesMemTable {
     }
 
     /// Returns a reference to the data for a specific series.
-    pub fn get_series(&self, series_id: SeriesId) -> Option<&BTreeMap<Timestamp, f64>> {
+    pub fn get_series(&self, series_id: SeriesId) -> Option<&BTreeMap<Timestamp, (f64, u64)>> {
         self.series_data.get(&series_id)
     }
 
@@ -698,7 +703,7 @@ mod tests {
         let data = memtable.get_series(series_id);
         assert!(data.is_some());
         assert_eq!(data.unwrap().len(), 1);
-        assert_eq!(data.unwrap().get(&1000), Some(&0.75));
+        assert_eq!(data.unwrap().get(&1000), Some(&(0.75, 0)));
     }
 
     #[test]
@@ -821,7 +826,7 @@ mod tests {
         let (series_id, _) = memtable.get_or_create_series("metric", &[]);
         let data = memtable.get_series(series_id).unwrap();
         assert_eq!(data.len(), 1);
-        assert_eq!(data.get(&100), Some(&2.0)); // Latest value wins
+        assert_eq!(data.get(&100), Some(&(2.0, 0))); // Latest value wins
     }
 
     #[test]
@@ -1063,18 +1068,24 @@ mod tests {
         for entry in &recovered_entries {
             // In real recovery, we'd need to reconstruct metric/labels from series_meta
             // Here we use insert() directly for simplicity since we know the series_id
-            if let Some(series) = new_memtable.series_data.get_mut(&entry.series_id) {
-                series.insert(entry.timestamp, entry.value);
-            } else {
-                // Create series with recovered data (in real code, we'd have metric/labels persisted)
-                new_memtable
-                    .series_data
-                    .insert(entry.series_id, BTreeMap::new());
-                if let Some(series) = new_memtable.series_data.get_mut(&entry.series_id) {
-                    series.insert(entry.timestamp, entry.value);
+            if let WalEntry::DataPoint {
+                series_id,
+                timestamp,
+                value,
+                ..
+            } = entry
+            {
+                if let Some(series) = new_memtable.series_data.get_mut(series_id) {
+                    series.insert(*timestamp, (*value, entry.sequence()));
+                } else {
+                    // Create series with recovered data (in real code, we'd have metric/labels persisted)
+                    new_memtable.series_data.insert(*series_id, BTreeMap::new());
+                    if let Some(series) = new_memtable.series_data.get_mut(series_id) {
+                        series.insert(*timestamp, (*value, entry.sequence()));
+                    }
                 }
+                new_memtable.stats.increment_points(1);
             }
-            new_memtable.stats.increment_points(1);
         }
 
         // Verify recovered data
@@ -1084,7 +1095,7 @@ mod tests {
         for i in 0..10 {
             let ts = i * 1000;
             let expected_value = i as f64 * 0.1;
-            assert!((data.get(&ts).unwrap() - expected_value).abs() < f64::EPSILON);
+            assert!((data.get(&ts).unwrap().0 - expected_value).abs() < f64::EPSILON);
         }
     }
 
