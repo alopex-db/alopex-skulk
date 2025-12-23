@@ -169,6 +169,7 @@
 #![warn(rustdoc::missing_crate_level_docs)]
 
 pub mod error;
+pub mod lifecycle;
 pub mod tsm;
 pub mod wal;
 
