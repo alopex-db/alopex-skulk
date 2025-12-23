@@ -141,14 +141,16 @@
 //! let mut memtable = TimeSeriesMemTable::new(partition);
 //!
 //! for entry in recovered_entries {
-//!     // Rebuild DataPoint from entry (requires metadata lookup)
-//!     let point = DataPoint::new(
-//!         "recovered_metric", // from metadata store
-//!         vec![],
-//!         entry.timestamp,
-//!         entry.value,
-//!     );
-//!     memtable.insert(&point)?;
+//!     if let WalEntry::DataPoint { timestamp, value, .. } = entry {
+//!         // Rebuild DataPoint from entry (requires metadata lookup)
+//!         let point = DataPoint::new(
+//!             "recovered_metric", // from metadata store
+//!             vec![],
+//!             timestamp,
+//!             value,
+//!         );
+//!         memtable.insert(&point)?;
+//!     }
 //! }
 //! ```
 //!
@@ -167,6 +169,7 @@
 #![warn(rustdoc::missing_crate_level_docs)]
 
 pub mod error;
+pub mod lifecycle;
 pub mod tsm;
 pub mod wal;
 

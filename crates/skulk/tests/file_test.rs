@@ -12,12 +12,12 @@ fn generate_points(
     interval: i64,
     count: usize,
     base_value: f64,
-) -> BTreeMap<i64, f64> {
+) -> BTreeMap<i64, (f64, u64)> {
     let mut points = BTreeMap::new();
     for i in 0..count {
         let ts = start_ts + (i as i64) * interval;
         let value = base_value + (i as f64) * 0.1 + ((i as f64) * 0.1).sin() * 5.0;
-        points.insert(ts, value);
+        points.insert(ts, (value, i as u64));
     }
     points
 }
@@ -226,7 +226,7 @@ fn test_scan_time_range() {
         let meta = SeriesMeta::new("cpu.usage", vec![]);
         let mut points = BTreeMap::new();
         for i in 0..1000 {
-            points.insert(i * 1_000_000_000, (i as f64) * 1.0);
+            points.insert(i * 1_000_000_000, ((i as f64) * 1.0, i as u64));
         }
 
         let mut writer = TsmWriter::new(&file_path).unwrap();
@@ -336,37 +336,45 @@ fn test_various_data_patterns() {
     let file_path = temp_dir.path().join("patterns.skulk");
 
     // Test with various data patterns
-    let patterns: Vec<(&str, BTreeMap<i64, f64>)> = vec![
+    type Pattern = (&'static str, BTreeMap<i64, (f64, u64)>);
+    let patterns: Vec<Pattern> = vec![
         // Constant values
-        ("constant", (0..100).map(|i| (i * 1000, 42.0)).collect()),
+        (
+            "constant",
+            (0..100).map(|i| (i * 1000, (42.0, i as u64))).collect(),
+        ),
         // Monotonically increasing
         (
             "increasing",
-            (0..100).map(|i| (i * 1000, i as f64)).collect(),
+            (0..100).map(|i| (i * 1000, (i as f64, i as u64))).collect(),
         ),
         // High frequency oscillation
         (
             "oscillation",
             (0..100)
-                .map(|i| (i * 1000, (i as f64 * 0.5).sin() * 100.0))
+                .map(|i| (i * 1000, ((i as f64 * 0.5).sin() * 100.0, i as u64)))
                 .collect(),
         ),
         // Sparse data with large gaps
         (
             "sparse",
             (0..10)
-                .map(|i| (i * 100_000_000, i as f64 * 10.0))
+                .map(|i| (i * 100_000_000, (i as f64 * 10.0, i as u64)))
                 .collect(),
         ),
         // Very small values
         (
             "small",
-            (0..100).map(|i| (i * 1000, (i as f64) * 1e-10)).collect(),
+            (0..100)
+                .map(|i| (i * 1000, ((i as f64) * 1e-10, i as u64)))
+                .collect(),
         ),
         // Very large values
         (
             "large",
-            (0..100).map(|i| (i * 1000, (i as f64) * 1e10)).collect(),
+            (0..100)
+                .map(|i| (i * 1000, ((i as f64) * 1e10, i as u64)))
+                .collect(),
         ),
     ];
 
@@ -390,7 +398,9 @@ fn test_various_data_patterns() {
             let read_points = reader.read_series(i as u64 + 1).unwrap().unwrap();
             assert_eq!(read_points.len(), original_points.len());
 
-            for ((ts, val), (orig_ts, orig_val)) in read_points.iter().zip(original_points.iter()) {
+            for ((ts, val), (orig_ts, (orig_val, _))) in
+                read_points.iter().zip(original_points.iter())
+            {
                 assert_eq!(*ts, *orig_ts);
                 // Use relative comparison for floating point
                 if orig_val.abs() > f64::EPSILON {
@@ -416,10 +426,11 @@ fn test_empty_series_ignored() {
     // Write with empty series (should be ignored)
     {
         let meta = SeriesMeta::new("empty", vec![]);
-        let empty_points: BTreeMap<i64, f64> = BTreeMap::new();
+        let empty_points: BTreeMap<i64, (f64, u64)> = BTreeMap::new();
 
         let non_empty_meta = SeriesMeta::new("non_empty", vec![]);
-        let non_empty_points: BTreeMap<i64, f64> = (0..10).map(|i| (i * 1000, i as f64)).collect();
+        let non_empty_points: BTreeMap<i64, (f64, u64)> =
+            (0..10).map(|i| (i * 1000, (i as f64, i as u64))).collect();
 
         let mut writer = TsmWriter::new(&file_path).unwrap();
         writer.write_series(1, &meta, &empty_points).unwrap(); // Empty, ignored

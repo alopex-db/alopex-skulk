@@ -9,7 +9,7 @@ use alopex_skulk::tsm::{
     DataPoint, PartitionManager, PartitionManagerConfig, TimePartition, TimeRange,
     TimeSeriesMemTable, TsmReader,
 };
-use alopex_skulk::wal::{SyncMode, Wal, WalConfig};
+use alopex_skulk::wal::{SyncMode, Wal, WalConfig, WalEntry};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -228,26 +228,41 @@ fn test_crash_recovery_from_wal() {
         let series_id = TimeSeriesMemTable::compute_series_id("cpu.usage", &labels);
 
         for entry in &recovered_entries {
-            assert_eq!(entry.series_id, series_id);
+            match entry {
+                WalEntry::DataPoint {
+                    series_id: entry_series_id,
+                    timestamp,
+                    value,
+                    ..
+                } => {
+                    assert_eq!(*entry_series_id, series_id);
 
-            // In real recovery, we'd reconstruct the DataPoint from stored metadata
-            // Here we verify the entry data matches expectations
-            let idx = (entry.timestamp / 1_000_000) as usize;
-            let expected_val = 42.0 + idx as f64 * 0.5;
-            assert!(
-                (entry.value - expected_val).abs() < f64::EPSILON,
-                "Recovered value mismatch at index {}: expected {}, got {}",
-                idx,
-                expected_val,
-                entry.value
-            );
+                    // In real recovery, we'd reconstruct the DataPoint from stored metadata
+                    // Here we verify the entry data matches expectations
+                    let idx = (*timestamp / 1_000_000) as usize;
+                    let expected_val = 42.0 + idx as f64 * 0.5;
+                    assert!(
+                        (*value - expected_val).abs() < f64::EPSILON,
+                        "Recovered value mismatch at index {}: expected {}, got {}",
+                        idx,
+                        expected_val,
+                        value
+                    );
+                }
+                _ => panic!("Expected data point entry"),
+            }
         }
 
         // Replay into a new MemTable
         for entry in &recovered_entries {
-            // Simulate inserting recovered data (without WAL since we're recovering)
-            let point = DataPoint::new("cpu.usage", labels.clone(), entry.timestamp, entry.value);
-            recovered_memtable.insert(&point).unwrap();
+            if let WalEntry::DataPoint {
+                timestamp, value, ..
+            } = entry
+            {
+                // Simulate inserting recovered data (without WAL since we're recovering)
+                let point = DataPoint::new("cpu.usage", labels.clone(), *timestamp, *value);
+                recovered_memtable.insert(&point).unwrap();
+            }
         }
 
         assert_eq!(recovered_memtable.point_count(), 100);
@@ -255,7 +270,7 @@ fn test_crash_recovery_from_wal() {
         // Verify data matches original
         let data = recovered_memtable.get_series(series_id).unwrap();
         for (ts, val) in &original_points {
-            assert_eq!(data.get(ts), Some(val));
+            assert_eq!(data.get(ts).map(|(v, _)| v), Some(val));
         }
     }
 }
@@ -315,9 +330,16 @@ fn test_wal_survives_multiple_reopens() {
     assert_eq!(recovered.len(), 100);
 
     for (i, entry) in recovered.iter().enumerate() {
-        assert_eq!(entry.sequence, (i + 1) as u64);
-        assert_eq!(entry.timestamp, (i as i64) * 1000);
-        assert!((entry.value - i as f64).abs() < f64::EPSILON);
+        assert_eq!(entry.sequence(), (i + 1) as u64);
+        if let WalEntry::DataPoint {
+            timestamp, value, ..
+        } = entry
+        {
+            assert_eq!(*timestamp, (i as i64) * 1000);
+            assert!((*value - i as f64).abs() < f64::EPSILON);
+        } else {
+            panic!("Expected data point entry");
+        }
     }
 }
 
@@ -369,13 +391,9 @@ fn test_recovery_with_partial_entries() {
         file.write_all(&[0xDE, 0xAD]).unwrap(); // Truncated data
     }
 
-    // Recovery should still get the valid entries
+    // Recovery should stop at the corrupted tail and salvage valid entries
     let recovered = Wal::recover(&wal_dir).unwrap();
-    assert_eq!(
-        recovered.len(),
-        20,
-        "Should recover all valid entries before corruption"
-    );
+    assert_eq!(recovered.len(), 20);
 }
 
 // ============================================================================
@@ -670,13 +688,13 @@ fn test_end_to_end_with_crash_recovery() {
 
         // Replay recovered entries
         for entry in &recovered_entries {
-            let point = DataPoint::new(
-                "requests.count",
-                labels.clone(),
-                entry.timestamp,
-                entry.value,
-            );
-            memtable.insert(&point).unwrap();
+            if let WalEntry::DataPoint {
+                timestamp, value, ..
+            } = entry
+            {
+                let point = DataPoint::new("requests.count", labels.clone(), *timestamp, *value);
+                memtable.insert(&point).unwrap();
+            }
         }
 
         // Continue writing new data

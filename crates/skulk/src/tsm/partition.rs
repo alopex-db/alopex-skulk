@@ -25,8 +25,8 @@
 //! manager.insert(&point)?;
 //! ```
 
-use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::{Result, TsmError};
@@ -139,6 +139,42 @@ pub struct PartitionManagerStats {
     pub newest_partition_ts: Option<i64>,
 }
 
+/// Partition lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionState {
+    /// Active and writable.
+    Active,
+    /// Dropping (writes rejected).
+    Dropping,
+    /// Dropped (removed from active list).
+    Dropped,
+}
+
+/// Partition lifecycle information tracked in memory.
+#[derive(Debug, Clone)]
+pub struct PartitionInfo {
+    /// Partition metadata.
+    pub partition: TimePartition,
+    /// Current lifecycle state.
+    pub state: PartitionState,
+    /// Last flushed LSN for this partition.
+    pub flushed_lsn: u64,
+    /// TSM files currently associated with this partition.
+    pub tsm_files: Vec<PathBuf>,
+}
+
+impl PartitionInfo {
+    /// Creates a new partition info entry.
+    pub fn new(partition: TimePartition) -> Self {
+        Self {
+            partition,
+            state: PartitionState::Active,
+            flushed_lsn: 0,
+            tsm_files: Vec::new(),
+        }
+    }
+}
+
 /// Manages multiple time partitions for time series data.
 ///
 /// The partition manager routes incoming data points to the appropriate
@@ -157,6 +193,8 @@ pub struct PartitionManagerStats {
 pub struct PartitionManager {
     /// Active partitions (start_ts -> MemTable).
     partitions: BTreeMap<i64, TimeSeriesMemTable>,
+    /// In-memory partition lifecycle states.
+    partition_states: HashMap<i64, PartitionInfo>,
     /// Configuration for the manager.
     config: PartitionManagerConfig,
     /// Set of partition start timestamps that are currently being flushed.
@@ -173,6 +211,7 @@ impl PartitionManager {
     pub fn new(config: PartitionManagerConfig) -> Self {
         Self {
             partitions: BTreeMap::new(),
+            partition_states: HashMap::new(),
             config,
             flushing_partitions: HashSet::new(),
         }
@@ -199,11 +238,43 @@ impl PartitionManager {
 
         if !self.partitions.contains_key(&start_ts) {
             let partition = TimePartition::new(start_ts, self.config.partition_duration);
-            let memtable = TimeSeriesMemTable::new(partition);
+            let memtable = TimeSeriesMemTable::new(partition.clone());
             self.partitions.insert(start_ts, memtable);
+            self.partition_states
+                .entry(start_ts)
+                .or_insert_with(|| PartitionInfo::new(partition));
         }
 
         self.partitions.get_mut(&start_ts).unwrap()
+    }
+
+    /// Returns the current state for a partition.
+    pub fn get_state(&self, start_ts: i64) -> Option<PartitionState> {
+        self.partition_states.get(&start_ts).map(|info| info.state)
+    }
+
+    /// Sets the state for a partition.
+    pub fn set_state(&mut self, start_ts: i64, state: PartitionState) {
+        let partition = TimePartition::new(start_ts, self.config.partition_duration);
+        let info = self
+            .partition_states
+            .entry(start_ts)
+            .or_insert_with(|| PartitionInfo::new(partition));
+        info.state = state;
+
+        if state == PartitionState::Dropped {
+            self.partitions.remove(&start_ts);
+            self.flushing_partitions.remove(&start_ts);
+        }
+    }
+
+    fn ensure_writable_partition(&self, start_ts: i64) -> Result<()> {
+        if let Some(info) = self.partition_states.get(&start_ts) {
+            if info.state != PartitionState::Active {
+                return Err(TsmError::PartitionDropping { start_ts });
+            }
+        }
+        Ok(())
     }
 
     /// Inserts a single data point into the appropriate partition.
@@ -221,6 +292,7 @@ impl PartitionManager {
         if self.flushing_partitions.contains(&start_ts) {
             return Err(TsmError::PartitionFlushing { start_ts });
         }
+        self.ensure_writable_partition(start_ts)?;
 
         let memtable = self.get_or_create_partition(point.timestamp);
         memtable.insert(point)
@@ -248,6 +320,7 @@ impl PartitionManager {
             if self.flushing_partitions.contains(&start_ts) {
                 return Err(TsmError::PartitionFlushing { start_ts });
             }
+            self.ensure_writable_partition(start_ts)?;
         }
 
         // Insert points for each partition
@@ -255,8 +328,11 @@ impl PartitionManager {
             // Ensure partition exists
             if !self.partitions.contains_key(&start_ts) {
                 let partition = TimePartition::new(start_ts, self.config.partition_duration);
-                let memtable = TimeSeriesMemTable::new(partition);
+                let memtable = TimeSeriesMemTable::new(partition.clone());
                 self.partitions.insert(start_ts, memtable);
+                self.partition_states
+                    .entry(start_ts)
+                    .or_insert_with(|| PartitionInfo::new(partition));
             }
 
             // Insert points
@@ -539,6 +615,12 @@ impl PartitionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_manager() -> PartitionManager {
+        let config =
+            PartitionManagerConfig::default().with_partition_duration(Duration::from_secs(3600));
+        PartitionManager::new(config)
+    }
 
     fn make_point(metric: &str, timestamp: i64, value: f64) -> DataPoint {
         DataPoint::new(metric.to_string(), vec![], timestamp, value)
@@ -897,6 +979,84 @@ mod tests {
     }
 
     #[test]
+    fn test_flush_partition_sets_block_max_lsn() {
+        use crate::tsm::{TimeSeriesMemTable, TsmDataBlock, TsmReader};
+        use crate::wal::{SyncMode, Wal, WalConfig};
+        use std::fs;
+        use std::io::Seek;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let wal_dir = temp_dir.path().join("wal");
+        let tsm_path = temp_dir.path().join("data.skulk");
+
+        let wal_config = WalConfig {
+            batch_size: 100,
+            batch_timeout: Duration::from_millis(10),
+            segment_size: 1024 * 1024,
+            sync_mode: SyncMode::Fsync,
+        };
+        let mut wal = Wal::new(&wal_dir, wal_config).unwrap();
+
+        let partition = TimePartition::new(0, Duration::from_secs(3600));
+        let mut memtable = TimeSeriesMemTable::new(partition);
+
+        let point1 = make_point("cpu", 1000, 1.0);
+        let seq1 = memtable.insert_with_wal(&point1, &mut wal).unwrap();
+        let point2 = make_point("cpu", 2000, 2.0);
+        let seq2 = memtable.insert_with_wal(&point2, &mut wal).unwrap();
+        let expected_max_lsn = seq1.max(seq2);
+
+        let _handle = memtable.flush(&tsm_path).unwrap();
+        let reader = TsmReader::open(&tsm_path).unwrap();
+        let (_, entry) = reader.index().iter().next().unwrap();
+
+        let file = fs::File::open(&tsm_path).unwrap();
+        let mut reader = std::io::BufReader::new(file);
+        reader
+            .seek(std::io::SeekFrom::Start(entry.block_offset))
+            .unwrap();
+        let block = TsmDataBlock::read_from(&mut reader).unwrap();
+
+        assert_eq!(block.max_lsn, expected_max_lsn);
+    }
+
+    #[test]
+    fn test_partition_state_transitions() {
+        let mut manager = make_manager();
+        let point = make_point("metric", 1000, 1.0);
+        manager.insert(&point).unwrap();
+
+        assert_eq!(manager.get_state(0), Some(PartitionState::Active));
+
+        manager.set_state(0, PartitionState::Dropping);
+        assert_eq!(manager.get_state(0), Some(PartitionState::Dropping));
+
+        manager.set_state(0, PartitionState::Dropped);
+        assert_eq!(manager.get_state(0), Some(PartitionState::Dropped));
+        assert!(manager.get_partition(0).is_none());
+    }
+
+    #[test]
+    fn test_insert_blocked_during_dropping() {
+        let mut manager = make_manager();
+        let point = make_point("metric", 1000, 1.0);
+        manager.insert(&point).unwrap();
+
+        manager.set_state(0, PartitionState::Dropping);
+
+        let result = manager.insert(&point);
+        assert!(result.is_err(), "Insert should fail when dropping");
+        match result {
+            Err(TsmError::PartitionDropping { start_ts }) => {
+                assert_eq!(start_ts, 0);
+            }
+            Err(err) => panic!("Unexpected error: {err:?}"),
+            Ok(_) => panic!("Expected error when inserting into dropping partition"),
+        }
+    }
+
+    #[test]
     fn test_insert_requires_wal_before_memtable() {
         // Test for WAL/Durability Contract (task 4.C completed):
         // "Client → WAL append → batch fsync → MemTable insert → Ack"
@@ -907,7 +1067,7 @@ mod tests {
         // 3. Data is recoverable from WAL after crash
         use crate::tsm::memtable::TimeSeriesMemTable;
         use crate::tsm::TimePartition;
-        use crate::wal::{SyncMode, Wal, WalConfig};
+        use crate::wal::{SyncMode, Wal, WalConfig, WalEntry};
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
@@ -952,8 +1112,15 @@ mod tests {
         // Recover from WAL
         let recovered = Wal::recover(&wal_dir).unwrap();
         assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].sequence, 1);
-        assert_eq!(recovered[0].timestamp, 1000);
-        assert!((recovered[0].value - 0.75).abs() < f64::EPSILON);
+        assert_eq!(recovered[0].sequence(), 1);
+        if let WalEntry::DataPoint {
+            timestamp, value, ..
+        } = &recovered[0]
+        {
+            assert_eq!(*timestamp, 1000);
+            assert!((*value - 0.75).abs() < f64::EPSILON);
+        } else {
+            panic!("Expected data point entry");
+        }
     }
 }

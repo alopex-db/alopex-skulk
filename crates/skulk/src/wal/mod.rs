@@ -42,8 +42,9 @@
 //! ```
 
 use crate::error::{Result, TsmError};
-use crate::tsm::SeriesId;
-use serde::{Deserialize, Serialize};
+use crate::lifecycle::partition::PartitionLayout;
+use crate::tsm::partition::PartitionState;
+use crate::tsm::{PartitionManager, SeriesId, TimePartition};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -69,7 +70,7 @@ const SEGMENT_PREFIX: &str = "segment";
 const WAL_MAGIC: [u8; 4] = [b'S', b'W', b'A', b'L']; // "SWAL" for Skulk WAL
 
 /// WAL format version.
-const WAL_VERSION: u16 = 1;
+const WAL_VERSION: u16 = 2;
 
 /// Sync mode for WAL durability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -124,74 +125,174 @@ impl WalConfig {
     }
 }
 
-/// A single entry in the Write-Ahead Log.
-///
-/// Each entry represents a time series data point with its series ID,
-/// timestamp, and value, protected by a CRC32 checksum.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WalEntry {
-    /// Unique sequence number for this entry.
-    pub sequence: u64,
-    /// Series identifier.
-    pub series_id: SeriesId,
-    /// Timestamp in nanoseconds.
-    pub timestamp: i64,
-    /// Data point value.
-    pub value: f64,
+/// WAL entry payload size in bytes.
+pub const WAL_ENTRY_SIZE: usize = 33;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum WalEntryType {
+    DataPoint = 1,
+    DropPartition = 2,
 }
 
-impl WalEntry {
-    /// Creates a new WAL entry.
+/// A single entry in the Write-Ahead Log (v2).
+///
+/// Each entry is fixed-size (33 bytes payload) and protected by a CRC32 checksum.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WalEntryV2 {
+    /// Data point write entry.
+    DataPoint {
+        /// Unique sequence number for this entry.
+        sequence: u64,
+        /// Series identifier.
+        series_id: SeriesId,
+        /// Timestamp in nanoseconds.
+        timestamp: i64,
+        /// Data point value.
+        value: f64,
+    },
+    /// Drop partition entry.
+    DropPartition {
+        /// Unique sequence number for this entry.
+        sequence: u64,
+        /// Partition start timestamp (nanoseconds since epoch).
+        partition_start: i64,
+        /// Partition duration in nanoseconds.
+        partition_duration_nanos: u64,
+        /// Drop operation timestamp.
+        dropped_at: i64,
+    },
+}
+
+/// Alias for the current WAL entry format (v2).
+pub type WalEntry = WalEntryV2;
+
+impl WalEntryV2 {
+    /// Creates a new data point WAL entry.
     ///
-    /// Note: The sequence number should be set by the WAL when appending.
+    /// Note: The sequence number is set by the WAL when appending.
     pub fn new(series_id: SeriesId, timestamp: i64, value: f64) -> Self {
-        Self {
-            sequence: 0, // Will be set by WAL
+        Self::DataPoint {
+            sequence: 0,
             series_id,
             timestamp,
             value,
+        }
+    }
+
+    /// Creates a DropPartition WAL entry.
+    ///
+    /// Note: The sequence number is set by the WAL when appending.
+    pub fn new_drop_partition(
+        partition_start: i64,
+        partition_duration_nanos: u64,
+        dropped_at: i64,
+    ) -> Self {
+        Self::DropPartition {
+            sequence: 0,
+            partition_start,
+            partition_duration_nanos,
+            dropped_at,
         }
     }
 
     /// Creates a WAL entry with a specific sequence number.
     pub fn with_sequence(sequence: u64, series_id: SeriesId, timestamp: i64, value: f64) -> Self {
-        Self {
+        Self::DataPoint {
             sequence,
             series_id,
             timestamp,
             value,
+        }
+    }
+
+    /// Returns the sequence number of the entry.
+    pub fn sequence(&self) -> u64 {
+        match self {
+            Self::DataPoint { sequence, .. } | Self::DropPartition { sequence, .. } => *sequence,
+        }
+    }
+
+    /// Sets the sequence number of the entry.
+    pub fn set_sequence(&mut self, sequence: u64) {
+        match self {
+            Self::DataPoint { sequence: seq, .. } | Self::DropPartition { sequence: seq, .. } => {
+                *seq = sequence;
+            }
         }
     }
 
     /// Serializes the entry to bytes.
     fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(32);
-        bytes.extend_from_slice(&self.sequence.to_le_bytes());
-        bytes.extend_from_slice(&self.series_id.to_le_bytes());
-        bytes.extend_from_slice(&self.timestamp.to_le_bytes());
-        bytes.extend_from_slice(&self.value.to_le_bytes());
+        let mut bytes = Vec::with_capacity(WAL_ENTRY_SIZE);
+        match self {
+            Self::DataPoint {
+                sequence,
+                series_id,
+                timestamp,
+                value,
+            } => {
+                bytes.push(WalEntryType::DataPoint as u8);
+                bytes.extend_from_slice(&sequence.to_le_bytes());
+                bytes.extend_from_slice(&series_id.to_le_bytes());
+                bytes.extend_from_slice(&timestamp.to_le_bytes());
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Self::DropPartition {
+                sequence,
+                partition_start,
+                partition_duration_nanos,
+                dropped_at,
+            } => {
+                bytes.push(WalEntryType::DropPartition as u8);
+                bytes.extend_from_slice(&sequence.to_le_bytes());
+                bytes.extend_from_slice(&partition_start.to_le_bytes());
+                bytes.extend_from_slice(&partition_duration_nanos.to_le_bytes());
+                bytes.extend_from_slice(&dropped_at.to_le_bytes());
+            }
+        }
         bytes
     }
 
     /// Deserializes an entry from bytes.
     fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 32 {
+        if bytes.len() != WAL_ENTRY_SIZE {
             return Err(TsmError::DecompressionError(
-                "WAL entry too short".to_string(),
+                "WAL entry size mismatch".to_string(),
             ));
         }
 
-        let sequence = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        let series_id = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let timestamp = i64::from_le_bytes(bytes[16..24].try_into().unwrap());
-        let value = f64::from_le_bytes(bytes[24..32].try_into().unwrap());
+        let entry_type = bytes[0];
+        let sequence = u64::from_le_bytes(bytes[1..9].try_into().unwrap());
 
-        Ok(Self {
-            sequence,
-            series_id,
-            timestamp,
-            value,
-        })
+        match entry_type {
+            x if x == WalEntryType::DataPoint as u8 => {
+                let series_id = u64::from_le_bytes(bytes[9..17].try_into().unwrap());
+                let timestamp = i64::from_le_bytes(bytes[17..25].try_into().unwrap());
+                let value = f64::from_le_bytes(bytes[25..33].try_into().unwrap());
+                Ok(Self::DataPoint {
+                    sequence,
+                    series_id,
+                    timestamp,
+                    value,
+                })
+            }
+            x if x == WalEntryType::DropPartition as u8 => {
+                let partition_start = i64::from_le_bytes(bytes[9..17].try_into().unwrap());
+                let partition_duration_nanos =
+                    u64::from_le_bytes(bytes[17..25].try_into().unwrap());
+                let dropped_at = i64::from_le_bytes(bytes[25..33].try_into().unwrap());
+                Ok(Self::DropPartition {
+                    sequence,
+                    partition_start,
+                    partition_duration_nanos,
+                    dropped_at,
+                })
+            }
+            _ => Err(TsmError::DecompressionError(
+                "Unknown WAL entry type".to_string(),
+            )),
+        }
     }
 }
 
@@ -360,10 +461,10 @@ impl Wal {
                                         }
 
                                         // Read the segment to find max sequence (from all segments, not just max)
-                                        if let Ok(entries) = Self::read_segment(&path) {
+                                        if let Ok(entries) = Self::read_segment_strict(&path) {
                                             for entry in entries {
-                                                if entry.sequence > max_sequence {
-                                                    max_sequence = entry.sequence;
+                                                if entry.sequence() > max_sequence {
+                                                    max_sequence = entry.sequence();
                                                 }
                                             }
                                         }
@@ -401,8 +502,8 @@ impl Wal {
         ))
     }
 
-    /// Reads all entries from a segment file.
-    fn read_segment(path: &Path) -> Result<Vec<WalEntry>> {
+    /// Reads all entries from a segment file (strict mode).
+    fn read_segment_strict(path: &Path) -> Result<Vec<WalEntry>> {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
 
@@ -416,7 +517,30 @@ impl Wal {
                 Ok(None) => break, // EOF
                 Err(e) => {
                     warn!("Error reading WAL entry: {:?}", e);
-                    break; // Stop on error (partial write or corruption)
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+
+    /// Reads entries from a segment file, stopping at the first error.
+    fn read_segment_lenient(path: &Path) -> Result<Vec<WalEntry>> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+
+        // Read and validate header
+        let _header = SegmentHeader::read_from(&mut reader)?;
+
+        let mut entries = Vec::new();
+        loop {
+            match Self::read_entry(&mut reader) {
+                Ok(Some(entry)) => entries.push(entry),
+                Ok(None) => break, // EOF
+                Err(e) => {
+                    warn!("Error reading WAL entry: {:?}", e);
+                    break;
                 }
             }
         }
@@ -437,6 +561,12 @@ impl Wal {
 
         if len == 0 {
             return Ok(None);
+        }
+        if len != WAL_ENTRY_SIZE {
+            return Err(TsmError::DecompressionError(format!(
+                "WAL entry size mismatch: expected {}, got {}",
+                WAL_ENTRY_SIZE, len
+            )));
         }
 
         // Read checksum (4 bytes)
@@ -475,9 +605,9 @@ impl Wal {
     ///
     /// Returns an error if the write or fsync fails.
     pub fn append(&mut self, mut entry: WalEntry) -> Result<u64> {
-        entry.sequence = self.next_sequence;
+        entry.set_sequence(self.next_sequence);
         self.next_sequence += 1;
-        let seq = entry.sequence;
+        let seq = entry.sequence();
 
         self.batch_buffer.push(entry);
 
@@ -505,9 +635,9 @@ impl Wal {
 
         for entry in entries {
             let mut e = entry.clone();
-            e.sequence = self.next_sequence;
+            e.set_sequence(self.next_sequence);
             self.next_sequence += 1;
-            sequences.push(e.sequence);
+            sequences.push(e.sequence());
             self.batch_buffer.push(e);
         }
 
@@ -524,7 +654,7 @@ impl Wal {
         }
 
         // Check if we need to rotate segments
-        let estimated_size: usize = self.batch_buffer.iter().map(|_| 32 + 8).sum();
+        let estimated_size: usize = self.batch_buffer.iter().map(|_| WAL_ENTRY_SIZE + 8).sum();
         if self.current_segment_size + estimated_size > self.config.segment_size {
             self.rotate_segment()?;
         }
@@ -565,7 +695,7 @@ impl Wal {
         let data = entry.to_bytes();
         let crc = crc32fast::hash(&data);
 
-        // Write: length (4) + crc (4) + data (32)
+        // Write: length (4) + crc (4) + data (fixed payload)
         self.current_segment
             .write_all(&(data.len() as u32).to_le_bytes())?;
         self.current_segment.write_all(&crc.to_le_bytes())?;
@@ -633,8 +763,18 @@ impl Wal {
             }
 
             // Check if all entries in this segment are flushed
-            let entries = Self::read_segment(&segment_path)?;
-            let all_flushed = entries.iter().all(|e| e.sequence <= up_to_seq);
+            let entries = match Self::read_segment_strict(&segment_path) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    warn!(
+                        "Skipping WAL segment {} due to read error: {:?}",
+                        segment_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+            let all_flushed = entries.iter().all(|e| e.sequence() <= up_to_seq);
 
             if all_flushed {
                 fs::remove_file(&segment_path)?;
@@ -674,7 +814,7 @@ impl Wal {
     /// Recovers WAL entries from the specified directory.
     ///
     /// Scans all segment files and returns all valid entries in sequence order.
-    /// Corrupted entries are skipped with warnings.
+    /// Segments with read errors are skipped with warnings.
     ///
     /// # Arguments
     ///
@@ -706,7 +846,7 @@ impl Wal {
 
         // Read entries from each segment
         for segment_path in segments {
-            match Self::read_segment(&segment_path) {
+            match Self::read_segment_lenient(&segment_path) {
                 Ok(entries) => {
                     debug!(
                         "Recovered {} entries from segment {}",
@@ -726,10 +866,60 @@ impl Wal {
         }
 
         // Sort by sequence number
-        all_entries.sort_by_key(|e| e.sequence);
+        all_entries.sort_by_key(|e| e.sequence());
 
         debug!("Total recovered WAL entries: {}", all_entries.len());
         Ok(all_entries)
+    }
+
+    /// Recovers WAL entries and applies DropPartition entries to the partition manager.
+    ///
+    /// DropPartition entries are idempotent; missing partitions are ignored, existing
+    /// partitions have their on-disk data removed before being marked dropped.
+    pub fn recover_with_partition_manager(
+        log_dir: impl AsRef<Path>,
+        partition_manager: &mut PartitionManager,
+        layout: &PartitionLayout,
+    ) -> Result<Vec<WalEntry>> {
+        let entries = Self::recover(log_dir)?;
+
+        for entry in &entries {
+            if let WalEntry::DropPartition {
+                partition_start,
+                partition_duration_nanos,
+                ..
+            } = entry
+            {
+                let partition = TimePartition::new(
+                    *partition_start,
+                    Duration::from_nanos(*partition_duration_nanos),
+                );
+                Self::delete_partition_files(layout, &partition)?;
+                partition_manager.set_state(*partition_start, PartitionState::Dropped);
+            }
+        }
+
+        Ok(entries)
+    }
+
+    fn delete_partition_files(layout: &PartitionLayout, partition: &TimePartition) -> Result<()> {
+        let dir = layout.partition_dir(partition);
+        if !dir.exists() {
+            return Ok(());
+        }
+
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                fs::remove_dir_all(&path)?;
+            } else {
+                fs::remove_file(&path)?;
+            }
+        }
+
+        fs::remove_dir(&dir)?;
+        Ok(())
     }
 
     /// Forces a flush of any buffered entries.
@@ -792,6 +982,29 @@ mod tests {
         (temp_dir, wal)
     }
 
+    fn assert_data_point(
+        entry: &WalEntry,
+        sequence: u64,
+        series_id: SeriesId,
+        timestamp: i64,
+        value: f64,
+    ) {
+        match entry {
+            WalEntry::DataPoint {
+                sequence: seq,
+                series_id: sid,
+                timestamp: ts,
+                value: val,
+            } => {
+                assert_eq!(*seq, sequence);
+                assert_eq!(*sid, series_id);
+                assert_eq!(*ts, timestamp);
+                assert!((*val - value).abs() < f64::EPSILON);
+            }
+            _ => panic!("Expected data point entry"),
+        }
+    }
+
     #[test]
     fn test_wal_append_single() {
         let (_temp_dir, mut wal) = create_test_wal();
@@ -845,11 +1058,61 @@ mod tests {
 
         assert_eq!(entries.len(), 10);
         for (i, entry) in entries.iter().enumerate() {
-            assert_eq!(entry.sequence, (i + 1) as u64);
-            assert_eq!(entry.series_id, i as u64);
-            assert_eq!(entry.timestamp, (i * 1000) as i64);
-            assert!((entry.value - (i as f64 * 1.5)).abs() < f64::EPSILON);
+            assert_data_point(
+                entry,
+                (i + 1) as u64,
+                i as u64,
+                (i * 1000) as i64,
+                i as f64 * 1.5,
+            );
         }
+    }
+
+    #[test]
+    fn test_recover_with_partition_manager_marks_dropped() {
+        use crate::lifecycle::partition::{PartitionDuration, PartitionLayout};
+        use crate::tsm::partition::PartitionState;
+        use crate::tsm::{PartitionManager, PartitionManagerConfig};
+        use std::fs;
+
+        let temp_dir = TempDir::new().unwrap();
+        let partition_start = 0;
+        let data_dir = temp_dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let layout = PartitionLayout::new(&data_dir, PartitionDuration::Hourly);
+
+        {
+            let config = WalConfig {
+                batch_size: 100,
+                batch_timeout: Duration::from_millis(10),
+                segment_size: 10 * 1024,
+                sync_mode: SyncMode::Fsync,
+            };
+            let mut wal = Wal::new(temp_dir.path(), config).unwrap();
+            let entry = WalEntry::new_drop_partition(
+                partition_start,
+                Duration::from_secs(3600).as_nanos() as u64,
+                1234567890,
+            );
+            wal.append(entry).unwrap();
+            wal.sync().unwrap();
+        }
+
+        let partition = TimePartition::new(partition_start, Duration::from_secs(3600));
+        let partition_dir = layout.partition_dir(&partition);
+        fs::create_dir_all(&partition_dir).unwrap();
+        fs::write(partition_dir.join("dummy.skulk"), b"data").unwrap();
+
+        let mut manager = PartitionManager::new(PartitionManagerConfig::default());
+        let entries =
+            Wal::recover_with_partition_manager(temp_dir.path(), &mut manager, &layout).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert!(!partition_dir.exists());
+        assert_eq!(
+            manager.get_state(partition_start),
+            Some(PartitionState::Dropped)
+        );
     }
 
     #[test]
@@ -882,7 +1145,7 @@ mod tests {
         // All entries with sequence > 10 should still be present
         for entry in &entries {
             // Entries in segments that weren't fully truncated remain
-            assert!(entry.sequence > 0);
+            assert!(entry.sequence() > 0);
         }
     }
 
@@ -975,7 +1238,7 @@ mod tests {
             file.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
         }
 
-        // Recovery should still get the valid entries
+        // Recovery should stop at corrupted tail and salvage valid entries
         let entries = Wal::recover(temp_dir.path()).unwrap();
         assert_eq!(entries.len(), 5);
     }
@@ -983,6 +1246,16 @@ mod tests {
     #[test]
     fn test_wal_entry_serialization() {
         let entry = WalEntry::with_sequence(42, 12345, 1000000000, std::f64::consts::PI);
+        let bytes = entry.to_bytes();
+        let recovered = WalEntry::from_bytes(&bytes).unwrap();
+
+        assert_eq!(entry, recovered);
+    }
+
+    #[test]
+    fn test_wal_drop_partition_serialization() {
+        let mut entry = WalEntry::new_drop_partition(1_000_000, 3_600_000_000_000, 1_500_000);
+        entry.set_sequence(7);
         let bytes = entry.to_bytes();
         let recovered = WalEntry::from_bytes(&bytes).unwrap();
 
@@ -1131,10 +1404,23 @@ mod tests {
 
         // Verify original entries were not corrupted
         for (i, entry) in all_entries.iter().take(5).enumerate() {
-            assert_eq!(entry.sequence, original_entries[i].sequence);
-            assert_eq!(entry.series_id, original_entries[i].series_id);
-            assert_eq!(entry.timestamp, original_entries[i].timestamp);
-            assert!((entry.value - original_entries[i].value).abs() < f64::EPSILON);
+            let original = &original_entries[i];
+            assert_data_point(
+                entry,
+                original.sequence(),
+                match original {
+                    WalEntry::DataPoint { series_id, .. } => *series_id,
+                    _ => panic!("Expected data point entry"),
+                },
+                match original {
+                    WalEntry::DataPoint { timestamp, .. } => *timestamp,
+                    _ => panic!("Expected data point entry"),
+                },
+                match original {
+                    WalEntry::DataPoint { value, .. } => *value,
+                    _ => panic!("Expected data point entry"),
+                },
+            );
         }
 
         // Count segment files - should have segment_0 and segment_1

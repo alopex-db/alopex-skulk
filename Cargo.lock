@@ -28,6 +28,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "alopex-skulk"
+version = "0.1.0"
+dependencies = [
+ "alopex-core",
+ "bitvec",
+ "bytes",
+ "crc32fast",
+ "criterion",
+ "proptest",
+ "rand 0.8.5",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "anes"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -805,26 +825,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7664a098b8e616bdfcc2dc0e9ac44eb231eedf41db4e9fe95d8d32ec728dedad"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "skulk"
-version = "0.1.0"
-dependencies = [
- "alopex-core",
- "bitvec",
- "bytes",
- "crc32fast",
- "criterion",
- "proptest",
- "rand 0.8.5",
- "serde",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "xxhash-rust",
 ]
 
 [[package]]
