@@ -7,6 +7,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Supported partition durations for on-disk layout.
+///
+/// # Examples
+/// ```rust,ignore
+/// use alopex_skulk::lifecycle::partition::PartitionDuration;
+///
+/// let hourly = PartitionDuration::Hourly;
+/// let nanos = hourly.as_nanos();
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartitionDuration {
     /// One-hour partitions.
@@ -17,6 +25,13 @@ pub enum PartitionDuration {
 
 impl PartitionDuration {
     /// Returns the duration in nanoseconds.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::partition::PartitionDuration;
+    ///
+    /// let nanos = PartitionDuration::Hourly.as_nanos();
+    /// ```
     pub fn as_nanos(self) -> i64 {
         match self {
             Self::Hourly => Duration::from_secs(3600).as_nanos() as i64,
@@ -25,6 +40,13 @@ impl PartitionDuration {
     }
 
     /// Returns the duration as `Duration`.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::partition::PartitionDuration;
+    ///
+    /// let duration = PartitionDuration::Daily.as_duration();
+    /// ```
     pub fn as_duration(self) -> Duration {
         match self {
             Self::Hourly => Duration::from_secs(3600),
@@ -34,6 +56,14 @@ impl PartitionDuration {
 }
 
 /// Information parsed from a TSM file name.
+///
+/// # Examples
+/// ```rust,ignore
+/// use alopex_skulk::lifecycle::partition::TsmFileInfo;
+///
+/// let name = TsmFileInfo::file_name(1, 0, 1);
+/// let parsed = TsmFileInfo::parse_file_name(&name);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TsmFileInfo {
     /// Series ID (u64).
@@ -48,11 +78,26 @@ pub struct TsmFileInfo {
 
 impl TsmFileInfo {
     /// Builds a file name using `{series_id_hex}_L{level}_G{generation}.skulk`.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::partition::TsmFileInfo;
+    ///
+    /// let name = TsmFileInfo::file_name(1, 0, 1);
+    /// ```
     pub fn file_name(series_id: SeriesId, level: u8, generation: u32) -> String {
         format!("{:016x}_L{}_G{:03}.skulk", series_id, level, generation)
     }
 
     /// Parses a file name into components.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::partition::TsmFileInfo;
+    ///
+    /// let name = TsmFileInfo::file_name(1, 0, 1);
+    /// let parsed = TsmFileInfo::parse_file_name(&name);
+    /// ```
     pub fn parse_file_name(name: &str) -> Option<(SeriesId, u8, u32)> {
         let name = name.strip_suffix(".skulk")?;
         let mut parts = name.split('_');
@@ -74,6 +119,14 @@ impl TsmFileInfo {
 }
 
 /// Provides filesystem paths for time partitions and TSM file names.
+///
+/// # Examples
+/// ```rust,ignore
+/// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+///
+/// let layout = PartitionLayout::new("/data", PartitionDuration::Hourly);
+/// let root = layout.data_dir();
+/// ```
 #[derive(Debug, Clone)]
 pub struct PartitionLayout {
     /// Root data directory.
@@ -84,6 +137,13 @@ pub struct PartitionLayout {
 
 impl PartitionLayout {
     /// Creates a new partition layout for the given directory and duration.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+    ///
+    /// let layout = PartitionLayout::new("/data", PartitionDuration::Daily);
+    /// ```
     pub fn new(data_dir: impl AsRef<Path>, duration: PartitionDuration) -> Self {
         Self {
             data_dir: data_dir.as_ref().to_path_buf(),
@@ -92,16 +152,43 @@ impl PartitionLayout {
     }
 
     /// Returns the root data directory.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+    ///
+    /// let layout = PartitionLayout::new("/data", PartitionDuration::Hourly);
+    /// let _root = layout.data_dir();
+    /// ```
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 
     /// Returns the partition duration.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+    ///
+    /// let layout = PartitionLayout::new("/data", PartitionDuration::Hourly);
+    /// let _duration = layout.duration();
+    /// ```
     pub fn duration(&self) -> PartitionDuration {
         self.duration
     }
 
     /// Returns the directory for the given partition.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+    /// use alopex_skulk::tsm::TimePartition;
+    /// use std::time::Duration;
+    ///
+    /// let layout = PartitionLayout::new("/data", PartitionDuration::Hourly);
+    /// let partition = TimePartition::new(0, Duration::from_secs(3600));
+    /// let _dir = layout.partition_dir(&partition);
+    /// ```
     pub fn partition_dir(&self, partition: &TimePartition) -> PathBuf {
         self.partition_dir_for(partition.start_ts)
     }
@@ -111,6 +198,14 @@ impl PartitionLayout {
     /// Note: v0.2 assumes timestamps are at or after Unix epoch. If negative
     /// timestamps are needed in the future, update the floor-division logic
     /// and directory naming to handle pre-epoch dates consistently.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+    ///
+    /// let layout = PartitionLayout::new("/data", PartitionDuration::Hourly);
+    /// let _dir = layout.partition_dir_for(0);
+    /// ```
     pub fn partition_dir_for(&self, timestamp: Timestamp) -> PathBuf {
         let (year, month, day, hour) = timestamp_to_ymdh(timestamp);
         match self.duration {
@@ -125,6 +220,17 @@ impl PartitionLayout {
     }
 
     /// Builds the TSM file path for the given series and partition.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+    /// use alopex_skulk::tsm::TimePartition;
+    /// use std::time::Duration;
+    ///
+    /// let layout = PartitionLayout::new("/data", PartitionDuration::Hourly);
+    /// let partition = TimePartition::new(0, Duration::from_secs(3600));
+    /// let _path = layout.tsm_file_path(&partition, 1, 0, 1);
+    /// ```
     pub fn tsm_file_path(
         &self,
         partition: &TimePartition,
@@ -137,6 +243,14 @@ impl PartitionLayout {
     }
 
     /// Lists partitions that overlap with a time range.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+    ///
+    /// let layout = PartitionLayout::new("/data", PartitionDuration::Hourly);
+    /// let _partitions = layout.list_partitions_in_range(0, 3_600_000_000_000);
+    /// ```
     pub fn list_partitions_in_range(
         &self,
         start_ts: Timestamp,
@@ -160,6 +274,17 @@ impl PartitionLayout {
     }
 
     /// Lists TSM files in the given partition directory.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+    /// use alopex_skulk::tsm::TimePartition;
+    /// use std::time::Duration;
+    ///
+    /// let layout = PartitionLayout::new("/data", PartitionDuration::Hourly);
+    /// let partition = TimePartition::new(0, Duration::from_secs(3600));
+    /// let _files = layout.list_tsm_files(&partition);
+    /// ```
     pub fn list_tsm_files(&self, partition: &TimePartition) -> Result<Vec<TsmFileInfo>> {
         let dir = self.partition_dir(partition);
         let mut files = Vec::new();

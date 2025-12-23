@@ -9,6 +9,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Compaction level configuration.
+///
+/// # Examples
+/// ```rust,ignore
+/// use alopex_skulk::lifecycle::compaction::LevelConfig;
+///
+/// let level = LevelConfig {
+///     level: 0,
+///     max_files: 4,
+///     target_file_size: 4 * 1024 * 1024,
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct LevelConfig {
     /// Level number (L0, L1, ...).
@@ -20,6 +31,13 @@ pub struct LevelConfig {
 }
 
 /// Compaction configuration for all levels.
+///
+/// # Examples
+/// ```rust,ignore
+/// use alopex_skulk::lifecycle::compaction::CompactionConfig;
+///
+/// let config = CompactionConfig::default();
+/// ```
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
     /// Level configurations sorted by level.
@@ -52,12 +70,35 @@ impl Default for CompactionConfig {
 
 impl CompactionConfig {
     /// Returns level configuration for the given level.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::compaction::CompactionConfig;
+    ///
+    /// let config = CompactionConfig::default();
+    /// let level = config.level_config(0);
+    /// ```
     pub fn level_config(&self, level: u8) -> Option<&LevelConfig> {
         self.levels.iter().find(|config| config.level == level)
     }
 }
 
 /// Compaction plan for a partition.
+///
+/// # Examples
+/// ```rust,ignore
+/// use alopex_skulk::lifecycle::compaction::CompactionPlan;
+/// use alopex_skulk::tsm::TimePartition;
+/// use std::time::Duration;
+///
+/// let partition = TimePartition::new(0, Duration::from_secs(3600));
+/// let plan = CompactionPlan {
+///     partition,
+///     source_level: 0,
+///     target_level: 1,
+///     input_files: Vec::new(),
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct CompactionPlan {
     /// Target partition.
@@ -71,6 +112,13 @@ pub struct CompactionPlan {
 }
 
 /// Compaction result metadata.
+///
+/// # Examples
+/// ```rust,ignore
+/// use alopex_skulk::lifecycle::compaction::CompactionResult;
+///
+/// let result = CompactionResult::default();
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct CompactionResult {
     /// Output file paths.
@@ -84,6 +132,15 @@ pub struct CompactionResult {
 }
 
 /// Compaction strategy for building plans and running compaction.
+///
+/// # Examples
+/// ```rust,ignore
+/// use alopex_skulk::lifecycle::compaction::{CompactionConfig, CompactionStrategy};
+/// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+///
+/// let layout = PartitionLayout::new("/data", PartitionDuration::Hourly);
+/// let strategy = CompactionStrategy::new(CompactionConfig::default(), layout);
+/// ```
 #[derive(Debug, Clone)]
 pub struct CompactionStrategy {
     config: CompactionConfig,
@@ -92,21 +149,63 @@ pub struct CompactionStrategy {
 
 impl CompactionStrategy {
     /// Creates a new compaction strategy.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::compaction::{CompactionConfig, CompactionStrategy};
+    /// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+    ///
+    /// let layout = PartitionLayout::new("/data", PartitionDuration::Hourly);
+    /// let strategy = CompactionStrategy::new(CompactionConfig::default(), layout);
+    /// ```
     pub fn new(config: CompactionConfig, layout: PartitionLayout) -> Self {
         Self { config, layout }
     }
 
     /// Returns the compaction config.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::compaction::{CompactionConfig, CompactionStrategy};
+    /// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+    ///
+    /// let layout = PartitionLayout::new("/data", PartitionDuration::Hourly);
+    /// let strategy = CompactionStrategy::new(CompactionConfig::default(), layout);
+    /// let _config = strategy.config();
+    /// ```
     pub fn config(&self) -> &CompactionConfig {
         &self.config
     }
 
     /// Returns the partition layout.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::compaction::{CompactionConfig, CompactionStrategy};
+    /// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+    ///
+    /// let layout = PartitionLayout::new("/data", PartitionDuration::Hourly);
+    /// let strategy = CompactionStrategy::new(CompactionConfig::default(), layout);
+    /// let _layout = strategy.layout();
+    /// ```
     pub fn layout(&self) -> &PartitionLayout {
         &self.layout
     }
 
     /// Returns a compaction plan when file count exceeds thresholds.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::compaction::{CompactionConfig, CompactionStrategy};
+    /// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+    /// use alopex_skulk::tsm::TimePartition;
+    /// use std::time::Duration;
+    ///
+    /// let layout = PartitionLayout::new("/data", PartitionDuration::Hourly);
+    /// let strategy = CompactionStrategy::new(CompactionConfig::default(), layout);
+    /// let partition = TimePartition::new(0, Duration::from_secs(3600));
+    /// let _plan = strategy.needs_compaction(&partition);
+    /// ```
     pub fn needs_compaction(&self, partition: &TimePartition) -> Result<Option<CompactionPlan>> {
         let files = self.layout.list_tsm_files(partition)?;
         let mut files_by_level: HashMap<u8, Vec<TsmFileInfo>> = HashMap::new();
@@ -137,6 +236,24 @@ impl CompactionStrategy {
     }
 
     /// Runs compaction for the provided plan.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::compaction::{CompactionConfig, CompactionStrategy};
+    /// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+    /// use alopex_skulk::tsm::TimePartition;
+    /// use std::time::Duration;
+    ///
+    /// # async fn run() -> alopex_skulk::error::Result<()> {
+    /// let layout = PartitionLayout::new("/data", PartitionDuration::Hourly);
+    /// let strategy = CompactionStrategy::new(CompactionConfig::default(), layout);
+    /// let partition = TimePartition::new(0, Duration::from_secs(3600));
+    /// if let Some(plan) = strategy.needs_compaction(&partition)? {
+    ///     let _result = strategy.run_compaction(&plan).await?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn run_compaction(&self, plan: &CompactionPlan) -> Result<CompactionResult> {
         let mut blocks_by_series: HashMap<SeriesId, Vec<BlockPoints>> = HashMap::new();
         let mut series_meta: HashMap<SeriesId, SeriesMeta> = HashMap::new();

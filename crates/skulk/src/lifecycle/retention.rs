@@ -11,6 +11,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::error;
 
 /// Retention policy for determining expired partitions.
+///
+/// # Examples
+/// ```rust,ignore
+/// use alopex_skulk::lifecycle::retention::RetentionPolicy;
+/// use alopex_skulk::tsm::TimePartition;
+/// use std::time::Duration;
+///
+/// struct KeepAll;
+/// impl RetentionPolicy for KeepAll {
+///     fn retention_duration(&self) -> Duration {
+///         Duration::from_secs(365 * 24 * 60 * 60)
+///     }
+/// }
+///
+/// let _partition = TimePartition::new(0, Duration::from_secs(3600));
+/// ```
 pub trait RetentionPolicy: Send + Sync {
     /// Returns the retention duration.
     fn retention_duration(&self) -> Duration;
@@ -23,6 +39,13 @@ pub trait RetentionPolicy: Send + Sync {
 }
 
 /// Default retention policy (7 days).
+///
+/// # Examples
+/// ```rust,ignore
+/// use alopex_skulk::lifecycle::retention::DefaultRetentionPolicy;
+///
+/// let policy = DefaultRetentionPolicy::default();
+/// ```
 #[derive(Debug, Clone)]
 pub struct DefaultRetentionPolicy {
     retention: Duration,
@@ -38,6 +61,14 @@ impl Default for DefaultRetentionPolicy {
 
 impl DefaultRetentionPolicy {
     /// Creates a new default retention policy with a custom duration.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::retention::DefaultRetentionPolicy;
+    /// use std::time::Duration;
+    ///
+    /// let policy = DefaultRetentionPolicy::new(Duration::from_secs(3600));
+    /// ```
     pub fn new(retention: Duration) -> Self {
         Self { retention }
     }
@@ -50,6 +81,23 @@ impl RetentionPolicy for DefaultRetentionPolicy {
 }
 
 /// Retention manager for TTL-based partition deletion.
+///
+/// # Examples
+/// ```rust,ignore
+/// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+/// use alopex_skulk::lifecycle::retention::{DefaultRetentionPolicy, RetentionManager};
+/// use alopex_skulk::lifecycle::safe_lsn::SafeLsnTracker;
+/// use alopex_skulk::tsm::{PartitionManager, PartitionManagerConfig};
+/// use alopex_skulk::wal::Wal;
+/// use std::time::Duration;
+///
+/// let policy = DefaultRetentionPolicy::new(Duration::from_secs(3600));
+/// let pm = PartitionManager::new(PartitionManagerConfig::default());
+/// let wal = Wal::new("/tmp/wal", Default::default());
+/// let layout = PartitionLayout::new("/data", PartitionDuration::Hourly);
+/// let tracker = SafeLsnTracker::new();
+/// let _manager = wal.map(|wal| RetentionManager::new(policy, pm, wal, tracker, layout));
+/// ```
 pub struct RetentionManager<P: RetentionPolicy> {
     policy: P,
     partition_manager: PartitionManager,
@@ -60,6 +108,23 @@ pub struct RetentionManager<P: RetentionPolicy> {
 
 impl<P: RetentionPolicy> RetentionManager<P> {
     /// Creates a new retention manager.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+    /// use alopex_skulk::lifecycle::retention::{DefaultRetentionPolicy, RetentionManager};
+    /// use alopex_skulk::lifecycle::safe_lsn::SafeLsnTracker;
+    /// use alopex_skulk::tsm::{PartitionManager, PartitionManagerConfig};
+    /// use alopex_skulk::wal::Wal;
+    /// use std::time::Duration;
+    ///
+    /// let policy = DefaultRetentionPolicy::new(Duration::from_secs(3600));
+    /// let pm = PartitionManager::new(PartitionManagerConfig::default());
+    /// let wal = Wal::new("/tmp/wal", Default::default());
+    /// let layout = PartitionLayout::new("/data", PartitionDuration::Hourly);
+    /// let tracker = SafeLsnTracker::new();
+    /// let _manager = wal.map(|wal| RetentionManager::new(policy, pm, wal, tracker, layout));
+    /// ```
     pub fn new(
         policy: P,
         partition_manager: PartitionManager,
@@ -77,6 +142,25 @@ impl<P: RetentionPolicy> RetentionManager<P> {
     }
 
     /// Runs a retention check and drops expired partitions.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::partition::{PartitionDuration, PartitionLayout};
+    /// use alopex_skulk::lifecycle::retention::{DefaultRetentionPolicy, RetentionManager};
+    /// use alopex_skulk::lifecycle::safe_lsn::SafeLsnTracker;
+    /// use alopex_skulk::tsm::{PartitionManager, PartitionManagerConfig};
+    /// use alopex_skulk::wal::Wal;
+    ///
+    /// let policy = DefaultRetentionPolicy::default();
+    /// let pm = PartitionManager::new(PartitionManagerConfig::default());
+    /// let wal = Wal::new("/tmp/wal", Default::default());
+    /// let layout = PartitionLayout::new("/data", PartitionDuration::Hourly);
+    /// let tracker = SafeLsnTracker::new();
+    /// let mut manager = wal
+    ///     .map(|wal| RetentionManager::new(policy, pm, wal, tracker, layout))
+    ///     .unwrap();
+    /// let _dropped = manager.run_retention_check();
+    /// ```
     pub fn run_retention_check(&mut self) -> Result<usize> {
         let now = current_timestamp_nanos()?;
         let start_ts: Vec<i64> = self

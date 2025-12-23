@@ -13,6 +13,13 @@ struct SafeLsnState {
 }
 
 /// Tracks safe LSN based on flushed partitions and pending DropPartition entries.
+///
+/// # Examples
+/// ```rust,ignore
+/// use alopex_skulk::lifecycle::safe_lsn::SafeLsnTracker;
+///
+/// let tracker = SafeLsnTracker::new();
+/// ```
 #[derive(Debug, Default)]
 pub struct SafeLsnTracker {
     inner: RwLock<SafeLsnState>,
@@ -20,17 +27,40 @@ pub struct SafeLsnTracker {
 
 impl SafeLsnTracker {
     /// Creates a new tracker with empty state.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::safe_lsn::SafeLsnTracker;
+    ///
+    /// let tracker = SafeLsnTracker::new();
+    /// ```
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Records a flush completion for a partition.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::safe_lsn::SafeLsnTracker;
+    ///
+    /// let tracker = SafeLsnTracker::new();
+    /// tracker.notify_flush(1, 42);
+    /// ```
     pub fn notify_flush(&self, partition_id: PartitionId, flushed_lsn: u64) {
         let mut state = self.inner.write().unwrap_or_else(|err| err.into_inner());
         state.flushed_lsns.insert(partition_id, flushed_lsn);
     }
 
     /// Records a DropPartition WAL entry by LSN.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::safe_lsn::SafeLsnTracker;
+    ///
+    /// let tracker = SafeLsnTracker::new();
+    /// tracker.notify_drop_recorded(100);
+    /// ```
     pub fn notify_drop_recorded(&self, lsn: u64) {
         let mut state = self.inner.write().unwrap_or_else(|err| err.into_inner());
         if !state.pending_drops.contains(&lsn) {
@@ -39,6 +69,14 @@ impl SafeLsnTracker {
     }
 
     /// Records a completed DropPartition, removing the pending LSN.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::safe_lsn::SafeLsnTracker;
+    ///
+    /// let tracker = SafeLsnTracker::new();
+    /// tracker.notify_drop_complete(100);
+    /// ```
     pub fn notify_drop_complete(&self, lsn: u64) {
         let mut state = self.inner.write().unwrap_or_else(|err| err.into_inner());
         state.pending_drops.retain(|&pending| pending != lsn);
@@ -48,6 +86,15 @@ impl SafeLsnTracker {
     ///
     /// Formula: min(min(flushed_lsns), min(pending_drop_lsn) - 1).
     /// Returns None if no partitions have been flushed.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// use alopex_skulk::lifecycle::safe_lsn::SafeLsnTracker;
+    ///
+    /// let tracker = SafeLsnTracker::new();
+    /// tracker.notify_flush(1, 100);
+    /// let _safe = tracker.calculate_safe_lsn();
+    /// ```
     pub fn calculate_safe_lsn(&self) -> Option<u64> {
         let state = self.inner.read().unwrap_or_else(|err| err.into_inner());
         let min_flushed = state.flushed_lsns.values().copied().min()?;
