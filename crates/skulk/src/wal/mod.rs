@@ -461,7 +461,7 @@ impl Wal {
                                         }
 
                                         // Read the segment to find max sequence (from all segments, not just max)
-                                        if let Ok(entries) = Self::read_segment(&path) {
+                                        if let Ok(entries) = Self::read_segment_strict(&path) {
                                             for entry in entries {
                                                 if entry.sequence() > max_sequence {
                                                     max_sequence = entry.sequence();
@@ -502,8 +502,8 @@ impl Wal {
         ))
     }
 
-    /// Reads all entries from a segment file.
-    fn read_segment(path: &Path) -> Result<Vec<WalEntry>> {
+    /// Reads all entries from a segment file (strict mode).
+    fn read_segment_strict(path: &Path) -> Result<Vec<WalEntry>> {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
 
@@ -518,6 +518,29 @@ impl Wal {
                 Err(e) => {
                     warn!("Error reading WAL entry: {:?}", e);
                     return Err(e);
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+
+    /// Reads entries from a segment file, stopping at the first error.
+    fn read_segment_lenient(path: &Path) -> Result<Vec<WalEntry>> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+
+        // Read and validate header
+        let _header = SegmentHeader::read_from(&mut reader)?;
+
+        let mut entries = Vec::new();
+        loop {
+            match Self::read_entry(&mut reader) {
+                Ok(Some(entry)) => entries.push(entry),
+                Ok(None) => break, // EOF
+                Err(e) => {
+                    warn!("Error reading WAL entry: {:?}", e);
+                    break;
                 }
             }
         }
@@ -740,7 +763,7 @@ impl Wal {
             }
 
             // Check if all entries in this segment are flushed
-            let entries = match Self::read_segment(&segment_path) {
+            let entries = match Self::read_segment_strict(&segment_path) {
                 Ok(entries) => entries,
                 Err(e) => {
                     warn!(
@@ -823,7 +846,7 @@ impl Wal {
 
         // Read entries from each segment
         for segment_path in segments {
-            match Self::read_segment(&segment_path) {
+            match Self::read_segment_lenient(&segment_path) {
                 Ok(entries) => {
                     debug!(
                         "Recovered {} entries from segment {}",
@@ -1215,9 +1238,9 @@ mod tests {
             file.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
         }
 
-        // Recovery should skip the corrupted segment
+        // Recovery should stop at corrupted tail and salvage valid entries
         let entries = Wal::recover(temp_dir.path()).unwrap();
-        assert_eq!(entries.len(), 0);
+        assert_eq!(entries.len(), 5);
     }
 
     #[test]

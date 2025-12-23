@@ -391,9 +391,9 @@ fn test_recovery_with_partial_entries() {
         file.write_all(&[0xDE, 0xAD]).unwrap(); // Truncated data
     }
 
-    // Recovery should skip the corrupted segment
+    // Recovery should stop at the corrupted tail and salvage valid entries
     let recovered = Wal::recover(&wal_dir).unwrap();
-    assert_eq!(recovered.len(), 0);
+    assert_eq!(recovered.len(), 20);
 }
 
 // ============================================================================
