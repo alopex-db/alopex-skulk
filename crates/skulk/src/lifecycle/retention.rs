@@ -320,6 +320,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_drop_partition_error_keeps_state() {
         let temp_dir = TempDir::new().unwrap();
