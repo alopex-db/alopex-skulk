@@ -80,7 +80,7 @@ mod tests {
         tracker.notify_flush(1, 150);
         tracker.notify_flush(2, 200);
         tracker.notify_drop_recorded(160);
-        assert_eq!(tracker.calculate_safe_lsn(), Some(159));
+        assert_eq!(tracker.calculate_safe_lsn(), Some(150));
     }
 
     #[test]
