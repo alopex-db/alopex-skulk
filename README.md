@@ -1,162 +1,97 @@
 # Alopex Skulk
 
-> Time-series database built on Alopex Core. Gorilla compression, automatic TTL/downsampling, PromQL & SQL-TS queries. Scales from embedded to distributed.
+Alopex Skulk is an embedded, append-only time-series storage and ingest core
+written in Rust. Version 0.3 stores wide, multi-field rows in Arrow memory
+batches and Parquet files while keeping acknowledged writes recoverable through
+a local WAL.
 
-**Skulk** (noun): A group of foxes. Like a skulk silently tracking prey, Alopex Skulk quietly collects and manages your time-series data in the background.
+## Current v0.3 Scope
 
-## Core Values
+- Wide rows: one measurement and tag set can hold multiple float, integer,
+  unsigned, boolean, and string fields.
+- Columnar storage: Arrow in memory and Parquet with pure-Rust BROTLI q5 on disk.
+- Durability: batch WAL sync before ACK, manifest-fenced recovery, atomic file
+  publication, torn-tail isolation, and single-writer data-root locking.
+- Lifecycle: hourly partitions, persisted measurement retention policies,
+  idempotent TTL expiry, and DataFusion-free compaction with last-ingest-wins
+  deduplication.
+- Ingest: HTTP-independent decoders for InfluxDB Line Protocol, Prometheus
+  Remote Write v1 float samples, and structured JSON.
 
-- **Ephemeral**: Data is consumable — automatic TTL and downsampling for freshness management
-- **Streaming**: High-speed ingestion, continuous queries, real-time alerts
-- **Observable**: Unified foundation for metrics, logs, and traces
+HTTP endpoints, PromQL/SQL-TS execution, downsampling, alerts, and distributed
+operation are future milestones; they are not part of the v0.3 crate.
 
-## Features
+## Breaking Change from v0.2
 
-| Feature | Description |
-|---------|-------------|
-| **Gorilla Compression** | 10:1+ compression ratio with Delta-of-Delta timestamps and XOR-encoded values |
-| **Automatic Lifecycle** | Time-based TTL, cascading downsampling (1s → 1h → 1d) |
-| **PromQL Compatible** | Query with familiar Prometheus syntax |
-| **SQL-TS Extension** | `TIME_BUCKET`, `RATE`, `DELTA`, `FIRST`, `LAST` functions |
-| **Multi-Mode Deployment** | Embedded → Single-Node → Distributed cluster |
-| **Alopex Core Foundation** | Built on battle-tested WAL, MemTable, and Compaction |
+Version 0.3 replaces the v0.2 single-value TSM/Gorilla format and APIs. It does
+not read or migrate v0.2 TSM or WAL files; legacy magic is rejected before
+the source is modified. There is no migration tool. Export data with v0.2 and
+re-ingest it into a new v0.3 data root.
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      Client Layer                           │
-│  (Prometheus, Telegraf, Grafana, Custom Apps)               │
-└─────────────────────────┬───────────────────────────────────┘
-                          │
-┌─────────────────────────┴───────────────────────────────────┐
-│                   Ingest Gateway                            │
-│  Line Protocol │ Prometheus Remote Write │ JSON API         │
-└─────────────────────────┬───────────────────────────────────┘
-                          │
-┌─────────────────────────┴───────────────────────────────────┐
-│                   Query Engine                              │
-│  PromQL Parser │ SQL-TS Parser │ Planner │ Executor         │
-└─────────────────────────┬───────────────────────────────────┘
-                          │
-┌─────────────────────────┴───────────────────────────────────┐
-│                  Lifecycle Manager                          │
-│  TTL Manager │ Downsampler │ Retention Policy               │
-└─────────────────────────┬───────────────────────────────────┘
-                          │
-┌─────────────────────────┴───────────────────────────────────┐
-│                   Storage Layer                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ TSM Engine (Time-Structured Merge)                  │   │
-│  │  MemTable → Immutable → TSM Files (.skulk)          │   │
-│  └─────────────────────────────────────────────────────┘   │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Alopex Core (WAL, Compaction)                       │   │
-│  └─────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## Comparison with Alopex DB
-
-| Aspect | Alopex DB | Alopex Skulk |
-|--------|-----------|--------------|
-| **Use Case** | RAG/AI, Knowledge Base, OLTP | Monitoring, IoT, Log Analysis |
-| **Data Lifespan** | Long-term (asset) | Short-term rotation (consumable) |
-| **Primary Ops** | CRUD + Vector Search | Append + Aggregate + TTL Delete |
-| **Query Pattern** | Point lookup, JOIN, Vector | Range aggregation, Downsampling |
-| **Delete Pattern** | Explicit DELETE | Automatic TTL expiry |
-
-## Quick Start
-
-### Embedded Mode
-
-```rust
-use alopex_skulk::EmbeddedTSDB;
-
-let db = EmbeddedTSDB::open("./tsdb_data")?;
-
-// Write metrics
-db.write_line_protocol(
-    "cpu,host=server1,region=ap usage_user=23.5,usage_system=12.3"
-)?;
-
-// Query with PromQL
-let result = db.query_promql("rate(cpu{host='server1'}[5m])")?;
-
-// Query with SQL-TS
-let result = db.query_sql(
-    "SELECT TIME_BUCKET('1h', time), AVG(usage_user)
-     FROM cpu
-     WHERE time > NOW() - INTERVAL '24h'
-     GROUP BY 1"
-)?;
-```
-
-### Server Mode
-
-```bash
-# Start server
-alopex-skulk --config /etc/skulk/config.toml
-
-# Write data (Line Protocol)
-curl -X POST http://localhost:8086/write \
-  -d 'cpu,host=server1 usage=45.2'
-
-# Query (PromQL)
-curl -G http://localhost:8086/api/v1/query \
-  --data-urlencode 'query=rate(cpu[5m])'
-```
+The series identity is now `measurement + tags`; field names are columns and do
+not create separate series. The decision history is recorded in the
+[public technical specification §1.4](https://github.com/alopex-db/docs/blob/aab328480b21bc66121b85b4e0e1218e9b3d0d68/specs/alopex-skulk-technical-spec.md).
 
 ## Ingest Protocols
 
-| Protocol | Endpoint | Format |
-|----------|----------|--------|
-| Line Protocol | `POST /write` | `metric,tag=value field=value timestamp` |
-| Prometheus Remote Write | `POST /api/v1/write` | Snappy-compressed Protobuf |
-| JSON | `POST /api/v1/ingest` | `{"metric": "cpu", "tags": {...}, "fields": {...}}` |
+| Protocol | v0.3 behavior |
+| --- | --- |
+| Line Protocol | Multi-field wide rows, all five field types, escaping, optional caller timestamp, and line-local rejection |
+| Remote Write | Snappy-compressed `prometheus.WriteRequest` v1 float samples; v2, metadata, exemplars, and histograms are explicitly rejected |
+| JSON | Canonical `{"metrics":[...]}` batch plus `{"metric":...}` single-point sugar, with item-local schema rejection |
 
-## Data Lifecycle
+All decoders return the same `IngestBatch`, which the shared `Ingestor` validates,
+admits under bounded buffer/WAL pressure, and writes durably.
 
+## Embedded Example
+
+```rust
+use alopex_skulk::ingest::line_protocol::LineProtocolDecoder;
+use alopex_skulk::ingest::{IngestLimits, Ingestor};
+use alopex_skulk::store::recovery::{RecoveryConfig, RecoveryStore};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let limits = IngestLimits::default();
+    let store = RecoveryStore::open("./skulk-data-v3", RecoveryConfig::default())?;
+    let mut ingestor = Ingestor::new(store, limits);
+
+    let batch = LineProtocolDecoder::new(limits).decode(
+        b"cpu,host=edge usage=23.5 1609459200000000000",
+        1609459200000000000,
+    )?;
+    let outcome = ingestor.ingest(batch, 1609459200000000000)?;
+    assert_eq!(outcome.accepted_count(), 1);
+    ingestor.sink_mut().flush_all()?;
+    Ok(())
+}
 ```
-Raw Data (1s resolution)
-    │ TTL: 72h
-    ▼
-Hourly Aggregate (1h resolution)
-    │ TTL: 30d
-    ▼
-Daily Aggregate (1d resolution)
-    │ TTL: 1y
-    ▼
-Archive/Delete
+
+## Build and Verify
+
+```bash
+cargo build --workspace --all-features
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 ```
+
+Rust 1.82 is the minimum supported version. Production dependencies are pure
+Rust with no `cc` or FFI `*-sys` crate. Current storage and ingest measurements
+are versioned in
+[`STORAGE_BASELINE.md`](crates/skulk/benches/STORAGE_BASELINE.md) and
+[`INGEST_BASELINE.md`](crates/skulk/benches/INGEST_BASELINE.md); unmet
+throughput and p99 targets remain open rather than being relaxed.
 
 ## Roadmap
 
-| Version | Milestone | Dependencies |
-|---------|-----------|--------------|
-| v0.1 | TSM Core (MemTable, Gorilla, File Format) | alopex-core v0.2 |
-| v0.2 | Lifecycle (TTL, Partitioning, Compaction) | Skulk v0.1 |
-| v0.3 | Ingest (Line Protocol, Remote Write) | Skulk v0.2 |
-| v0.4 | Query (PromQL, SQL-TS) | Skulk v0.3 |
-| v0.5 | Downsampling & Continuous Query | Skulk v0.4 |
-| v0.6 | HTTP Server & Prometheus Compat | Skulk v0.5 |
-| v0.7 | Alert Engine | Skulk v0.6 |
-| v0.8 | Distributed (Sharding) | Skulk v0.7 + Chirps v0.3 |
-| v0.9 | Replication (Raft) | Skulk v0.8 + Chirps v0.6 |
-| v1.0 | Stable Release | Full test coverage |
-
-## Documentation
-
-- [Requirements Specification](../design/requirements-tsdb.md)
-- [Design Specification](../design/design-spec-tsdb.md)
-- [Technical Specification](../design/technical-spec-tsdb.md)
-- [Milestone Dependencies](../design/milestones.md)
-
-## Related Projects
-
-- [Alopex DB](https://github.com/alopex-db/alopex) - Vector-enabled embedded database
-- [Alopex Chirps](https://github.com/alopex-db/alopex-chirps) - Cluster mesh networking (QUIC + SWIM + Raft)
+| Version | Scope |
+| --- | --- |
+| v0.3 | Wide columnar storage, durability, retention/compaction, and three ingest decoders |
+| v0.4 | Query planner/executor and PromQL/SQL-TS core |
+| v0.5 | Downsampling and continuous queries |
+| v0.6 | HTTP server and Prometheus-compatible endpoints |
+| v0.7+ | Alerts, sharding, and replication |
 
 ## License
 
-Apache-2.0
+Apache-2.0 OR MIT
