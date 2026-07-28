@@ -169,7 +169,10 @@
 #![warn(rustdoc::missing_crate_level_docs)]
 
 pub mod error;
+pub mod ingest;
 pub mod lifecycle;
+pub mod model;
+pub mod store;
 pub mod tsm;
 pub mod wal;
 
@@ -178,3 +181,11 @@ pub use tsm::{
     CompressedBlock, DataPoint, SeriesId, SeriesMeta, TimePartition, TimeRange, Timestamp,
 };
 pub use wal::{SyncMode, Wal, WalConfig, WalEntry};
+
+#[cfg(test)]
+mod module_surface_tests {
+    #[test]
+    fn exposes_v0_3_responsibility_modules() {
+        use crate::{ingest as _, model as _, store as _};
+    }
+}
