@@ -3,7 +3,8 @@
 Measured on 2026-07-28 with Rust 1.96.0, Linux x86_64 under WSL2, and an ext
 filesystem. Benchmarks use 10,000 points, a single writer, real files, and an
 `fsync` before durable acknowledgement. The Embedded release budget is fixed
-at 4,100,000 bytes.
+at 4,100,000 bytes. Protocol-level decode and WAL-ACK measurements are tracked
+separately in [`INGEST_BASELINE.md`](INGEST_BASELINE.md).
 
 | Check | Result | Evidence |
 | --- | --- | --- |

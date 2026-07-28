@@ -46,3 +46,7 @@ proptest = { workspace = true }
 [[bench]]
 name = "storage_bench"
 harness = false
+
+[[bench]]
+name = "ingest_bench"
+harness = false
