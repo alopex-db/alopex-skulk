@@ -802,6 +802,7 @@ mod tests {
 
     const CRASH_ROOT_ENV: &str = "SKULK_WAL_CRASH_TEST_ROOT";
     const ACK_MARKER_FILE: &str = "durable-append-returned";
+    const CHILD_READY_POLLS: usize = 3_000;
 
     #[derive(Default)]
     struct ManualTime {
@@ -863,7 +864,7 @@ mod tests {
             .expect("spawn crash writer");
         let marker = root.path().join(ACK_MARKER_FILE);
 
-        for _ in 0..500 {
+        for _ in 0..CHILD_READY_POLLS {
             if marker.exists() {
                 break;
             }

@@ -1,5 +1,7 @@
 //! Protocol-independent ingestion and protocol decoder boundaries.
 
+pub mod line_protocol;
+
 use crate::error::{Result, TsmError};
 use crate::model::{FieldValue, SeriesId, WideRow};
 use crate::store::buffer::{estimated_row_bytes, INGEST_SEQ_COLUMN, TIME_COLUMN};
@@ -35,12 +37,14 @@ pub enum SourceLocation {
     Series(usize),
 }
 
+#[derive(Debug)]
 struct CandidateRow {
     source: SourceLocation,
     row: WideRow,
 }
 
 /// Decoder output passed to the shared ingestion boundary.
+#[derive(Debug)]
 pub struct IngestBatch {
     encoded_bytes: usize,
     expanded_bytes: usize,

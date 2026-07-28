@@ -66,6 +66,7 @@ mod tests {
 
     const CHILD_ROOT_ENV: &str = "SKULK_LOCK_TEST_ROOT";
     const READY_FILE: &str = "lock-child-ready";
+    const CHILD_READY_POLLS: usize = 3_000;
 
     #[test]
     fn second_open_fails_until_the_first_guard_is_dropped() {
@@ -94,7 +95,7 @@ mod tests {
             .spawn()
             .expect("spawn lock holder");
         let ready = root.path().join(READY_FILE);
-        for _ in 0..500 {
+        for _ in 0..CHILD_READY_POLLS {
             if ready.exists() {
                 break;
             }

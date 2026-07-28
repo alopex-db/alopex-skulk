@@ -18,6 +18,9 @@ default = []
 # Serialization
 serde = { workspace = true }
 
+# Protocol parsing (official InfluxData parser; pure Rust)
+influxdb-line-protocol = { version = "=2.0.0", default-features = false }
+
 # Columnar storage (pure Rust; depend only on the Arrow components we use)
 arrow-array = { version = "=55.2.0", default-features = false }
 arrow-schema = { version = "=55.2.0", default-features = false }
