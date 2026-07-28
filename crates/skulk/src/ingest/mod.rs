@@ -1,5 +1,7 @@
 //! Protocol-independent ingestion and protocol decoder boundaries.
 
+/// Structured JSON batch and single-point decoding.
+pub mod json;
 pub mod line_protocol;
 /// Prometheus Remote Write v1 decoding.
 pub mod remote_write;

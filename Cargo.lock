@@ -55,6 +55,7 @@ dependencies = [
  "proptest",
  "prost",
  "serde",
+ "serde_json",
  "snap",
  "tempfile",
  "thiserror",

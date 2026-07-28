@@ -17,6 +17,7 @@ default = []
 [dependencies]
 # Serialization
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 # Protocol parsing (official InfluxData parser; pure Rust)
 influxdb-line-protocol = { version = "=2.0.0", default-features = false }
