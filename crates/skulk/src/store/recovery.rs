@@ -3,6 +3,7 @@
 use crate::error::{Result, TsmError};
 use crate::model::WideRow;
 use crate::store::buffer::{FlushPolicy, MeasurementBuffer};
+use crate::store::compaction::{CompactionConfig, CompactionResult, Compactor};
 use crate::store::lock::DataRootLock;
 use crate::store::manifest::{ActiveFile, ManifestState, ManifestStore, ManifestUpdate};
 use crate::store::parquet_reader::{ParquetReader, ParquetReaderConfig};
@@ -259,6 +260,16 @@ impl RecoveryStore {
             )));
         }
         Ok(rows)
+    }
+
+    /// Compacts all durable files for one measurement under this store's lock.
+    pub fn compact_measurement(&mut self, measurement: &str) -> Result<Option<CompactionResult>> {
+        Compactor::new(CompactionConfig::new(
+            self.config.buffer,
+            self.config.reader,
+            self.config.writer,
+        ))
+        .compact_measurement(&self.manifest, measurement)
     }
 
     /// Returns how many WAL rows were replayed beyond the manifest fence.

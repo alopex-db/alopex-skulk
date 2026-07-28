@@ -308,6 +308,31 @@ impl ManifestStore {
         Sequencer::resume_after(max_sequence(manifest_high_water, wal_high_water))
     }
 
+    pub(crate) fn remove_inactive_files(&self, names: &[String]) -> Result<()> {
+        let inner = self.lock_inner()?;
+        for name in names {
+            validate_file_name(name)?;
+            if inner.state.active_files.contains_key(name) {
+                return Err(TsmError::InvalidInput(format!(
+                    "refusing to remove active Parquet file '{name}'"
+                )));
+            }
+        }
+        let mut removed = false;
+        for name in names {
+            match fs::remove_file(self.segments.join(name)) {
+                Ok(()) => removed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if removed {
+            sync_directory(&self.segments)?;
+        }
+        drop(inner);
+        Ok(())
+    }
+
     fn lock_inner(&self) -> Result<std::sync::MutexGuard<'_, ManifestInner>> {
         self.inner
             .lock()
