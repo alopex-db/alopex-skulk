@@ -15,9 +15,6 @@ readme = "README.md"
 default = []
 
 [dependencies]
-# Alopex core for WAL and MemTable traits
-alopex-core = { workspace = true }
-
 # Async runtime
 tokio = { workspace = true }
 
@@ -33,7 +30,6 @@ thiserror = { workspace = true }
 
 # Compression and checksums
 crc32fast = { workspace = true }
-bitvec = { workspace = true }
 bytes = { workspace = true }
 xxhash-rust = { workspace = true }
 
@@ -47,7 +43,3 @@ rand = { workspace = true }
 proptest = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-
-[[bench]]
-name = "tsm_bench"
-harness = false
