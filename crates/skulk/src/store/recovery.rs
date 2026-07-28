@@ -166,6 +166,7 @@ impl RecoveryStore {
         } else {
             MeasurementBuffer::new(&measurement, self.config.buffer).validate_append(&row)?;
         }
+        self.wal.validate_row(&row)?;
         let sequenced = self.sequencer.issue(row)?;
         let sequence = sequenced.ingest_seq();
         self.wal
@@ -218,6 +219,7 @@ impl RecoveryStore {
                     ),
                     row.clone(),
                 ))?;
+            self.wal.validate_row(row)?;
         }
 
         let sequenced = self.sequencer.issue_batch(rows)?;
@@ -395,6 +397,27 @@ impl RecoveryStore {
     /// Returns how many WAL rows were replayed beyond the manifest fence.
     pub const fn replayed_row_count(&self) -> usize {
         self.replayed_row_count
+    }
+
+    /// Returns the current unflushed row count for admission control.
+    pub fn pending_row_count(&self) -> usize {
+        self.pending
+            .values()
+            .fold(0_usize, |total, rows| total.saturating_add(rows.len()))
+    }
+
+    /// Returns the current in-memory buffer estimate for admission control.
+    pub fn pending_estimated_bytes(&self) -> Result<usize> {
+        self.buffers.values().try_fold(0_usize, |total, buffer| {
+            total
+                .checked_add(buffer.estimated_bytes())
+                .ok_or_else(|| TsmError::ResourceLimit("buffer pressure estimate overflow".into()))
+        })
+    }
+
+    /// Returns the current durable-log size for admission control.
+    pub fn wal_file_bytes(&self) -> Result<u64> {
+        self.wal.file_bytes()
     }
 
     /// Returns a snapshot of the durable manifest state.

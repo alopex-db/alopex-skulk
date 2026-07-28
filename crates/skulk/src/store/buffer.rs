@@ -458,7 +458,7 @@ fn arrow_field(name: &str, data_type: DataType, nullable: bool, kind: &str) -> F
     )]))
 }
 
-fn estimated_row_bytes(row: &WideRow) -> Result<usize> {
+pub(crate) fn estimated_row_bytes(row: &WideRow) -> Result<usize> {
     let mut bytes = size_of::<i64>() + size_of::<u64>();
     for (name, value) in row.series().tags() {
         bytes = checked_add(bytes, name.len())?;

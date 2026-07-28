@@ -321,6 +321,22 @@ impl Wal {
         &self.path
     }
 
+    /// Returns the current durable-log file size.
+    pub(crate) fn file_bytes(&self) -> Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+
+    pub(crate) fn validate_row(&self, row: &WideRow) -> Result<()> {
+        let size = encoded_row_size(row)?;
+        if size > self.config.max_entry_bytes {
+            return Err(TsmError::ResourceLimit(format!(
+                "encoded WAL entry is {size} bytes, limit is {}",
+                self.config.max_entry_bytes
+            )));
+        }
+        Ok(())
+    }
+
     fn write_entry(&mut self, entry: &WalEntry) -> Result<()> {
         self.ensure_writable()?;
         let payload = encode_entry(entry, self.config.max_entry_bytes)?;
@@ -580,20 +596,28 @@ fn encode_entry(entry: &WalEntry, max_entry_bytes: usize) -> Result<Vec<u8>> {
 }
 
 fn encoded_size(entry: &WalEntry) -> Result<usize> {
-    let measurement_size = string_size(entry.row.series().measurement())?;
+    encoded_row_size(entry.row())
+}
+
+pub(crate) fn encoded_frame_size(row: &WideRow) -> Result<usize> {
+    checked_size_add(encoded_row_size(row)?, 8)
+}
+
+fn encoded_row_size(row: &WideRow) -> Result<usize> {
+    let measurement_size = string_size(row.series().measurement())?;
     let mut size = 8_usize
         .checked_add(8)
         .and_then(|value| value.checked_add(measurement_size))
         .and_then(|value| value.checked_add(4))
         .ok_or_else(|| TsmError::ResourceLimit("WAL entry size overflow".into()))?;
-    count_u32(entry.row.series().tags().len())?;
-    for (name, value) in entry.row.series().tags() {
+    count_u32(row.series().tags().len())?;
+    for (name, value) in row.series().tags() {
         size = checked_size_add(size, string_size(name)?)?;
         size = checked_size_add(size, string_size(value)?)?;
     }
     size = checked_size_add(size, 4)?;
-    count_u32(entry.row.fields().len())?;
-    for (name, value) in entry.row.fields() {
+    count_u32(row.fields().len())?;
+    for (name, value) in row.fields() {
         size = checked_size_add(size, string_size(name)?)?;
         size = checked_size_add(size, 1)?;
         let value_size = match value {
