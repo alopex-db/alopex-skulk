@@ -28,6 +28,7 @@ static MANIFEST_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// One immutable Parquet file referenced by a manifest generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveFile {
+    measurement: String,
     name: String,
     row_count: u64,
     file_bytes: u64,
@@ -35,8 +36,19 @@ pub struct ActiveFile {
 
 impl ActiveFile {
     /// Creates a validated file entry relative to the dedicated segments directory.
-    pub fn new(name: impl Into<String>, row_count: u64, file_bytes: u64) -> Result<Self> {
+    pub fn new(
+        measurement: impl Into<String>,
+        name: impl Into<String>,
+        row_count: u64,
+        file_bytes: u64,
+    ) -> Result<Self> {
+        let measurement = measurement.into();
         let name = name.into();
+        if measurement.is_empty() || measurement.len() > MAX_FILE_NAME_BYTES {
+            return Err(TsmError::InvalidInput(
+                "active Parquet measurement must be non-empty and bounded".into(),
+            ));
+        }
         validate_file_name(&name)?;
         if row_count == 0 || file_bytes == 0 {
             return Err(TsmError::InvalidInput(
@@ -44,10 +56,16 @@ impl ActiveFile {
             ));
         }
         Ok(Self {
+            measurement,
             name,
             row_count,
             file_bytes,
         })
+    }
+
+    /// Returns the measurement/table stored in this file.
+    pub fn measurement(&self) -> &str {
+        &self.measurement
     }
 
     /// Returns the relative file name.
@@ -367,6 +385,7 @@ fn encode_state(state: &ManifestState) -> Result<Vec<u8>> {
         .map_err(|_| TsmError::ResourceLimit("too many active files".into()))?;
     payload.extend_from_slice(&file_count.to_le_bytes());
     for file in state.active_files.values() {
+        encode_string(&mut payload, &file.measurement)?;
         encode_string(&mut payload, &file.name)?;
         payload.extend_from_slice(&file.row_count.to_le_bytes());
         payload.extend_from_slice(&file.file_bytes.to_le_bytes());
@@ -442,8 +461,9 @@ fn decode_state(bytes: &[u8]) -> Result<ManifestState> {
     }
     let mut active_files = BTreeMap::new();
     for _ in 0..file_count {
+        let measurement = cursor.string()?;
         let name = cursor.string()?;
-        let file = ActiveFile::new(name.clone(), cursor.u64()?, cursor.u64()?)?;
+        let file = ActiveFile::new(measurement, name.clone(), cursor.u64()?, cursor.u64()?)?;
         if active_files.insert(name, file).is_some() {
             return Err(TsmError::Corruption(
                 "duplicate active file in manifest".into(),
@@ -680,7 +700,7 @@ mod tests {
     fn create_segment(store: &ManifestStore, name: &str, contents: &[u8]) -> ActiveFile {
         let path = store.segments_dir().join(name);
         fs::write(&path, contents).expect("create segment");
-        ActiveFile::new(name, 1, contents.len() as u64).expect("active file")
+        ActiveFile::new("test", name, 1, contents.len() as u64).expect("active file")
     }
 
     #[test]
@@ -838,9 +858,9 @@ mod tests {
 
     #[test]
     fn active_file_names_cannot_escape_the_segments_directory() {
-        assert!(ActiveFile::new("../escape.parquet", 1, 1).is_err());
-        assert!(ActiveFile::new("nested/file.parquet", 1, 1).is_err());
-        assert!(ActiveFile::new(".hidden.parquet", 1, 1).is_err());
-        assert!(ActiveFile::new("not-parquet.tmp", 1, 1).is_err());
+        assert!(ActiveFile::new("cpu", "../escape.parquet", 1, 1).is_err());
+        assert!(ActiveFile::new("cpu", "nested/file.parquet", 1, 1).is_err());
+        assert!(ActiveFile::new("cpu", ".hidden.parquet", 1, 1).is_err());
+        assert!(ActiveFile::new("cpu", "not-parquet.tmp", 1, 1).is_err());
     }
 }
