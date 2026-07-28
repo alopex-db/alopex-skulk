@@ -10,6 +10,9 @@ use crate::store::parquet_reader::{ParquetReader, ParquetReaderConfig};
 use crate::store::parquet_writer::{
     ParquetWriter, ParquetWriterConfig, PublishHook, PublishedParquet,
 };
+use crate::store::retention::{
+    current_timestamp_nanos, RetentionPolicy, RetentionResult, RetentionStore, TimePartition,
+};
 use crate::store::seq::{IngestSeq, SequencedRow, Sequencer};
 use crate::store::wal::{Wal, WalConfig, WalEntry};
 use std::collections::{BTreeMap, BTreeSet};
@@ -81,6 +84,7 @@ impl PublishHook for ContinuePublish {
 pub struct RecoveryStore {
     _lock: DataRootLock,
     manifest: ManifestStore,
+    retention: RetentionStore,
     wal: Wal,
     sequencer: Sequencer,
     buffers: BTreeMap<String, MeasurementBuffer>,
@@ -95,6 +99,7 @@ impl RecoveryStore {
         let root = root.as_ref();
         let lock = DataRootLock::acquire(root)?;
         let manifest = ManifestStore::open(root)?;
+        let retention = RetentionStore::open(root)?;
         let wal = Wal::open(root, config.wal)?;
         let manifest_state = manifest.state()?;
         let wal_high_water = wal
@@ -133,6 +138,7 @@ impl RecoveryStore {
         Ok(Self {
             _lock: lock,
             manifest,
+            retention,
             wal,
             sequencer,
             buffers,
@@ -144,7 +150,15 @@ impl RecoveryStore {
 
     /// Durably logs one row before returning its acknowledgeable sequence.
     pub fn ingest(&mut self, row: WideRow) -> Result<IngestSeq> {
+        self.ingest_at(row, current_timestamp_nanos()?)
+    }
+
+    /// Ingests with an explicit clock value for deterministic cutoff decisions.
+    pub fn ingest_at(&mut self, row: WideRow, now: i64) -> Result<IngestSeq> {
         let measurement = row.series().measurement().to_owned();
+        TimePartition::for_timestamp(row.timestamp())?;
+        self.retention
+            .validate_write(&measurement, row.timestamp(), now)?;
         if let Some(buffer) = self.buffers.get(&measurement) {
             buffer.validate_append(&row)?;
         } else {
@@ -187,30 +201,47 @@ impl RecoveryStore {
         let writer = ParquetWriter::new(self.config.writer);
         let mut published = Vec::new();
         let mut update = ManifestUpdate::new();
-        for (measurement, buffer) in &self.buffers {
-            if buffer.row_count() == 0 {
-                continue;
+        for (measurement, rows) in &self.pending {
+            let mut partitions: BTreeMap<TimePartition, Vec<&SequencedRow>> = BTreeMap::new();
+            for row in rows {
+                partitions
+                    .entry(TimePartition::for_timestamp(row.row().timestamp())?)
+                    .or_default()
+                    .push(row);
             }
-            let batch = buffer.to_sorted_record_batch()?;
-            let name = format!(
-                "segment-{:020}-{:016}.parquet",
-                self.sequencer.highest_issued().map_or(0, IngestSeq::get),
-                SEGMENT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-            );
-            let written = writer.write_atomic_with_hook(
-                self.manifest.segments_dir().join(&name),
-                &batch,
-                publish_hook,
-            )?;
-            hook.reached(RecoveryBoundary::AfterParquetPublish, Some(written.path()))?;
-            let active = ActiveFile::new(
-                measurement,
-                &name,
-                written.row_count() as u64,
-                written.file_bytes(),
-            )?;
-            update = update.add_file(active);
-            published.push(written);
+            for (partition, rows) in partitions {
+                let mut buffer = MeasurementBuffer::new(measurement, self.config.buffer);
+                let mut min_timestamp = i64::MAX;
+                let mut max_timestamp = i64::MIN;
+                for row in rows {
+                    min_timestamp = min_timestamp.min(row.row().timestamp());
+                    max_timestamp = max_timestamp.max(row.row().timestamp());
+                    buffer.append(row.clone())?;
+                }
+                let batch = buffer.to_sorted_record_batch()?;
+                let name = format!(
+                    "segment-{:020}-{:+020}-{:016}.parquet",
+                    self.sequencer.highest_issued().map_or(0, IngestSeq::get),
+                    partition.start(),
+                    SEGMENT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                );
+                let written = writer.write_atomic_with_hook(
+                    self.manifest.segments_dir().join(&name),
+                    &batch,
+                    publish_hook,
+                )?;
+                hook.reached(RecoveryBoundary::AfterParquetPublish, Some(written.path()))?;
+                let active = ActiveFile::new(
+                    measurement,
+                    &name,
+                    written.row_count() as u64,
+                    written.file_bytes(),
+                    min_timestamp,
+                    max_timestamp,
+                )?;
+                update = update.add_file(active);
+                published.push(written);
+            }
         }
         let fence = self
             .pending
@@ -262,7 +293,7 @@ impl RecoveryStore {
         Ok(rows)
     }
 
-    /// Compacts all durable files for one measurement under this store's lock.
+    /// Compacts one eligible durable time partition under this store's lock.
     pub fn compact_measurement(&mut self, measurement: &str) -> Result<Option<CompactionResult>> {
         Compactor::new(CompactionConfig::new(
             self.config.buffer,
@@ -270,6 +301,31 @@ impl RecoveryStore {
             self.config.writer,
         ))
         .compact_measurement(&self.manifest, measurement)
+    }
+
+    /// Atomically creates or changes a measurement retention policy.
+    pub fn set_retention_policy(
+        &mut self,
+        measurement: &str,
+        policy: RetentionPolicy,
+    ) -> Result<()> {
+        self.retention.set_policy(measurement, policy)
+    }
+
+    /// Returns the currently durable policy for a measurement.
+    pub fn retention_policy(&self, measurement: &str) -> Result<Option<RetentionPolicy>> {
+        self.retention.policy(measurement)
+    }
+
+    /// Lists manifest-active hourly partitions in timestamp order.
+    pub fn list_partitions(&self, measurement: &str) -> Result<Vec<TimePartition>> {
+        self.retention
+            .list_partitions(&self.manifest.state()?, measurement)
+    }
+
+    /// Runs one idempotent TTL pass using an explicit nanosecond clock value.
+    pub fn expire_retention(&mut self, measurement: &str, now: i64) -> Result<RetentionResult> {
+        self.retention.expire(&self.manifest, measurement, now)
     }
 
     /// Returns how many WAL rows were replayed beyond the manifest fence.

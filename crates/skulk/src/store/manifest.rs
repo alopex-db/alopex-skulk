@@ -18,7 +18,7 @@ pub const PREVIOUS_MANIFEST_FILE: &str = "manifest-v3.previous";
 pub const SEGMENTS_DIRECTORY: &str = "segments";
 
 const MANIFEST_MAGIC: [u8; 4] = *b"SKM3";
-const MANIFEST_VERSION: u16 = 1;
+const MANIFEST_VERSION: u16 = 2;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_FILES: usize = 100_000;
 const MAX_FILE_NAME_BYTES: usize = 1024;
@@ -32,6 +32,8 @@ pub struct ActiveFile {
     name: String,
     row_count: u64,
     file_bytes: u64,
+    min_timestamp: i64,
+    max_timestamp: i64,
 }
 
 impl ActiveFile {
@@ -41,6 +43,8 @@ impl ActiveFile {
         name: impl Into<String>,
         row_count: u64,
         file_bytes: u64,
+        min_timestamp: i64,
+        max_timestamp: i64,
     ) -> Result<Self> {
         let measurement = measurement.into();
         let name = name.into();
@@ -55,11 +59,18 @@ impl ActiveFile {
                 "active Parquet row count and file size must be non-zero".into(),
             ));
         }
+        if min_timestamp > max_timestamp {
+            return Err(TsmError::InvalidInput(
+                "active Parquet timestamp range is inverted".into(),
+            ));
+        }
         Ok(Self {
             measurement,
             name,
             row_count,
             file_bytes,
+            min_timestamp,
+            max_timestamp,
         })
     }
 
@@ -81,6 +92,16 @@ impl ActiveFile {
     /// Returns the expected file size.
     pub const fn file_bytes(&self) -> u64 {
         self.file_bytes
+    }
+
+    /// Returns the smallest timestamp stored in this file.
+    pub const fn min_timestamp(&self) -> i64 {
+        self.min_timestamp
+    }
+
+    /// Returns the largest timestamp stored in this file.
+    pub const fn max_timestamp(&self) -> i64 {
+        self.max_timestamp
     }
 }
 
@@ -414,6 +435,8 @@ fn encode_state(state: &ManifestState) -> Result<Vec<u8>> {
         encode_string(&mut payload, &file.name)?;
         payload.extend_from_slice(&file.row_count.to_le_bytes());
         payload.extend_from_slice(&file.file_bytes.to_le_bytes());
+        payload.extend_from_slice(&file.min_timestamp.to_le_bytes());
+        payload.extend_from_slice(&file.max_timestamp.to_le_bytes());
     }
     if payload.len() > MAX_MANIFEST_BYTES.saturating_sub(HEADER_BYTES + 4) {
         return Err(TsmError::ResourceLimit(
@@ -488,7 +511,14 @@ fn decode_state(bytes: &[u8]) -> Result<ManifestState> {
     for _ in 0..file_count {
         let measurement = cursor.string()?;
         let name = cursor.string()?;
-        let file = ActiveFile::new(measurement, name.clone(), cursor.u64()?, cursor.u64()?)?;
+        let file = ActiveFile::new(
+            measurement,
+            name.clone(),
+            cursor.u64()?,
+            cursor.u64()?,
+            cursor.i64()?,
+            cursor.i64()?,
+        )?;
         if active_files.insert(name, file).is_some() {
             return Err(TsmError::Corruption(
                 "duplicate active file in manifest".into(),
@@ -584,6 +614,12 @@ impl<'a> Cursor<'a> {
     fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().map_err(
             |_| TsmError::InvalidFormat("invalid manifest u64".into()),
+        )?))
+    }
+
+    fn i64(&mut self) -> Result<i64> {
+        Ok(i64::from_le_bytes(self.take(8)?.try_into().map_err(
+            |_| TsmError::InvalidFormat("invalid manifest i64".into()),
         )?))
     }
 
@@ -725,7 +761,7 @@ mod tests {
     fn create_segment(store: &ManifestStore, name: &str, contents: &[u8]) -> ActiveFile {
         let path = store.segments_dir().join(name);
         fs::write(&path, contents).expect("create segment");
-        ActiveFile::new("test", name, 1, contents.len() as u64).expect("active file")
+        ActiveFile::new("test", name, 1, contents.len() as u64, 0, 0).expect("active file")
     }
 
     #[test]
@@ -883,9 +919,27 @@ mod tests {
 
     #[test]
     fn active_file_names_cannot_escape_the_segments_directory() {
-        assert!(ActiveFile::new("cpu", "../escape.parquet", 1, 1).is_err());
-        assert!(ActiveFile::new("cpu", "nested/file.parquet", 1, 1).is_err());
-        assert!(ActiveFile::new("cpu", ".hidden.parquet", 1, 1).is_err());
-        assert!(ActiveFile::new("cpu", "not-parquet.tmp", 1, 1).is_err());
+        assert!(ActiveFile::new("cpu", "../escape.parquet", 1, 1, 0, 0).is_err());
+        assert!(ActiveFile::new("cpu", "nested/file.parquet", 1, 1, 0, 0).is_err());
+        assert!(ActiveFile::new("cpu", ".hidden.parquet", 1, 1, 0, 0).is_err());
+        assert!(ActiveFile::new("cpu", "not-parquet.tmp", 1, 1, 0, 0).is_err());
+    }
+
+    #[test]
+    fn active_file_timestamp_range_survives_manifest_reopen() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = ManifestStore::open(root.path()).expect("manifest");
+        fs::write(store.segments_dir().join("ranged.parquet"), b"x").expect("segment");
+        let file = ActiveFile::new("cpu", "ranged.parquet", 1, 1, -5, 10).expect("active range");
+        store
+            .publish(ManifestUpdate::new().add_file(file))
+            .expect("publish");
+        drop(store);
+
+        let reopened = ManifestStore::open(root.path()).expect("reopen");
+        let state = reopened.state().expect("state");
+        let file = state.active_file("ranged.parquet").expect("active");
+        assert_eq!(file.min_timestamp(), -5);
+        assert_eq!(file.max_timestamp(), 10);
     }
 }

@@ -6,6 +6,7 @@ use crate::store::buffer::{FlushPolicy, MeasurementBuffer};
 use crate::store::manifest::{ActiveFile, ManifestStore, ManifestUpdate};
 use crate::store::parquet_reader::{ParquetReader, ParquetReaderConfig};
 use crate::store::parquet_writer::{ParquetWriter, ParquetWriterConfig};
+use crate::store::retention::TimePartition;
 use crate::store::seq::SequencedRow;
 use std::collections::BTreeMap;
 use std::fs;
@@ -79,7 +80,7 @@ impl Compactor {
         Self { config }
     }
 
-    /// Replaces all active files for one measurement when at least two exist.
+    /// Replaces one eligible time partition containing at least two active files.
     pub fn compact_measurement(
         &self,
         manifest: &ManifestStore,
@@ -91,23 +92,45 @@ impl Compactor {
             ));
         }
         let snapshot = manifest.state()?;
-        let candidates = snapshot
+        let mut partition_files: BTreeMap<TimePartition, Vec<ActiveFile>> = BTreeMap::new();
+        for file in snapshot
             .active_files()
             .values()
             .filter(|file| file.measurement() == measurement)
-            .cloned()
-            .collect::<Vec<_>>();
-        if candidates.len() < 2 {
-            return Ok(None);
+        {
+            let partition = TimePartition::for_timestamp(file.min_timestamp())?;
+            if file.max_timestamp() >= partition.end_exclusive() {
+                return Err(TsmError::Corruption(format!(
+                    "active Parquet '{}' spans multiple v0.3 partitions",
+                    file.name()
+                )));
+            }
+            partition_files
+                .entry(partition)
+                .or_default()
+                .push(file.clone());
         }
+        let Some(candidates) = partition_files.into_values().find(|files| files.len() >= 2) else {
+            return Ok(None);
+        };
 
-        let rows = ParquetReader::new(self.config.reader).read_measurement(
-            &snapshot,
+        let rows = ParquetReader::new(self.config.reader).read_active_files(
+            &candidates,
             manifest.segments_dir(),
             measurement,
         )?;
         let input_row_count = rows.len();
         let winners = deduplicate(rows);
+        let min_timestamp = winners
+            .values()
+            .map(|row| row.row().timestamp())
+            .min()
+            .ok_or_else(|| TsmError::Corruption("compaction input contains no rows".into()))?;
+        let max_timestamp = winners
+            .values()
+            .map(|row| row.row().timestamp())
+            .max()
+            .ok_or_else(|| TsmError::Corruption("compaction input contains no rows".into()))?;
         let mut buffer = MeasurementBuffer::new(measurement, self.config.buffer);
         for row in winners.into_values() {
             buffer.append(row)?;
@@ -115,8 +138,9 @@ impl Compactor {
         let batch = buffer.drain_sorted()?;
         let output_row_count = batch.num_rows();
         let output_file = format!(
-            "compact-{:020}-{:016}.parquet",
+            "compact-{:020}-{:+020}-{:016}.parquet",
             snapshot.generation(),
+            TimePartition::for_timestamp(min_timestamp)?.start(),
             COMPACTION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         );
         let written = ParquetWriter::new(self.config.writer)
@@ -127,6 +151,8 @@ impl Compactor {
             &output_file,
             written.row_count() as u64,
             written.file_bytes(),
+            min_timestamp,
+            max_timestamp,
         )?;
         let mut update = ManifestUpdate::new().add_file(compacted);
         let input_files = candidates

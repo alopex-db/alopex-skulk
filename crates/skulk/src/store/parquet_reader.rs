@@ -6,7 +6,7 @@ use crate::store::buffer::{
     COLUMN_KIND_METADATA_KEY, FIELD_COLUMN_KIND, INGEST_SEQ_COLUMN, INGEST_SEQ_COLUMN_KIND,
     TAG_COLUMN_KIND, TIME_COLUMN, TIME_COLUMN_KIND,
 };
-use crate::store::manifest::ManifestState;
+use crate::store::manifest::{ActiveFile, ManifestState};
 use crate::store::seq::{IngestSeq, SequencedRow};
 use arrow::array::{
     Array, BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
@@ -71,7 +71,22 @@ impl ParquetReader {
             .active_files()
             .values()
             .filter(|file| file.measurement() == measurement)
+            .cloned()
             .collect::<Vec<_>>();
+        self.read_active_files(&files, segments_dir.as_ref(), measurement)
+    }
+
+    pub(crate) fn read_active_files(
+        &self,
+        files: &[ActiveFile],
+        segments_dir: &Path,
+        measurement: &str,
+    ) -> Result<Vec<SequencedRow>> {
+        if files.iter().any(|file| file.measurement() != measurement) {
+            return Err(TsmError::InvalidInput(
+                "selected Parquet file belongs to another measurement".into(),
+            ));
+        }
         let expected_rows = files.iter().try_fold(0_usize, |total, file| {
             let rows = usize::try_from(file.row_count())
                 .map_err(|_| TsmError::ResourceLimit("manifest row count exceeds usize".into()))?;
@@ -89,7 +104,7 @@ impl ParquetReader {
         let mut rows = Vec::with_capacity(expected_rows);
         for active_file in files {
             let before = rows.len();
-            let file = File::open(segments_dir.as_ref().join(active_file.name()))?;
+            let file = File::open(segments_dir.join(active_file.name()))?;
             let reader = ParquetRecordBatchReaderBuilder::try_new(file)
                 .map_err(parquet_error)?
                 .with_batch_size(self.config.batch_rows)
@@ -109,6 +124,37 @@ impl ParquetReader {
                     "Parquet '{}' row count {decoded} differs from manifest {}",
                     active_file.name(),
                     active_file.row_count()
+                )));
+            }
+            let decoded_rows = &rows[before..];
+            let min_timestamp = decoded_rows
+                .iter()
+                .map(|row| row.row().timestamp())
+                .min()
+                .ok_or_else(|| {
+                    TsmError::Corruption(format!(
+                        "active Parquet '{}' contains no rows",
+                        active_file.name()
+                    ))
+                })?;
+            let max_timestamp = decoded_rows
+                .iter()
+                .map(|row| row.row().timestamp())
+                .max()
+                .ok_or_else(|| {
+                    TsmError::Corruption(format!(
+                        "active Parquet '{}' contains no rows",
+                        active_file.name()
+                    ))
+                })?;
+            if min_timestamp != active_file.min_timestamp()
+                || max_timestamp != active_file.max_timestamp()
+            {
+                return Err(TsmError::Corruption(format!(
+                    "Parquet '{}' timestamp range {min_timestamp}..={max_timestamp} differs from manifest {}..={}",
+                    active_file.name(),
+                    active_file.min_timestamp(),
+                    active_file.max_timestamp()
                 )));
             }
         }
@@ -314,11 +360,23 @@ mod tests {
         let written = ParquetWriter::new(ParquetWriterConfig::default())
             .write_atomic(store.segments_dir().join(name), &batch)
             .expect("write");
+        let min_timestamp = rows
+            .iter()
+            .map(|row| row.row().timestamp())
+            .min()
+            .expect("non-empty rows");
+        let max_timestamp = rows
+            .iter()
+            .map(|row| row.row().timestamp())
+            .max()
+            .expect("non-empty rows");
         ActiveFile::new(
             measurement,
             name,
             written.row_count() as u64,
             written.file_bytes(),
+            min_timestamp,
+            max_timestamp,
         )
         .expect("active file")
     }
@@ -397,6 +455,36 @@ mod tests {
         let reader = ParquetReader::new(ParquetReaderConfig::new(1, 1).expect("config"));
         assert!(reader
             .read_measurement(&store.state().expect("state"), store.segments_dir(), "cpu",)
+            .is_err());
+    }
+
+    #[test]
+    fn manifest_timestamp_range_must_match_the_parquet_rows() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = ManifestStore::open(root.path()).expect("manifest");
+        let rows = [sequenced(
+            1,
+            "cpu",
+            Tags::new(),
+            42,
+            Fields::from([("value".into(), FieldValue::Integer(1))]),
+        )];
+        let actual = persist(&store, "cpu", "cpu.parquet", &rows);
+        let wrong = ActiveFile::new(
+            "cpu",
+            actual.name(),
+            actual.row_count(),
+            actual.file_bytes(),
+            0,
+            0,
+        )
+        .expect("wrong metadata");
+        store
+            .publish(ManifestUpdate::new().add_file(wrong))
+            .expect("publish");
+
+        assert!(ParquetReader::new(ParquetReaderConfig::default())
+            .read_measurement(&store.state().expect("state"), store.segments_dir(), "cpu")
             .is_err());
     }
 }

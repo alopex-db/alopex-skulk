@@ -1,5 +1,6 @@
 use alopex_skulk::model::{FieldValue, Fields, SeriesKey, Tags, WideRow};
 use alopex_skulk::store::recovery::{RecoveryConfig, RecoveryStore};
+use alopex_skulk::store::retention::HOUR_NANOS;
 
 fn row(host: &str, timestamp: i64, fields: Fields) -> WideRow {
     WideRow::new(
@@ -106,4 +107,52 @@ fn a_single_active_file_is_an_idempotent_noop() {
         .is_none());
 
     assert_eq!(store.manifest_state().expect("after"), before);
+}
+
+#[test]
+fn compaction_never_merges_across_time_partition_boundaries() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut store = RecoveryStore::open(root.path(), RecoveryConfig::default()).expect("open");
+    for offset in [1, 2] {
+        store
+            .ingest(row(
+                "edge-a",
+                offset,
+                Fields::from([("value".into(), FieldValue::Integer(offset))]),
+            ))
+            .expect("first partition");
+        store
+            .ingest(row(
+                "edge-b",
+                HOUR_NANOS + offset,
+                Fields::from([("value".into(), FieldValue::Integer(offset))]),
+            ))
+            .expect("second partition");
+        store.flush_all().expect("flush both partitions");
+    }
+    assert_eq!(
+        store.manifest_state().expect("before").active_files().len(),
+        4
+    );
+
+    let first = store
+        .compact_measurement("cpu")
+        .expect("first compact")
+        .expect("eligible partition");
+    assert_eq!(first.input_file_count(), 2);
+    assert_eq!(
+        store.manifest_state().expect("middle").active_files().len(),
+        3
+    );
+    assert_eq!(store.list_partitions("cpu").expect("partitions").len(), 2);
+
+    store
+        .compact_measurement("cpu")
+        .expect("second compact")
+        .expect("second eligible partition");
+    assert_eq!(
+        store.manifest_state().expect("after").active_files().len(),
+        2
+    );
+    assert_eq!(store.read_measurement("cpu").expect("all rows").len(), 4);
 }
