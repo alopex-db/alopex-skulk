@@ -1,6 +1,7 @@
 //! Durable Arrow and Parquet storage components.
 
 pub mod buffer;
+pub mod lock;
 pub mod manifest;
 pub mod parquet_reader;
 pub mod parquet_writer;

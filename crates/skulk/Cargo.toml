@@ -30,6 +30,7 @@ thiserror = { workspace = true }
 
 # Compression and checksums
 crc32fast = { workspace = true }
+fs2 = "0.4"
 bytes = { workspace = true }
 xxhash-rust = { workspace = true }
 
