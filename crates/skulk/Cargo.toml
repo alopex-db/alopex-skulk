@@ -24,6 +24,10 @@ tokio = { workspace = true }
 # Serialization
 serde = { workspace = true }
 
+# Columnar storage (pure Rust; keep default codecs disabled)
+arrow = { version = "=55.2.0", default-features = false }
+parquet = { version = "=55.2.0", default-features = false, features = ["arrow", "brotli"] }
+
 # Error handling
 thiserror = { workspace = true }
 
