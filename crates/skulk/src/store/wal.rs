@@ -6,11 +6,13 @@ use crc32fast::Hasher as Crc32;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Name of the v0.3 WAL file below the data root.
 pub const WAL_FILE_NAME: &str = "wal-v3.log";
+const CHECKPOINT_PREFIX: &str = ".wal-v3.log.checkpoint-";
 
 const WAL_MAGIC: [u8; 4] = *b"SKW3";
 const WAL_VERSION: u16 = 1;
@@ -18,6 +20,7 @@ const HEADER_BYTES: u64 = 6;
 const MIN_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_MAX_ENTRY_BYTES: usize = 1024 * 1024;
+static CHECKPOINT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Injectable monotonic time source used by interval-based synchronization.
 pub trait TimeSource: Send + Sync {
@@ -196,6 +199,7 @@ impl Wal {
     ) -> Result<Self> {
         let root = root.as_ref();
         fs::create_dir_all(root)?;
+        cleanup_checkpoint_files(root)?;
         let path = root.join(WAL_FILE_NAME);
 
         if !path.exists() || fs::metadata(&path)?.len() == 0 {
@@ -260,9 +264,51 @@ impl Wal {
         Ok(self.durable_through)
     }
 
-    /// Returns entries recovered when this handle was opened.
+    /// Returns all retained entries, including appends made on this handle.
     pub fn recovered_entries(&self) -> &[WalEntry] {
         &self.recovered
+    }
+
+    /// Atomically removes entries at or below a manifest-persisted sequence.
+    pub fn checkpoint_through(&mut self, persisted_through: u64) -> Result<()> {
+        self.ensure_writable()?;
+        self.sync()?;
+        let retained = self
+            .recovered
+            .iter()
+            .filter(|entry| entry.sequence > persisted_through)
+            .cloned()
+            .collect::<Vec<_>>();
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let checkpoint = parent.join(format!(
+            "{CHECKPOINT_PREFIX}{}-{}",
+            std::process::id(),
+            CHECKPOINT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut cleanup = CheckpointFile::new(checkpoint.clone());
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&checkpoint)?;
+        file.write_all(&WAL_MAGIC)?;
+        file.write_all(&WAL_VERSION.to_le_bytes())?;
+        for entry in &retained {
+            write_frame(&mut file, entry, self.config.max_entry_bytes)?;
+        }
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&checkpoint, &self.path)?;
+        cleanup.disarm();
+        sync_directory(parent)?;
+        self.file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.path)?;
+        self.recovered = retained;
+        self.pending_through = None;
+        self.durable_through = self.recovered.iter().map(WalEntry::sequence).max();
+        self.last_sync = self.time.now();
+        Ok(())
     }
 
     /// Returns the latest sequence known to be synchronized.
@@ -291,7 +337,11 @@ impl Wal {
             self.poisoned = true;
             return Err(error.into());
         }
-        self.pending_through = Some(entry.sequence);
+        self.pending_through = Some(
+            self.pending_through
+                .map_or(entry.sequence, |pending| pending.max(entry.sequence)),
+        );
+        self.recovered.push(entry.clone());
         Ok(())
     }
 
@@ -302,6 +352,62 @@ impl Wal {
             ));
         }
         Ok(())
+    }
+}
+
+fn cleanup_checkpoint_files(root: &Path) -> Result<()> {
+    let mut removed = false;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(CHECKPOINT_PREFIX)
+        {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_file() || file_type.is_symlink() {
+            fs::remove_file(entry.path())?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_directory(root)?;
+    }
+    Ok(())
+}
+
+fn write_frame(file: &mut File, entry: &WalEntry, max_entry_bytes: usize) -> Result<()> {
+    let payload = encode_entry(entry, max_entry_bytes)?;
+    let mut crc = Crc32::new();
+    crc.update(&payload);
+    file.write_all(&(payload.len() as u32).to_le_bytes())?;
+    file.write_all(&payload)?;
+    file.write_all(&crc.finalize().to_le_bytes())?;
+    Ok(())
+}
+
+struct CheckpointFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl CheckpointFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CheckpointFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -933,5 +1039,42 @@ mod tests {
         assert!(WalConfig::new(Duration::from_secs(61), 1024).is_err());
         assert!(WalConfig::new(Duration::from_secs(1), 1024).is_ok());
         assert!(WalConfig::new(Duration::from_secs(60), 1024).is_ok());
+    }
+
+    #[test]
+    fn checkpoint_removes_only_the_persisted_sequence_prefix() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut wal = Wal::open(root.path(), config()).expect("open WAL");
+        for sequence in 1..=4 {
+            wal.append_durable(&WalEntry::new(sequence, row(sequence as i64)))
+                .expect("append");
+        }
+
+        wal.checkpoint_through(2).expect("checkpoint");
+        drop(wal);
+
+        let reopened = Wal::open(root.path(), config()).expect("reopen");
+        assert_eq!(
+            reopened
+                .recovered_entries()
+                .iter()
+                .map(WalEntry::sequence)
+                .collect::<Vec<_>>(),
+            [3, 4]
+        );
+    }
+
+    #[test]
+    fn open_removes_only_scoped_checkpoint_artifacts() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let checkpoint = root.path().join(".wal-v3.log.checkpoint-123-4");
+        let unrelated = root.path().join("checkpoint-user-data");
+        fs::write(&checkpoint, b"reproducible partial checkpoint").expect("checkpoint");
+        fs::write(&unrelated, b"keep").expect("unrelated");
+
+        let _wal = Wal::open(root.path(), config()).expect("open WAL");
+
+        assert!(!checkpoint.exists());
+        assert!(unrelated.exists());
     }
 }

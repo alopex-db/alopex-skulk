@@ -120,12 +120,7 @@ impl MeasurementBuffer {
     /// Adds one sequenced row after validating the table and column union.
     pub fn append(&mut self, sequenced: SequencedRow) -> Result<()> {
         let row = sequenced.row();
-        self.validate_row(row)?;
-        let row_bytes = estimated_row_bytes(row)?;
-        let estimated_bytes = self
-            .estimated_bytes
-            .checked_add(row_bytes)
-            .ok_or_else(|| TsmError::ResourceLimit("buffer memory estimate overflow".into()))?;
+        let estimated_bytes = self.validate_append(row)?;
 
         let prior_rows = self.row_count();
         let mut present = BTreeSet::new();
@@ -161,6 +156,14 @@ impl MeasurementBuffer {
         });
         self.estimated_bytes = estimated_bytes;
         Ok(())
+    }
+
+    pub(crate) fn validate_append(&self, row: &WideRow) -> Result<usize> {
+        self.validate_row(row)?;
+        let row_bytes = estimated_row_bytes(row)?;
+        self.estimated_bytes
+            .checked_add(row_bytes)
+            .ok_or_else(|| TsmError::ResourceLimit("buffer memory estimate overflow".into()))
     }
 
     /// Builds a schema-union RecordBatch sorted by tags, time, then sequence.
