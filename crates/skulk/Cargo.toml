@@ -15,14 +15,13 @@ readme = "README.md"
 default = []
 
 [dependencies]
-# Async runtime
-tokio = { workspace = true }
-
 # Serialization
 serde = { workspace = true }
 
-# Columnar storage (pure Rust; keep default codecs disabled)
-arrow = { version = "=55.2.0", default-features = false }
+# Columnar storage (pure Rust; depend only on the Arrow components we use)
+arrow-array = { version = "=55.2.0", default-features = false }
+arrow-schema = { version = "=55.2.0", default-features = false }
+arrow-select = { version = "=55.2.0", default-features = false }
 parquet = { version = "=55.2.0", default-features = false, features = ["arrow", "brotli"] }
 
 # Error handling
@@ -31,16 +30,13 @@ thiserror = { workspace = true }
 # Compression and checksums
 crc32fast = { workspace = true }
 fs2 = "0.4"
-bytes = { workspace = true }
 xxhash-rust = { workspace = true }
-
-# Logging
-tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
-rand = { workspace = true }
 proptest = { workspace = true }
-tracing-subscriber = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[bench]]
+name = "storage_bench"
+harness = false

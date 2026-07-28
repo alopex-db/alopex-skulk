@@ -8,12 +8,12 @@ use crate::store::buffer::{
 };
 use crate::store::manifest::{ActiveFile, ManifestState};
 use crate::store::seq::{IngestSeq, SequencedRow};
-use arrow::array::{
+use arrow_array::RecordBatch;
+use arrow_array::{
     Array, BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
     UInt64Array,
 };
-use arrow::datatypes::DataType;
-use arrow::record_batch::RecordBatch;
+use arrow_schema::{ArrowError, DataType, Field};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::fs::File;
 use std::path::Path;
@@ -294,7 +294,7 @@ fn decode_field(batch: &RecordBatch, column: usize, row: usize) -> Result<Option
     Ok(Some(value))
 }
 
-fn validate_system_kind(field: &arrow::datatypes::Field, expected: &str) -> Result<()> {
+fn validate_system_kind(field: &Field, expected: &str) -> Result<()> {
     if field
         .metadata()
         .get(COLUMN_KIND_METADATA_KEY)
@@ -313,7 +313,7 @@ fn type_corruption() -> TsmError {
     TsmError::Corruption("Arrow array does not match declared field type".into())
 }
 
-fn arrow_error(error: arrow::error::ArrowError) -> TsmError {
+fn arrow_error(error: ArrowError) -> TsmError {
     TsmError::InvalidFormat(format!("Arrow schema error: {error}"))
 }
 

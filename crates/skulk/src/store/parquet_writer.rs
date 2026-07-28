@@ -5,8 +5,8 @@ use crate::store::buffer::{
     COLUMN_KIND_METADATA_KEY, FIELD_COLUMN_KIND, INGEST_SEQ_COLUMN, INGEST_SEQ_COLUMN_KIND,
     TAG_COLUMN_KIND, TIME_COLUMN, TIME_COLUMN_KIND,
 };
-use arrow::datatypes::DataType;
-use arrow::record_batch::RecordBatch;
+use arrow_array::RecordBatch;
+use arrow_schema::DataType;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{BrotliLevel, Compression, Encoding};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -289,7 +289,7 @@ mod tests {
         )
     }
 
-    fn batch(rows: impl IntoIterator<Item = SequencedRow>) -> arrow::record_batch::RecordBatch {
+    fn batch(rows: impl IntoIterator<Item = SequencedRow>) -> arrow_array::RecordBatch {
         let mut buffer = MeasurementBuffer::new(
             "cpu",
             FlushPolicy::new(100_000, 128 * 1024 * 1024).expect("policy"),

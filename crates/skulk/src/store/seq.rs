@@ -95,6 +95,33 @@ impl Sequencer {
         Ok(SequencedRow::new(ingest_seq, row))
     }
 
+    /// Atomically reserves a contiguous sequence range for a validated batch.
+    pub fn issue_batch(&mut self, rows: Vec<WideRow>) -> Result<Vec<SequencedRow>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let start = self
+            .next
+            .ok_or_else(|| TsmError::ResourceLimit("ingest sequence space is exhausted".into()))?;
+        let additional = u64::try_from(rows.len() - 1)
+            .map_err(|_| TsmError::ResourceLimit("ingest batch exceeds u64".into()))?;
+        let last = start
+            .checked_add(additional)
+            .ok_or_else(|| TsmError::ResourceLimit("ingest sequence space is exhausted".into()))?;
+        let mut sequenced = Vec::with_capacity(rows.len());
+        for (offset, row) in rows.into_iter().enumerate() {
+            let offset = u64::try_from(offset)
+                .map_err(|_| TsmError::ResourceLimit("ingest batch exceeds u64".into()))?;
+            let sequence = start.checked_add(offset).ok_or_else(|| {
+                TsmError::ResourceLimit("ingest sequence space is exhausted".into())
+            })?;
+            sequenced.push(SequencedRow::new(IngestSeq::new(sequence), row));
+        }
+        self.next = last.checked_add(1);
+        self.highest_issued = Some(IngestSeq::new(last));
+        Ok(sequenced)
+    }
+
     /// Returns the highest recovered or newly issued sequence.
     pub const fn highest_issued(&self) -> Option<IngestSeq> {
         self.highest_issued
@@ -177,5 +204,19 @@ mod tests {
     #[test]
     fn recovery_after_u64_max_fails_without_reusing_the_sequence_space() {
         assert!(Sequencer::resume_after(Some(IngestSeq::new(u64::MAX))).is_err());
+    }
+
+    #[test]
+    fn oversized_batch_reservation_does_not_partially_advance() {
+        let mut sequencer =
+            Sequencer::resume_after(Some(IngestSeq::new(u64::MAX - 1))).expect("last slot");
+        assert!(sequencer.issue_batch(vec![row(1), row(2)]).is_err());
+        assert_eq!(
+            sequencer
+                .issue(row(3))
+                .expect("still available")
+                .ingest_seq(),
+            IngestSeq::new(u64::MAX)
+        );
     }
 }

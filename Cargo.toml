@@ -30,9 +30,17 @@ proptest = "1.4"
 tempfile = "3.8"
 
 [profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.bench]
 opt-level = 3
 lto = true
 codegen-units = 1
+strip = "symbols"
 
 [profile.dev]
 opt-level = 0

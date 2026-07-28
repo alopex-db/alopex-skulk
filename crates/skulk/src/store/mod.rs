@@ -2,6 +2,7 @@
 
 pub mod buffer;
 pub mod compaction;
+mod format;
 pub mod lock;
 pub mod manifest;
 pub mod parquet_reader;

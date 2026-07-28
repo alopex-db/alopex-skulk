@@ -3,13 +3,13 @@
 use crate::error::{Result, TsmError};
 use crate::model::{FieldType, FieldValue, WideRow};
 use crate::store::seq::SequencedRow;
-use arrow::array::{
-    ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
-    TimestampNanosecondBuilder, UInt64Array, UInt64Builder,
+use arrow_array::builder::{
+    BooleanBuilder, Float64Builder, Int64Builder, StringBuilder, TimestampNanosecondBuilder,
+    UInt64Builder,
 };
-use arrow::compute::take;
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow::record_batch::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
+use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
+use arrow_select::take::take;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::mem::size_of;
@@ -490,7 +490,7 @@ fn checked_add(current: usize, additional: usize) -> Result<usize> {
         .ok_or_else(|| TsmError::ResourceLimit("buffer memory estimate overflow".into()))
 }
 
-fn arrow_error(error: arrow::error::ArrowError) -> TsmError {
+fn arrow_error(error: ArrowError) -> TsmError {
     TsmError::Serialization(format!("Arrow record batch: {error}"))
 }
 
@@ -502,11 +502,11 @@ mod tests {
     };
     use crate::model::{FieldValue, Fields, SeriesKey, Tags, WideRow};
     use crate::store::seq::{IngestSeq, SequencedRow};
-    use arrow::array::{
+    use arrow_array::{
         Array, BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
         UInt64Array,
     };
-    use arrow::datatypes::DataType;
+    use arrow_schema::DataType;
 
     fn sequenced(
         sequence: u64,

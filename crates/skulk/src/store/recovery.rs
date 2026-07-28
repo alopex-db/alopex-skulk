@@ -4,6 +4,7 @@ use crate::error::{Result, TsmError};
 use crate::model::WideRow;
 use crate::store::buffer::{FlushPolicy, MeasurementBuffer};
 use crate::store::compaction::{CompactionConfig, CompactionResult, Compactor};
+use crate::store::format::reject_legacy_data_root;
 use crate::store::lock::DataRootLock;
 use crate::store::manifest::{ActiveFile, ManifestState, ManifestStore, ManifestUpdate};
 use crate::store::parquet_reader::{ParquetReader, ParquetReaderConfig};
@@ -98,6 +99,7 @@ impl RecoveryStore {
     pub fn open(root: impl AsRef<Path>, config: RecoveryConfig) -> Result<Self> {
         let root = root.as_ref();
         let lock = DataRootLock::acquire(root)?;
+        reject_legacy_data_root(root)?;
         let manifest = ManifestStore::open(root)?;
         let retention = RetentionStore::open(root)?;
         let wal = Wal::open(root, config.wal)?;
@@ -174,6 +176,68 @@ impl RecoveryStore {
             .append(sequenced.clone())?;
         self.pending.entry(measurement).or_default().push(sequenced);
         Ok(sequence)
+    }
+
+    /// Validates a batch, appends every WAL frame, and fsyncs once before Ack.
+    pub fn ingest_batch_at(&mut self, rows: Vec<WideRow>, now: i64) -> Result<Vec<IngestSeq>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let affected = rows
+            .iter()
+            .map(|row| row.series().measurement().to_owned())
+            .collect::<BTreeSet<_>>();
+        let mut validation = BTreeMap::new();
+        for measurement in &affected {
+            let mut buffer = MeasurementBuffer::new(measurement, self.config.buffer);
+            if let Some(pending) = self.pending.get(measurement) {
+                for row in pending {
+                    buffer.append(row.clone())?;
+                }
+            }
+            validation.insert(measurement.clone(), buffer);
+        }
+        for (offset, row) in rows.iter().enumerate() {
+            let measurement = row.series().measurement();
+            TimePartition::for_timestamp(row.timestamp())?;
+            self.retention
+                .validate_write(measurement, row.timestamp(), now)?;
+            validation
+                .get_mut(measurement)
+                .ok_or_else(|| TsmError::Corruption("batch validation buffer is missing".into()))?
+                .append(SequencedRow::new(
+                    IngestSeq::new(
+                        u64::try_from(offset)
+                            .map_err(|_| {
+                                TsmError::ResourceLimit("ingest batch exceeds u64".into())
+                            })?
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                TsmError::ResourceLimit("ingest batch sequence overflow".into())
+                            })?,
+                    ),
+                    row.clone(),
+                ))?;
+        }
+
+        let sequenced = self.sequencer.issue_batch(rows)?;
+        for row in &sequenced {
+            self.wal
+                .append_buffered(&WalEntry::new(row.ingest_seq().get(), row.row().clone()))?;
+        }
+        self.wal.sync()?;
+
+        let mut sequences = Vec::with_capacity(sequenced.len());
+        for row in sequenced {
+            let measurement = row.row().series().measurement().to_owned();
+            self.buffers
+                .entry(measurement.clone())
+                .or_insert_with(|| MeasurementBuffer::new(&measurement, self.config.buffer))
+                .append(row.clone())?;
+            sequences.push(row.ingest_seq());
+            self.pending.entry(measurement).or_default().push(row);
+        }
+        Ok(sequences)
     }
 
     /// Persists every buffered measurement under one global recovery fence.
