@@ -1,6 +1,8 @@
 //! Protocol-independent ingestion and protocol decoder boundaries.
 
 pub mod line_protocol;
+/// Prometheus Remote Write v1 decoding.
+pub mod remote_write;
 
 use crate::error::{Result, TsmError};
 use crate::model::{FieldValue, SeriesId, WideRow};

@@ -20,6 +20,8 @@ serde = { workspace = true }
 
 # Protocol parsing (official InfluxData parser; pure Rust)
 influxdb-line-protocol = { version = "=2.0.0", default-features = false }
+prost = { version = "=0.13.5", default-features = false, features = ["derive", "std"] }
+snap = { version = "=1.1.1", default-features = false }
 
 # Columnar storage (pure Rust; depend only on the Arrow components we use)
 arrow-array = { version = "=55.2.0", default-features = false }
