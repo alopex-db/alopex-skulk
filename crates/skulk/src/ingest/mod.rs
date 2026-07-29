@@ -80,6 +80,15 @@ impl IngestBatch {
             .push(IngestRejection::new(source, reason.into()));
     }
 
+    /// Test helper: rejection sources and reasons in order.
+    #[cfg(test)]
+    pub(crate) fn rejected_debug(&self) -> Vec<(SourceLocation, String)> {
+        self.rejections
+            .iter()
+            .map(|rejection| (rejection.source(), rejection.reason().to_string()))
+            .collect()
+    }
+
     /// Returns the original encoded request size.
     pub const fn encoded_bytes(&self) -> usize {
         self.encoded_bytes
