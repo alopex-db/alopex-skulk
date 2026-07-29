@@ -10,9 +10,19 @@ documentation = "https://docs.rs/alopex-skulk"
 keywords = ["time-series", "database", "storage", "tsdb", "alopex"]
 categories = ["database", "data-structures"]
 readme = "README.md"
+# links: the Nim query-parser shared library (vendored per target under
+# crates/skulk/nim-parser/vendor/). A distinct links value from alopex-sql's
+# "alopex_sql_parser" avoids a duplicate-links conflict if both crates ever
+# share a dependency graph. build.rs publishes cargo::metadata=libdir so the
+# final binary's build script can set an rpath (DEP_SKULK_NIM_PARSER_LIBDIR).
+links = "skulk_nim_parser"
 
 [features]
-default = []
+# Text query frontends (spec skulk-v0-4, rulings D1/D2). The core profile
+# (--no-default-features) stays pure Rust with zero C/Nim artifacts.
+default = ["promql", "sql-ts"]
+promql = ["dep:rmp-serde"]
+sql-ts = ["dep:rmp-serde"]
 
 [dependencies]
 # Serialization
@@ -29,6 +39,13 @@ arrow-array = { version = "=55.2.0", default-features = false }
 arrow-schema = { version = "=55.2.0", default-features = false }
 arrow-select = { version = "=55.2.0", default-features = false }
 parquet = { version = "=55.2.0", default-features = false, features = ["arrow", "brotli"] }
+
+# Query layer (core; pure Rust). Size/DFA limits are configured at runtime
+# via RegexBuilder so hostile patterns are bounded (spec Req1 AC8).
+regex = { version = "1.11", default-features = false, features = ["std", "perf", "unicode"] }
+
+# Nim parser FFI bridge payloads (feature-gated; not part of the core profile)
+rmp-serde = { version = "1.3", optional = true }
 
 # Error handling
 thiserror = { workspace = true }
@@ -50,3 +67,7 @@ harness = false
 [[bench]]
 name = "ingest_bench"
 harness = false
+
+[[test]]
+name = "build_script_contract"
+path = "build_support.rs"
