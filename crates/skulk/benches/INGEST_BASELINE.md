@@ -11,7 +11,7 @@ Attribution uses same-session paired runs (code change is the only delta).
 | --- | ---: | ---: | ---: | --- |
 | Line Protocol decode | 118.9-147.4 K/s | 225.2-324.7 K/s (~2.2x) | - | improved |
 | Remote Write decode | 201.5-217.9 K/s | 595.7-743.3 K/s | - | improved |
-| Line Protocol -> WAL ACK | 34.1-37.8 K/s | mids 128.9-172.8 K/s over 5 clean runs, median 152.3 K/s (~4.3x) | >= 150 K/s (median of >=3 clean runs) | PASS |
+| Line Protocol -> WAL ACK | 34.1-37.8 K/s | fully-quiet window: mids 150.9/180.1/189.7 K/s, median 180.1 K/s (~4.9x) | >= 150 K/s (median of >=3 clean runs) | PASS (3/3 runs above gate) |
 | Remote Write -> WAL ACK | 34.1-39.8 K/s | 95.0-159.1 K/s (~3-4x; 141.9-159.1 K/s after the buffer-state rework even under load avg 3) | >= 100 K/s (published) | PASS |
 
 Additional fixes after the first remeasurement: single-walk row admission
@@ -22,9 +22,11 @@ fallback whose equivalence is enforced by a differential proptest.
 Gate rule: median of at least three clean runs in load-gated windows
 (load1 < 1.2 and load5 < 1.5 at start). Contaminated runs are identified
 by simultaneous collapse of the untouched Remote Write path and excluded
-(1 of 6 fast-path runs). Per-run LP mids on the release build:
-172.8 / 161.3 / 128.9 / 152.3 / 146.5 K/s; RW mids 95.9-108.2 K/s with
-every clean run's mid above the 100 K published gate. Residual variance
+(1 of 6 fast-path runs). Definitive window (background jobs stopped, load1 0.71-0.97 through all
+three runs): LP mids 189.7 / 180.1 / 150.9 K/s (lower CI 184.0 / 169.3 /
+143.9 K/s), RW mids 144.6 / 144.4 / 139.2 K/s. Earlier partially-quiet
+windows: LP mids 172.8 / 161.3 / 128.9 / 152.3 / 146.5 K/s, RW mids
+95.9-108.2 K/s. Residual variance
 comes from WSL2 host-side disk activity that is invisible inside the VM;
 future release gates should run on a dedicated CI runner.
 
