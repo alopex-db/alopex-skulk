@@ -4,9 +4,10 @@
 
 ### Fixed
 
-- Durable ingest throughput on the fixed 10K-point baseline workload:
-  Line Protocol -> WAL ACK ~4.5x (34-38K -> 161-173K pts/s in clean runs)
-  and Remote Write -> WAL ACK ~3-4x (34-40K -> up to 141-185K samples/s).
+- Durable ingest throughput on the fixed 10K-point baseline workload
+  (fully-quiet window, median of 3 runs): Line Protocol -> WAL ACK ~4.9x
+  (34-38K -> 180.1K pts/s, all runs above the 150K gate) and Remote
+  Write -> WAL ACK ~3.9x (34-40K -> 144.4K samples/s).
   Achieved via single-walk row admission (influxdb3 validator
   architecture), type-state qualified batches, Arc-shared series
   identity, and an escape-free Line Protocol fast path with reference
@@ -31,6 +32,9 @@
   Arrow columns are built only at flush.
 - v0.3.0-written WAL/Parquet/manifest files are read unchanged; frame
   encoding is byte-identical.
+- `WideRow` and `SequencedRow` no longer derive serde Serialize/
+  Deserialize (they are not persisted via serde; recorded here as a
+  public-API change omitted from the original 0.3.1 notes).
 
 ### Known Limitations
 
