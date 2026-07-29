@@ -2,9 +2,10 @@
 
 use super::{IngestBatch, IngestLimits, SourceLocation};
 use crate::error::{Result, TsmError};
-use crate::model::{FieldValue, Fields, SeriesKey, Tags, WideRow};
+use crate::model::{FieldValue, Fields, SeriesId, SeriesKey, Tags, WideRow};
 use influxdb_line_protocol::{parse_lines, split_lines, FieldValue as LineFieldValue, ParsedLine};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Upper bound for the per-request series cache (bypassed once full).
 const SERIES_CACHE_MAX_ENTRIES: usize = 10_000;
@@ -30,7 +31,7 @@ impl LineProtocolDecoder {
         })?;
         let mut batch = IngestBatch::new(input.len(), input.len());
         let mut physical_line = 1_usize;
-        let mut series_cache: HashMap<&str, SeriesKey> = HashMap::new();
+        let mut series_cache: HashMap<&str, (Arc<SeriesKey>, SeriesId)> = HashMap::new();
 
         for raw_line in split_lines(text) {
             let source = SourceLocation::Line(physical_line);
@@ -73,7 +74,7 @@ impl LineProtocolDecoder {
         source: SourceLocation,
         default_timestamp: i64,
         batch: &mut IngestBatch,
-        series_cache: &mut HashMap<&'a str, SeriesKey>,
+        series_cache: &mut HashMap<&'a str, (Arc<SeriesKey>, SeriesId)>,
     ) -> Result<()> {
         match parse_lines(raw_line).next() {
             None => return Ok(()),
@@ -127,10 +128,10 @@ fn wide_row<'a>(
     line: ParsedLine<'_>,
     series_raw: &'a str,
     default_timestamp: i64,
-    series_cache: &mut HashMap<&'a str, SeriesKey>,
+    series_cache: &mut HashMap<&'a str, (Arc<SeriesKey>, SeriesId)>,
 ) -> std::result::Result<WideRow, String> {
-    let series = if let Some(cached) = series_cache.get(series_raw) {
-        cached.clone()
+    let (series, series_id) = if let Some((series, series_id)) = series_cache.get(series_raw) {
+        (Arc::clone(series), *series_id)
     } else {
         let mut tags = Tags::new();
         for (name, value) in line.series.tag_set.unwrap_or_default() {
@@ -139,11 +140,12 @@ fn wide_row<'a>(
                 return Err(format!("duplicate tag '{name}'"));
             }
         }
-        let key = SeriesKey::new(line.series.measurement.to_string(), tags);
+        let key = Arc::new(SeriesKey::new(line.series.measurement.to_string(), tags));
+        let key_id = key.id();
         if series_cache.len() < SERIES_CACHE_MAX_ENTRIES {
-            series_cache.insert(series_raw, key.clone());
+            series_cache.insert(series_raw, (Arc::clone(&key), key_id));
         }
-        key
+        (key, key_id)
     };
 
     let mut fields = Fields::new();
@@ -161,8 +163,9 @@ fn wide_row<'a>(
         }
     }
 
-    Ok(WideRow::new(
+    Ok(WideRow::with_shared_series(
         series,
+        series_id,
         line.timestamp.unwrap_or(default_timestamp),
         fields,
     ))

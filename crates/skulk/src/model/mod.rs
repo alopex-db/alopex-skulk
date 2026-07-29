@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::hash::Hasher;
+use std::sync::Arc;
 use xxhash_rust::xxh64::Xxh64;
 
 /// Timestamp in nanoseconds since the Unix epoch.
@@ -117,9 +118,13 @@ impl FieldValue {
 }
 
 /// One timestamped row containing all fields for a series.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// The series identity is shared (`Arc`) so hot decode paths can reuse one
+/// interned key across many rows, and its hash is memoized at construction.
+#[derive(Debug, Clone, PartialEq)]
 pub struct WideRow {
-    series: SeriesKey,
+    series: Arc<SeriesKey>,
+    series_id: SeriesId,
     timestamp: Timestamp,
     fields: Fields,
 }
@@ -127,8 +132,26 @@ pub struct WideRow {
 impl WideRow {
     /// Creates a wide row without splitting its fields into separate series.
     pub fn new(series: SeriesKey, timestamp: Timestamp, fields: Fields) -> Self {
+        let series_id = series.id();
+        Self {
+            series: Arc::new(series),
+            series_id,
+            timestamp,
+            fields,
+        }
+    }
+
+    /// Creates a row sharing an interned series identity and memoized id.
+    pub fn with_shared_series(
+        series: Arc<SeriesKey>,
+        series_id: SeriesId,
+        timestamp: Timestamp,
+        fields: Fields,
+    ) -> Self {
+        debug_assert_eq!(series.id(), series_id);
         Self {
             series,
+            series_id,
             timestamp,
             fields,
         }
@@ -140,8 +163,8 @@ impl WideRow {
     }
 
     /// Returns the stable identifier for this row's series.
-    pub fn series_id(&self) -> SeriesId {
-        self.series.id()
+    pub const fn series_id(&self) -> SeriesId {
+        self.series_id
     }
 
     /// Returns the nanosecond timestamp.
@@ -161,7 +184,8 @@ impl WideRow {
 
     /// Splits the row into owned parts for storage adapters.
     pub fn into_parts(self) -> (SeriesKey, Timestamp, Fields) {
-        (self.series, self.timestamp, self.fields)
+        let series = Arc::try_unwrap(self.series).unwrap_or_else(|shared| (*shared).clone());
+        (series, self.timestamp, self.fields)
     }
 }
 

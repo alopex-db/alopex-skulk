@@ -2,7 +2,9 @@
 
 use crate::error::{Result, TsmError};
 use crate::model::WideRow;
-use crate::store::buffer::{BatchValidator, FlushPolicy, MeasurementBuffer, MeasurementState};
+use crate::store::buffer::{
+    BatchQualification, BatchValidator, FlushPolicy, MeasurementBuffer, MeasurementState,
+};
 use crate::store::compaction::{CompactionConfig, CompactionResult, Compactor};
 use crate::store::format::reject_legacy_data_root;
 use crate::store::lock::DataRootLock;
@@ -194,7 +196,7 @@ impl RecoveryStore {
         for measurement in &affected {
             validation.insert(
                 *measurement,
-                BatchValidator::new(measurement, self.buffers.get(*measurement), max_entry_bytes),
+                BatchValidator::new(self.buffers.get(*measurement), max_entry_bytes),
             );
             cutoffs.insert(
                 *measurement,
@@ -218,12 +220,57 @@ impl RecoveryStore {
                 .validate(row)?;
         }
 
-        let applied = validation
-            .into_iter()
-            .map(|(measurement, validator)| (measurement.to_owned(), validator.finish()))
-            .collect::<Vec<_>>();
+        let qualification = BatchQualification(
+            validation
+                .into_iter()
+                .map(|(measurement, validator)| (measurement.to_owned(), validator.finish()))
+                .collect(),
+        );
         drop(cutoffs);
         drop(affected);
+        self.write_validated_batch(rows, qualification)
+    }
+
+    /// Durably writes rows whose admission walk already happened at the
+    /// ingest layer (type-state trust; see `BatchQualification`). Only the
+    /// cheap time-domain checks run here.
+    pub fn ingest_qualified_batch_at(
+        &mut self,
+        rows: Vec<WideRow>,
+        qualification: BatchQualification,
+        now: i64,
+    ) -> Result<Vec<IngestSeq>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut cutoffs = BTreeMap::new();
+        for (measurement, _) in &qualification.0 {
+            cutoffs.insert(
+                measurement.as_str(),
+                self.retention.reject_cutoff(measurement, now)?,
+            );
+        }
+        for row in rows.iter() {
+            TimePartition::for_timestamp(row.timestamp())?;
+            if let Some(Some(cutoff)) = cutoffs.get(row.series().measurement()) {
+                if row.timestamp() < *cutoff {
+                    return Err(TsmError::InvalidInput(format!(
+                        "timestamp {} is older than retention cutoff {cutoff} for '{}'",
+                        row.timestamp(),
+                        row.series().measurement()
+                    )));
+                }
+            }
+        }
+        drop(cutoffs);
+        self.write_validated_batch(rows, qualification)
+    }
+
+    fn write_validated_batch(
+        &mut self,
+        rows: Vec<WideRow>,
+        qualification: BatchQualification,
+    ) -> Result<Vec<IngestSeq>> {
         let sequenced = self.sequencer.issue_batch(rows)?;
         self.wal.append_batch(
             sequenced
@@ -232,7 +279,7 @@ impl RecoveryStore {
         )?;
         self.wal.sync()?;
 
-        for (measurement, (new_columns, estimated_bytes, validated_rows)) in applied {
+        for (measurement, (new_columns, estimated_bytes, validated_rows)) in qualification.0 {
             if let Some(state) = self.buffers.get_mut(&measurement) {
                 state.apply_batch(new_columns, estimated_bytes, validated_rows);
             } else {
@@ -416,6 +463,16 @@ impl RecoveryStore {
         self.pending
             .values()
             .fold(0_usize, |total, rows| total.saturating_add(rows.len()))
+    }
+
+    /// Returns the recorded column state for one measurement, if any.
+    pub fn measurement_state(&self, measurement: &str) -> Option<&MeasurementState> {
+        self.buffers.get(measurement)
+    }
+
+    /// Returns the WAL entry size limit for admission-time qualification.
+    pub fn wal_max_entry_bytes(&self) -> usize {
+        self.config.wal.max_entry_bytes()
     }
 
     /// Returns the current in-memory buffer estimate for admission control.

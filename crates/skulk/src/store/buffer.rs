@@ -600,13 +600,21 @@ impl MeasurementState {
     }
 }
 
+/// Opaque result of a single-walk batch qualification: per-measurement
+/// column additions and totals, applied in bulk by the trusted write path.
+/// Constructible only inside the crate, so external callers cannot bypass
+/// qualification (type-state pattern, after influxdb3's WriteValidator).
+pub struct BatchQualification(pub(crate) Vec<(String, MeasurementDelta)>);
+
+/// Batch-introduced columns, final memory estimate and validated row count.
+pub(crate) type MeasurementDelta = (BTreeMap<String, ColumnRole>, usize, usize);
+
 /// Clone-free validation of one incoming batch against a buffer's column
 /// state. Mirrors `MeasurementBuffer::append`'s checks (measurement match,
 /// column-name validity, tag/field collision, role conflicts including
 /// columns introduced earlier in the same batch, and the memory-estimate
 /// overflow guard) without cloning rows or building Arrow columns.
 pub(crate) struct BatchValidator<'a> {
-    measurement: &'a str,
     state: Option<&'a MeasurementState>,
     new_columns: BTreeMap<String, ColumnRole>,
     estimated_bytes: usize,
@@ -615,19 +623,38 @@ pub(crate) struct BatchValidator<'a> {
 }
 
 impl<'a> BatchValidator<'a> {
-    pub(crate) fn new(
-        measurement: &'a str,
-        state: Option<&'a MeasurementState>,
-        max_entry_bytes: usize,
-    ) -> Self {
+    pub(crate) fn new(state: Option<&'a MeasurementState>, max_entry_bytes: usize) -> Self {
         Self {
-            measurement,
             state,
             new_columns: BTreeMap::new(),
             estimated_bytes: state.map_or(0, MeasurementState::estimated_bytes),
             max_entry_bytes,
             validated_rows: 0,
         }
+    }
+
+    /// Returns the recorded role of one column, if the store state or an
+    /// earlier row of this batch already introduced it.
+    pub(crate) fn role_of(&self, name: &str) -> Option<ColumnRole> {
+        self.column_role(name)
+    }
+
+    /// Commits one fully admitted row: its newly introduced columns and its
+    /// buffer memory estimate. Rejected rows must not be committed.
+    pub(crate) fn commit_row(
+        &mut self,
+        new_columns: Vec<(String, ColumnRole)>,
+        row_bytes: usize,
+    ) -> Result<()> {
+        for (name, role) in new_columns {
+            self.new_columns.insert(name, role);
+        }
+        self.estimated_bytes = self
+            .estimated_bytes
+            .checked_add(row_bytes)
+            .ok_or_else(|| TsmError::ResourceLimit("buffer memory estimate overflow".into()))?;
+        self.validated_rows += 1;
+        Ok(())
     }
 
     /// Returns the batch-introduced columns, the final memory estimate and
@@ -643,13 +670,6 @@ impl<'a> BatchValidator<'a> {
     }
 
     pub(crate) fn validate(&mut self, row: &WideRow) -> Result<()> {
-        if row.series().measurement() != self.measurement {
-            return Err(TsmError::InvalidInput(format!(
-                "measurement '{}' does not match buffer '{}'",
-                row.series().measurement(),
-                self.measurement
-            )));
-        }
         let mut entry_bytes = 8 + 8 + 4 + row.series().measurement().len() + 4 + 4;
         let mut row_bytes = std::mem::size_of::<i64>() + std::mem::size_of::<u64>();
         for (name, value) in row.series().tags() {
