@@ -35,15 +35,21 @@ impl LineProtocolDecoder {
 
         for raw_line in split_lines(text) {
             let source = SourceLocation::Line(physical_line);
+            let has_newline = raw_line.contains('\n');
+            let embedded_newlines = if has_newline {
+                raw_line.bytes().filter(|byte| *byte == b'\n').count()
+            } else {
+                0
+            };
             physical_line = physical_line
-                .checked_add(raw_line.bytes().filter(|byte| *byte == b'\n').count())
+                .checked_add(embedded_newlines)
                 .and_then(|line| line.checked_add(1))
                 .ok_or_else(|| {
                     TsmError::ResourceLimit("Line Protocol line number overflow".into())
                 })?;
 
             let invalid_multiline =
-                raw_line.contains('\n') && matches!(parse_lines(raw_line).next(), Some(Err(_)));
+                has_newline && matches!(parse_lines(raw_line).next(), Some(Err(_)));
             if invalid_multiline {
                 for (offset, physical) in raw_line.split('\n').enumerate() {
                     let line = source_line(source, offset)?;
