@@ -21,7 +21,7 @@ impl IngestSeq {
 }
 
 /// A wide row coupled to its total-order ingest position.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SequencedRow {
     ingest_seq: IngestSeq,
     row: WideRow,

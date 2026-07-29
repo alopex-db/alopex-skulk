@@ -354,7 +354,7 @@ mod tests {
             FlushPolicy::new(100, 1024 * 1024).expect("policy"),
         );
         for row in rows {
-            buffer.append(row.clone()).expect("buffer");
+            buffer.append(row).expect("buffer");
         }
         let batch = buffer.drain_sorted().expect("batch");
         let written = ParquetWriter::new(ParquetWriterConfig::default())

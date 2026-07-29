@@ -170,6 +170,15 @@ impl RetentionStore {
     }
 
     /// Applies the explicit cutoff policy before sequence allocation and WAL append.
+    /// Returns the reject cutoff for one measurement when its policy rejects
+    /// late writes, so batch loops can hoist the policy lookup.
+    pub fn reject_cutoff(&self, measurement: &str, now: Timestamp) -> Result<Option<Timestamp>> {
+        Ok(self.policy(measurement)?.and_then(|policy| {
+            (policy.late_write_policy() == LateWritePolicy::Reject).then(|| policy.cutoff(now))
+        }))
+    }
+
+    /// Validates one write timestamp against the measurement's retention policy.
     pub fn validate_write(
         &self,
         measurement: &str,

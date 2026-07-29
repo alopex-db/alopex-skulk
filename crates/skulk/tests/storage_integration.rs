@@ -128,7 +128,7 @@ fn fixed_volatile_and_repeated_parquet_files_beat_v02_gorilla() {
             let timestamp = 1_000_000_000 + index as i64 * 1_000_000;
             baseline.push((timestamp, value));
             buffer
-                .append(SequencedRow::new(
+                .append(&SequencedRow::new(
                     IngestSeq::new(index as u64 + 1),
                     WideRow::new(
                         SeriesKey::new(

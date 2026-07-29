@@ -2,7 +2,9 @@
 
 use crate::error::{Result, TsmError};
 use crate::model::WideRow;
-use crate::store::buffer::{FlushPolicy, MeasurementBuffer};
+use crate::store::buffer::{
+    BatchQualification, BatchValidator, FlushPolicy, MeasurementBuffer, MeasurementState,
+};
 use crate::store::compaction::{CompactionConfig, CompactionResult, Compactor};
 use crate::store::format::reject_legacy_data_root;
 use crate::store::lock::DataRootLock;
@@ -88,7 +90,7 @@ pub struct RecoveryStore {
     retention: RetentionStore,
     wal: Wal,
     sequencer: Sequencer,
-    buffers: BTreeMap<String, MeasurementBuffer>,
+    buffers: BTreeMap<String, MeasurementState>,
     pending: BTreeMap<String, Vec<SequencedRow>>,
     replayed_row_count: usize,
     config: RecoveryConfig,
@@ -111,7 +113,7 @@ impl RecoveryStore {
             .max()
             .map(IngestSeq::new);
         let sequencer = manifest.resume_sequencer(wal_high_water)?;
-        let mut buffers = BTreeMap::new();
+        let mut buffers: BTreeMap<String, MeasurementState> = BTreeMap::new();
         let mut pending: BTreeMap<String, Vec<SequencedRow>> = BTreeMap::new();
         let mut observed_sequences = BTreeSet::new();
         let mut replayed_row_count = 0;
@@ -131,8 +133,8 @@ impl RecoveryStore {
             let measurement = sequenced.row().series().measurement().to_owned();
             buffers
                 .entry(measurement.clone())
-                .or_insert_with(|| MeasurementBuffer::new(&measurement, config.buffer))
-                .append(sequenced.clone())?;
+                .or_insert_with(|| MeasurementState::new(&measurement))
+                .record(sequenced.row())?;
             pending.entry(measurement).or_default().push(sequenced);
             replayed_row_count += 1;
         }
@@ -161,20 +163,20 @@ impl RecoveryStore {
         TimePartition::for_timestamp(row.timestamp())?;
         self.retention
             .validate_write(&measurement, row.timestamp(), now)?;
-        if let Some(buffer) = self.buffers.get(&measurement) {
-            buffer.validate_append(&row)?;
+        if let Some(state) = self.buffers.get(&measurement) {
+            state.validate_append(&row)?;
         } else {
-            MeasurementBuffer::new(&measurement, self.config.buffer).validate_append(&row)?;
+            MeasurementState::new(&measurement).validate_append(&row)?;
         }
         self.wal.validate_row(&row)?;
         let sequenced = self.sequencer.issue(row)?;
         let sequence = sequenced.ingest_seq();
         self.wal
-            .append_durable(&WalEntry::new(sequence.get(), sequenced.row().clone()))?;
+            .append_durable_row(sequence.get(), sequenced.row())?;
         self.buffers
             .entry(measurement.clone())
-            .or_insert_with(|| MeasurementBuffer::new(&measurement, self.config.buffer))
-            .append(sequenced.clone())?;
+            .or_insert_with(|| MeasurementState::new(&measurement))
+            .record(sequenced.row())?;
         self.pending.entry(measurement).or_default().push(sequenced);
         Ok(sequence)
     }
@@ -186,58 +188,115 @@ impl RecoveryStore {
         }
         let affected = rows
             .iter()
-            .map(|row| row.series().measurement().to_owned())
-            .collect::<BTreeSet<_>>();
+            .map(|row| row.series().measurement())
+            .collect::<BTreeSet<&str>>();
+        let max_entry_bytes = self.config.wal.max_entry_bytes();
         let mut validation = BTreeMap::new();
+        let mut cutoffs = BTreeMap::new();
         for measurement in &affected {
-            let mut buffer = MeasurementBuffer::new(measurement, self.config.buffer);
-            if let Some(pending) = self.pending.get(measurement) {
-                for row in pending {
-                    buffer.append(row.clone())?;
-                }
-            }
-            validation.insert(measurement.clone(), buffer);
+            validation.insert(
+                *measurement,
+                BatchValidator::new(self.buffers.get(*measurement), max_entry_bytes),
+            );
+            cutoffs.insert(
+                *measurement,
+                self.retention.reject_cutoff(measurement, now)?,
+            );
         }
-        for (offset, row) in rows.iter().enumerate() {
+        for row in rows.iter() {
             let measurement = row.series().measurement();
             TimePartition::for_timestamp(row.timestamp())?;
-            self.retention
-                .validate_write(measurement, row.timestamp(), now)?;
+            if let Some(Some(cutoff)) = cutoffs.get(measurement) {
+                if row.timestamp() < *cutoff {
+                    return Err(TsmError::InvalidInput(format!(
+                        "timestamp {} is older than retention cutoff {cutoff} for '{measurement}'",
+                        row.timestamp()
+                    )));
+                }
+            }
             validation
                 .get_mut(measurement)
-                .ok_or_else(|| TsmError::Corruption("batch validation buffer is missing".into()))?
-                .append(SequencedRow::new(
-                    IngestSeq::new(
-                        u64::try_from(offset)
-                            .map_err(|_| {
-                                TsmError::ResourceLimit("ingest batch exceeds u64".into())
-                            })?
-                            .checked_add(1)
-                            .ok_or_else(|| {
-                                TsmError::ResourceLimit("ingest batch sequence overflow".into())
-                            })?,
-                    ),
-                    row.clone(),
-                ))?;
-            self.wal.validate_row(row)?;
+                .ok_or_else(|| TsmError::Corruption("batch validation state is missing".into()))?
+                .validate(row)?;
         }
 
-        let sequenced = self.sequencer.issue_batch(rows)?;
-        for row in &sequenced {
-            self.wal
-                .append_buffered(&WalEntry::new(row.ingest_seq().get(), row.row().clone()))?;
+        let qualification = BatchQualification(
+            validation
+                .into_iter()
+                .map(|(measurement, validator)| (measurement.to_owned(), validator.finish()))
+                .collect(),
+        );
+        drop(cutoffs);
+        drop(affected);
+        self.write_validated_batch(rows, qualification)
+    }
+
+    /// Durably writes rows whose admission walk already happened at the
+    /// ingest layer (type-state trust; see `BatchQualification`). Only the
+    /// cheap time-domain checks run here.
+    pub fn ingest_qualified_batch_at(
+        &mut self,
+        rows: Vec<WideRow>,
+        qualification: BatchQualification,
+        now: i64,
+    ) -> Result<Vec<IngestSeq>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
         }
+        let mut cutoffs = BTreeMap::new();
+        for (measurement, _) in &qualification.0 {
+            cutoffs.insert(
+                measurement.as_str(),
+                self.retention.reject_cutoff(measurement, now)?,
+            );
+        }
+        for row in rows.iter() {
+            TimePartition::for_timestamp(row.timestamp())?;
+            if let Some(Some(cutoff)) = cutoffs.get(row.series().measurement()) {
+                if row.timestamp() < *cutoff {
+                    return Err(TsmError::InvalidInput(format!(
+                        "timestamp {} is older than retention cutoff {cutoff} for '{}'",
+                        row.timestamp(),
+                        row.series().measurement()
+                    )));
+                }
+            }
+        }
+        drop(cutoffs);
+        self.write_validated_batch(rows, qualification)
+    }
+
+    fn write_validated_batch(
+        &mut self,
+        rows: Vec<WideRow>,
+        qualification: BatchQualification,
+    ) -> Result<Vec<IngestSeq>> {
+        let sequenced = self.sequencer.issue_batch(rows)?;
+        self.wal.append_batch(
+            sequenced
+                .iter()
+                .map(|row| (row.ingest_seq().get(), row.row())),
+        )?;
         self.wal.sync()?;
 
+        for (measurement, (new_columns, estimated_bytes, validated_rows)) in qualification.0 {
+            if let Some(state) = self.buffers.get_mut(&measurement) {
+                state.apply_batch(new_columns, estimated_bytes, validated_rows);
+            } else {
+                let mut state = MeasurementState::new(&measurement);
+                state.apply_batch(new_columns, estimated_bytes, validated_rows);
+                self.buffers.insert(measurement, state);
+            }
+        }
         let mut sequences = Vec::with_capacity(sequenced.len());
         for row in sequenced {
-            let measurement = row.row().series().measurement().to_owned();
-            self.buffers
-                .entry(measurement.clone())
-                .or_insert_with(|| MeasurementBuffer::new(&measurement, self.config.buffer))
-                .append(row.clone())?;
             sequences.push(row.ingest_seq());
-            self.pending.entry(measurement).or_default().push(row);
+            if let Some(rows) = self.pending.get_mut(row.row().series().measurement()) {
+                rows.push(row);
+            } else {
+                let measurement = row.row().series().measurement().to_owned();
+                self.pending.entry(measurement).or_default().push(row);
+            }
         }
         Ok(sequences)
     }
@@ -282,7 +341,7 @@ impl RecoveryStore {
                 for row in rows {
                     min_timestamp = min_timestamp.min(row.row().timestamp());
                     max_timestamp = max_timestamp.max(row.row().timestamp());
-                    buffer.append(row.clone())?;
+                    buffer.append(row)?;
                 }
                 let batch = buffer.to_sorted_record_batch()?;
                 let name = format!(
@@ -406,11 +465,21 @@ impl RecoveryStore {
             .fold(0_usize, |total, rows| total.saturating_add(rows.len()))
     }
 
+    /// Returns the recorded column state for one measurement, if any.
+    pub fn measurement_state(&self, measurement: &str) -> Option<&MeasurementState> {
+        self.buffers.get(measurement)
+    }
+
+    /// Returns the WAL entry size limit for admission-time qualification.
+    pub fn wal_max_entry_bytes(&self) -> usize {
+        self.config.wal.max_entry_bytes()
+    }
+
     /// Returns the current in-memory buffer estimate for admission control.
     pub fn pending_estimated_bytes(&self) -> Result<usize> {
-        self.buffers.values().try_fold(0_usize, |total, buffer| {
+        self.buffers.values().try_fold(0_usize, |total, state| {
             total
-                .checked_add(buffer.estimated_bytes())
+                .checked_add(state.estimated_bytes())
                 .ok_or_else(|| TsmError::ResourceLimit("buffer pressure estimate overflow".into()))
         })
     }
@@ -426,10 +495,8 @@ impl RecoveryStore {
     }
 
     fn clear_persisted_buffers(&mut self) -> Result<()> {
-        for buffer in self.buffers.values_mut() {
-            if buffer.row_count() != 0 {
-                let _ = buffer.drain_sorted()?;
-            }
+        for state in self.buffers.values_mut() {
+            state.clear();
         }
         self.pending.clear();
         Ok(())

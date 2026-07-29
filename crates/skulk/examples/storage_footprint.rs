@@ -9,7 +9,7 @@ fn main() -> alopex_skulk::Result<()> {
     let root = unique_root()?;
     std::fs::create_dir(&root)?;
     let mut buffer = MeasurementBuffer::new("footprint", FlushPolicy::default());
-    buffer.append(SequencedRow::new(
+    buffer.append(&SequencedRow::new(
         IngestSeq::new(1),
         WideRow::new(
             SeriesKey::new("footprint", Tags::from([("host".into(), "edge".into())])),

@@ -118,7 +118,7 @@ impl MeasurementBuffer {
     }
 
     /// Adds one sequenced row after validating the table and column union.
-    pub fn append(&mut self, sequenced: SequencedRow) -> Result<()> {
+    pub fn append(&mut self, sequenced: &SequencedRow) -> Result<()> {
         let row = sequenced.row();
         let estimated_bytes = self.validate_append(row)?;
 
@@ -294,7 +294,8 @@ impl MeasurementBuffer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ColumnRole {
+/// Role of one buffered column: tag or typed field.
+pub(crate) enum ColumnRole {
     Tag,
     Field(FieldType),
 }
@@ -494,6 +495,237 @@ fn arrow_error(error: ArrowError) -> TsmError {
     TsmError::Serialization(format!("Arrow record batch: {error}"))
 }
 
+/// Lightweight per-measurement ingest state: column roles for validation and
+/// the flush-policy memory estimate. Since v0.3.1 the acked row data lives
+/// once in the pending set and Arrow columns are built only at flush time.
+#[derive(Debug)]
+pub struct MeasurementState {
+    measurement: String,
+    columns: BTreeMap<String, ColumnRole>,
+    estimated_bytes: usize,
+    row_count: usize,
+}
+
+impl MeasurementState {
+    /// Creates an empty state for one measurement.
+    pub fn new(measurement: impl Into<String>) -> Self {
+        Self {
+            measurement: measurement.into(),
+            columns: BTreeMap::new(),
+            estimated_bytes: 0,
+            row_count: 0,
+        }
+    }
+
+    /// Returns the memory estimate used by the flush policy.
+    pub const fn estimated_bytes(&self) -> usize {
+        self.estimated_bytes
+    }
+
+    /// Returns the number of recorded (unflushed) rows.
+    pub const fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    /// Validates one row against the recorded column roles without mutating.
+    pub(crate) fn validate_append(&self, row: &WideRow) -> Result<usize> {
+        if row.series().measurement() != self.measurement {
+            return Err(TsmError::InvalidInput(format!(
+                "measurement '{}' does not match buffer '{}'",
+                row.series().measurement(),
+                self.measurement
+            )));
+        }
+        for name in row.series().tags().keys() {
+            validate_user_column_name(name)?;
+            if row.fields().contains_key(name) {
+                return Err(TsmError::InvalidInput(format!(
+                    "column '{name}' cannot be both a tag and a field"
+                )));
+            }
+            if let Some(role) = self.columns.get(name) {
+                if *role != ColumnRole::Tag {
+                    return Err(column_role_conflict(name));
+                }
+            }
+        }
+        for (name, value) in row.fields() {
+            validate_user_column_name(name)?;
+            let expected = ColumnRole::Field(value.field_type());
+            if let Some(role) = self.columns.get(name) {
+                if *role != expected {
+                    return Err(column_role_conflict(name));
+                }
+            }
+        }
+        let row_bytes = estimated_row_bytes(row)?;
+        self.estimated_bytes
+            .checked_add(row_bytes)
+            .ok_or_else(|| TsmError::ResourceLimit("buffer memory estimate overflow".into()))
+    }
+
+    /// Validates and records one acked row's columns and memory estimate.
+    pub fn record(&mut self, row: &WideRow) -> Result<()> {
+        let estimated_bytes = self.validate_append(row)?;
+        for name in row.series().tags().keys() {
+            self.columns.entry(name.clone()).or_insert(ColumnRole::Tag);
+        }
+        for (name, value) in row.fields() {
+            self.columns
+                .entry(name.clone())
+                .or_insert(ColumnRole::Field(value.field_type()));
+        }
+        self.estimated_bytes = estimated_bytes;
+        self.row_count += 1;
+        Ok(())
+    }
+
+    /// Applies one validated batch's columns and totals in bulk.
+    pub(crate) fn apply_batch(
+        &mut self,
+        new_columns: BTreeMap<String, ColumnRole>,
+        estimated_bytes: usize,
+        added_rows: usize,
+    ) {
+        self.columns.extend(new_columns);
+        self.estimated_bytes = estimated_bytes;
+        self.row_count += added_rows;
+    }
+
+    /// Forgets recorded rows and columns after a successful flush.
+    pub fn clear(&mut self) {
+        self.columns.clear();
+        self.estimated_bytes = 0;
+        self.row_count = 0;
+    }
+}
+
+/// Opaque result of a single-walk batch qualification: per-measurement
+/// column additions and totals, applied in bulk by the trusted write path.
+/// Constructible only inside the crate, so external callers cannot bypass
+/// qualification (type-state pattern, after influxdb3's WriteValidator).
+pub struct BatchQualification(pub(crate) Vec<(String, MeasurementDelta)>);
+
+/// Batch-introduced columns, final memory estimate and validated row count.
+pub(crate) type MeasurementDelta = (BTreeMap<String, ColumnRole>, usize, usize);
+
+/// Clone-free validation of one incoming batch against a buffer's column
+/// state. Mirrors `MeasurementBuffer::append`'s checks (measurement match,
+/// column-name validity, tag/field collision, role conflicts including
+/// columns introduced earlier in the same batch, and the memory-estimate
+/// overflow guard) without cloning rows or building Arrow columns.
+pub(crate) struct BatchValidator<'a> {
+    state: Option<&'a MeasurementState>,
+    new_columns: BTreeMap<String, ColumnRole>,
+    estimated_bytes: usize,
+    max_entry_bytes: usize,
+    validated_rows: usize,
+}
+
+impl<'a> BatchValidator<'a> {
+    pub(crate) fn new(state: Option<&'a MeasurementState>, max_entry_bytes: usize) -> Self {
+        Self {
+            state,
+            new_columns: BTreeMap::new(),
+            estimated_bytes: state.map_or(0, MeasurementState::estimated_bytes),
+            max_entry_bytes,
+            validated_rows: 0,
+        }
+    }
+
+    /// Returns the recorded role of one column, if the store state or an
+    /// earlier row of this batch already introduced it.
+    pub(crate) fn role_of(&self, name: &str) -> Option<ColumnRole> {
+        self.column_role(name)
+    }
+
+    /// Commits one fully admitted row: its newly introduced columns and its
+    /// buffer memory estimate. Rejected rows must not be committed.
+    pub(crate) fn commit_row(
+        &mut self,
+        new_columns: Vec<(String, ColumnRole)>,
+        row_bytes: usize,
+    ) -> Result<()> {
+        for (name, role) in new_columns {
+            self.new_columns.insert(name, role);
+        }
+        self.estimated_bytes = self
+            .estimated_bytes
+            .checked_add(row_bytes)
+            .ok_or_else(|| TsmError::ResourceLimit("buffer memory estimate overflow".into()))?;
+        self.validated_rows += 1;
+        Ok(())
+    }
+
+    /// Returns the batch-introduced columns, the final memory estimate and
+    /// the number of validated rows for one bulk state application.
+    pub(crate) fn finish(self) -> (BTreeMap<String, ColumnRole>, usize, usize) {
+        (self.new_columns, self.estimated_bytes, self.validated_rows)
+    }
+
+    fn column_role(&self, name: &str) -> Option<ColumnRole> {
+        self.state
+            .and_then(|state| state.columns.get(name).copied())
+            .or_else(|| self.new_columns.get(name).copied())
+    }
+
+    pub(crate) fn validate(&mut self, row: &WideRow) -> Result<()> {
+        let mut entry_bytes = 8 + 8 + 4 + row.series().measurement().len() + 4 + 4;
+        let mut row_bytes = std::mem::size_of::<i64>() + std::mem::size_of::<u64>();
+        for (name, value) in row.series().tags() {
+            validate_user_column_name(name)?;
+            if row.fields().contains_key(name) {
+                return Err(TsmError::InvalidInput(format!(
+                    "column '{name}' cannot be both a tag and a field"
+                )));
+            }
+            match self.column_role(name) {
+                Some(ColumnRole::Tag) => {}
+                Some(_) => return Err(column_role_conflict(name)),
+                None => {
+                    self.new_columns.insert(name.clone(), ColumnRole::Tag);
+                }
+            }
+            entry_bytes += 8 + name.len() + value.len();
+            row_bytes += name.len() + value.len().saturating_mul(2);
+        }
+        for (name, value) in row.fields() {
+            validate_user_column_name(name)?;
+            let expected = ColumnRole::Field(value.field_type());
+            match self.column_role(name) {
+                Some(role) if role == expected => {}
+                Some(_) => return Err(column_role_conflict(name)),
+                None => {
+                    self.new_columns.insert(name.clone(), expected);
+                }
+            }
+            entry_bytes += 4 + name.len() + 1;
+            row_bytes += name.len();
+            let (memory, encoded) = match value {
+                FieldValue::Float(_) => (8, 8),
+                FieldValue::Integer(_) => (8, 8),
+                FieldValue::Unsigned(_) => (8, 8),
+                FieldValue::Boolean(_) => (1, 1),
+                FieldValue::String(value) => (value.len(), 4 + value.len()),
+            };
+            row_bytes += memory;
+            entry_bytes += encoded;
+        }
+        if entry_bytes > self.max_entry_bytes {
+            return Err(TsmError::ResourceLimit(format!(
+                "encoded WAL entry is {entry_bytes} bytes, limit is {}",
+                self.max_entry_bytes
+            )));
+        }
+        self.estimated_bytes = self
+            .estimated_bytes
+            .checked_add(row_bytes)
+            .ok_or_else(|| TsmError::ResourceLimit("buffer memory estimate overflow".into()))?;
+        self.validated_rows += 1;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -538,7 +770,7 @@ mod tests {
     fn sparse_fields_and_late_columns_are_arrow_nulls() {
         let mut buffer = MeasurementBuffer::new("weather", unlimited_policy());
         buffer
-            .append(sequenced(
+            .append(&sequenced(
                 1,
                 "weather",
                 &[("region", "east")],
@@ -547,7 +779,7 @@ mod tests {
             ))
             .expect("first row");
         buffer
-            .append(sequenced(
+            .append(&sequenced(
                 2,
                 "weather",
                 &[("region", "east"), ("zone", "1a")],
@@ -588,7 +820,7 @@ mod tests {
     fn every_field_type_keeps_its_arrow_type_and_value() {
         let mut buffer = MeasurementBuffer::new("mixed", unlimited_policy());
         buffer
-            .append(sequenced(
+            .append(&sequenced(
                 7,
                 "mixed",
                 &[],
@@ -694,7 +926,7 @@ mod tests {
                 Fields::from([("value".into(), FieldValue::Integer(1))]),
             ),
         ] {
-            buffer.append(row).expect("append row");
+            buffer.append(&row).expect("append row");
         }
 
         let batch = buffer.to_sorted_record_batch().expect("record batch");
@@ -757,7 +989,7 @@ mod tests {
     fn measurement_or_field_type_conflicts_do_not_partially_mutate_the_buffer() {
         let mut buffer = MeasurementBuffer::new("cpu", unlimited_policy());
         buffer
-            .append(sequenced(
+            .append(&sequenced(
                 1,
                 "cpu",
                 &[],
@@ -767,7 +999,7 @@ mod tests {
             .expect("initial row");
 
         assert!(buffer
-            .append(sequenced(
+            .append(&sequenced(
                 2,
                 "memory",
                 &[],
@@ -776,7 +1008,7 @@ mod tests {
             ))
             .is_err());
         assert!(buffer
-            .append(sequenced(
+            .append(&sequenced(
                 3,
                 "cpu",
                 &[],
@@ -792,18 +1024,18 @@ mod tests {
         let mut row_limited =
             MeasurementBuffer::new("cpu", FlushPolicy::new(2, usize::MAX).expect("policy"));
         row_limited
-            .append(sequenced(1, "cpu", &[], 1, Fields::new()))
+            .append(&sequenced(1, "cpu", &[], 1, Fields::new()))
             .expect("first row");
         assert!(!row_limited.should_flush());
         row_limited
-            .append(sequenced(2, "cpu", &[], 2, Fields::new()))
+            .append(&sequenced(2, "cpu", &[], 2, Fields::new()))
             .expect("second row");
         assert!(row_limited.should_flush());
 
         let mut memory_limited =
             MeasurementBuffer::new("logs", FlushPolicy::new(100, 32).expect("policy"));
         memory_limited
-            .append(sequenced(
+            .append(&sequenced(
                 1,
                 "logs",
                 &[],
@@ -818,7 +1050,7 @@ mod tests {
     fn draining_a_sorted_batch_resets_only_after_success() {
         let mut buffer = MeasurementBuffer::new("cpu", unlimited_policy());
         buffer
-            .append(sequenced(1, "cpu", &[], 1, Fields::new()))
+            .append(&sequenced(1, "cpu", &[], 1, Fields::new()))
             .expect("row");
 
         let batch = buffer.drain_sorted().expect("drain");
