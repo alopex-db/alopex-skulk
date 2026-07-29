@@ -2,7 +2,7 @@
 
 use crate::error::{Result, TsmError};
 use crate::model::WideRow;
-use crate::store::buffer::{FlushPolicy, MeasurementBuffer};
+use crate::store::buffer::{BatchValidator, FlushPolicy, MeasurementBuffer};
 use crate::store::compaction::{CompactionConfig, CompactionResult, Compactor};
 use crate::store::format::reject_legacy_data_root;
 use crate::store::lock::DataRootLock;
@@ -132,7 +132,7 @@ impl RecoveryStore {
             buffers
                 .entry(measurement.clone())
                 .or_insert_with(|| MeasurementBuffer::new(&measurement, config.buffer))
-                .append(sequenced.clone())?;
+                .append(&sequenced)?;
             pending.entry(measurement).or_default().push(sequenced);
             replayed_row_count += 1;
         }
@@ -174,7 +174,7 @@ impl RecoveryStore {
         self.buffers
             .entry(measurement.clone())
             .or_insert_with(|| MeasurementBuffer::new(&measurement, self.config.buffer))
-            .append(sequenced.clone())?;
+            .append(&sequenced)?;
         self.pending.entry(measurement).or_default().push(sequenced);
         Ok(sequence)
     }
@@ -190,35 +190,20 @@ impl RecoveryStore {
             .collect::<BTreeSet<_>>();
         let mut validation = BTreeMap::new();
         for measurement in &affected {
-            let mut buffer = MeasurementBuffer::new(measurement, self.config.buffer);
-            if let Some(pending) = self.pending.get(measurement) {
-                for row in pending {
-                    buffer.append(row.clone())?;
-                }
-            }
-            validation.insert(measurement.clone(), buffer);
+            validation.insert(
+                measurement.as_str(),
+                BatchValidator::new(measurement, self.buffers.get(measurement.as_str())),
+            );
         }
-        for (offset, row) in rows.iter().enumerate() {
+        for row in rows.iter() {
             let measurement = row.series().measurement();
             TimePartition::for_timestamp(row.timestamp())?;
             self.retention
                 .validate_write(measurement, row.timestamp(), now)?;
             validation
                 .get_mut(measurement)
-                .ok_or_else(|| TsmError::Corruption("batch validation buffer is missing".into()))?
-                .append(SequencedRow::new(
-                    IngestSeq::new(
-                        u64::try_from(offset)
-                            .map_err(|_| {
-                                TsmError::ResourceLimit("ingest batch exceeds u64".into())
-                            })?
-                            .checked_add(1)
-                            .ok_or_else(|| {
-                                TsmError::ResourceLimit("ingest batch sequence overflow".into())
-                            })?,
-                    ),
-                    row.clone(),
-                ))?;
+                .ok_or_else(|| TsmError::Corruption("batch validation state is missing".into()))?
+                .validate(row)?;
             self.wal.validate_row(row)?;
         }
 
@@ -236,7 +221,7 @@ impl RecoveryStore {
             self.buffers
                 .entry(measurement.clone())
                 .or_insert_with(|| MeasurementBuffer::new(&measurement, self.config.buffer))
-                .append(row.clone())?;
+                .append(&row)?;
             sequences.push(row.ingest_seq());
             self.pending.entry(measurement).or_default().push(row);
         }
@@ -283,7 +268,7 @@ impl RecoveryStore {
                 for row in rows {
                     min_timestamp = min_timestamp.min(row.row().timestamp());
                     max_timestamp = max_timestamp.max(row.row().timestamp());
-                    buffer.append(row.clone())?;
+                    buffer.append(row)?;
                 }
                 let batch = buffer.to_sorted_record_batch()?;
                 let name = format!(

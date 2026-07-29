@@ -39,7 +39,12 @@ fn sustained_batches_recover_all_rows_after_reopen() {
                 for point in 0..500_i64 {
                     let host = (point % 100) as usize;
                     let ts = 1_000_000 + batch * 500 + point;
-                    rows.push(wide_row(measurement, host, ts, (batch * 500 + point) as f64));
+                    rows.push(wide_row(
+                        measurement,
+                        host,
+                        ts,
+                        (batch * 500 + point) as f64,
+                    ));
                 }
             }
             let accepted = store.ingest_batch_at(rows, NOW).expect("batch ingest");
@@ -123,7 +128,9 @@ fn flush_cycles_keep_wal_bounded_and_data_complete() {
         for batch in 0..5_i64 {
             let rows: Vec<WideRow> = (0..20_i64)
                 .flat_map(|m| {
-                    (0..100_i64).map(move |point| (m, point)).collect::<Vec<_>>()
+                    (0..100_i64)
+                        .map(move |point| (m, point))
+                        .collect::<Vec<_>>()
                 })
                 .map(|(m, point)| {
                     let measurement = format!("m{m:02}");
@@ -190,7 +197,9 @@ fn rejected_batch_under_load_leaves_store_usable_and_consistent() {
         let after: Vec<WideRow> = (0..1_000_i64)
             .map(|point| wide_row("cpu", (point % 10) as usize, 4_000_000 + point, 3.0))
             .collect();
-        store.ingest_batch_at(after, NOW).expect("store stays usable");
+        store
+            .ingest_batch_at(after, NOW)
+            .expect("store stays usable");
     }
     let store = RecoveryStore::open(root.path(), RecoveryConfig::default()).expect("reopen store");
     let rows = store.read_measurement("cpu").expect("readback");

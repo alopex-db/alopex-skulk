@@ -4,6 +4,10 @@ use super::{IngestBatch, IngestLimits, SourceLocation};
 use crate::error::{Result, TsmError};
 use crate::model::{FieldValue, Fields, SeriesKey, Tags, WideRow};
 use influxdb_line_protocol::{parse_lines, split_lines, FieldValue as LineFieldValue, ParsedLine};
+use std::collections::HashMap;
+
+/// Upper bound for the per-request series cache (bypassed once full).
+const SERIES_CACHE_MAX_ENTRIES: usize = 10_000;
 
 /// Pure byte-to-wide-row decoder for InfluxDB Line Protocol.
 #[derive(Debug, Clone, Copy)]
@@ -26,6 +30,7 @@ impl LineProtocolDecoder {
         })?;
         let mut batch = IngestBatch::new(input.len(), input.len());
         let mut physical_line = 1_usize;
+        let mut series_cache: HashMap<&str, SeriesKey> = HashMap::new();
 
         for raw_line in split_lines(text) {
             let source = SourceLocation::Line(physical_line);
@@ -41,29 +46,45 @@ impl LineProtocolDecoder {
             if invalid_multiline {
                 for (offset, physical) in raw_line.split('\n').enumerate() {
                     let line = source_line(source, offset)?;
-                    self.decode_one(physical, line, default_timestamp, &mut batch)?;
+                    self.decode_one(
+                        physical,
+                        line,
+                        default_timestamp,
+                        &mut batch,
+                        &mut series_cache,
+                    )?;
                 }
             } else {
-                self.decode_one(raw_line, source, default_timestamp, &mut batch)?;
+                self.decode_one(
+                    raw_line,
+                    source,
+                    default_timestamp,
+                    &mut batch,
+                    &mut series_cache,
+                )?;
             }
         }
         Ok(batch)
     }
 
-    fn decode_one(
+    fn decode_one<'a>(
         &self,
-        raw_line: &str,
+        raw_line: &'a str,
         source: SourceLocation,
         default_timestamp: i64,
         batch: &mut IngestBatch,
+        series_cache: &mut HashMap<&'a str, SeriesKey>,
     ) -> Result<()> {
         match parse_lines(raw_line).next() {
             None => return Ok(()),
             Some(Err(error)) => batch.reject(source, error.to_string()),
-            Some(Ok(line)) => match wide_row(line, default_timestamp) {
-                Ok(row) => batch.push_row(source, row),
-                Err(reason) => batch.reject(source, reason),
-            },
+            Some(Ok(line)) => {
+                let series_raw = &raw_line[..raw_series_end(raw_line)];
+                match wide_row(line, series_raw, default_timestamp, series_cache) {
+                    Ok(row) => batch.push_row(source, row),
+                    Err(reason) => batch.reject(source, reason),
+                }
+            }
         }
         if batch.item_count() > self.limits.request().max_rows() {
             return Err(TsmError::ResourceLimit(format!(
@@ -87,14 +108,43 @@ fn source_line(source: SourceLocation, offset: usize) -> Result<SourceLocation> 
         .ok_or_else(|| TsmError::ResourceLimit("Line Protocol line number overflow".into()))
 }
 
-fn wide_row(line: ParsedLine<'_>, default_timestamp: i64) -> std::result::Result<WideRow, String> {
-    let mut tags = Tags::new();
-    for (name, value) in line.series.tag_set.unwrap_or_default() {
-        let name = name.to_string();
-        if tags.insert(name.clone(), value.to_string()).is_some() {
-            return Err(format!("duplicate tag '{name}'"));
+/// Returns the byte length of the measurement-and-tags prefix of one line
+/// (everything before the first space that is not escaped by a backslash).
+fn raw_series_end(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index = (index + 2).min(bytes.len()),
+            b' ' => return index,
+            _ => index += 1,
         }
     }
+    bytes.len()
+}
+
+fn wide_row<'a>(
+    line: ParsedLine<'_>,
+    series_raw: &'a str,
+    default_timestamp: i64,
+    series_cache: &mut HashMap<&'a str, SeriesKey>,
+) -> std::result::Result<WideRow, String> {
+    let series = if let Some(cached) = series_cache.get(series_raw) {
+        cached.clone()
+    } else {
+        let mut tags = Tags::new();
+        for (name, value) in line.series.tag_set.unwrap_or_default() {
+            let name = name.to_string();
+            if tags.insert(name.clone(), value.to_string()).is_some() {
+                return Err(format!("duplicate tag '{name}'"));
+            }
+        }
+        let key = SeriesKey::new(line.series.measurement.to_string(), tags);
+        if series_cache.len() < SERIES_CACHE_MAX_ENTRIES {
+            series_cache.insert(series_raw, key.clone());
+        }
+        key
+    };
 
     let mut fields = Fields::new();
     for (name, value) in line.field_set {
@@ -112,7 +162,7 @@ fn wide_row(line: ParsedLine<'_>, default_timestamp: i64) -> std::result::Result
     }
 
     Ok(WideRow::new(
-        SeriesKey::new(line.series.measurement.to_string(), tags),
+        series,
         line.timestamp.unwrap_or(default_timestamp),
         fields,
     ))
@@ -125,6 +175,41 @@ mod tests {
     use crate::model::FieldValue;
     use proptest::prelude::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn repeated_series_lines_hit_the_cache_and_stay_equivalent() {
+        let limits = IngestLimits::default();
+        let mut input = String::new();
+        for index in 0..1_000 {
+            input.push_str(&format!(
+                "cpu,host=web\\ 01,region=ap value={index},status=\"ok\" {index}\n"
+            ));
+        }
+        let batch = LineProtocolDecoder::new(limits)
+            .decode(input.as_bytes(), 42)
+            .expect("decode");
+        assert_eq!(batch.rows.len(), 1_000);
+        let first = batch.rows[0].row.series().clone();
+        for entry in &batch.rows {
+            assert_eq!(entry.row.series(), &first);
+            assert_eq!(
+                entry.row.series().tags().get("host").map(String::as_str),
+                Some("web 01")
+            );
+        }
+        // A different raw series (swapped tag order) must miss the cache and
+        // still canonicalize to the same key.
+        let swapped = LineProtocolDecoder::new(limits)
+            .decode(b"cpu,region=ap,host=web\\ 01 value=1 7", 42)
+            .expect("decode swapped");
+        assert_eq!(swapped.rows[0].row.series(), &first);
+        // Duplicate tags keep erroring even with a warm cache shape.
+        let dup = LineProtocolDecoder::new(limits)
+            .decode(b"cpu,host=a,host=b value=1 7", 42)
+            .expect("decode duplicate");
+        assert_eq!(dup.rows.len(), 0);
+        assert_eq!(dup.rejections.len(), 1);
+    }
 
     #[test]
     fn decodes_multi_field_rows_and_all_line_protocol_types() {

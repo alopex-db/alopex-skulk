@@ -50,7 +50,7 @@ fn batch(repeated: bool) -> arrow_array::RecordBatch {
     );
     for index in 0..POINTS {
         buffer
-            .append(SequencedRow::new(
+            .append(&SequencedRow::new(
                 IngestSeq::new(index as u64 + 1),
                 row(index, repeated),
             ))

@@ -300,7 +300,7 @@ mod tests {
             FlushPolicy::new(100_000, 128 * 1024 * 1024).expect("policy"),
         );
         for row in rows {
-            buffer.append(row).expect("buffer row");
+            buffer.append(&row).expect("buffer row");
         }
         buffer.drain_sorted().expect("batch")
     }

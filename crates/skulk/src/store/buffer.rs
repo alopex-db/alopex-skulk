@@ -118,7 +118,7 @@ impl MeasurementBuffer {
     }
 
     /// Adds one sequenced row after validating the table and column union.
-    pub fn append(&mut self, sequenced: SequencedRow) -> Result<()> {
+    pub fn append(&mut self, sequenced: &SequencedRow) -> Result<()> {
         let row = sequenced.row();
         let estimated_bytes = self.validate_append(row)?;
 
@@ -494,6 +494,77 @@ fn arrow_error(error: ArrowError) -> TsmError {
     TsmError::Serialization(format!("Arrow record batch: {error}"))
 }
 
+/// Clone-free validation of one incoming batch against a buffer's column
+/// state. Mirrors `MeasurementBuffer::append`'s checks (measurement match,
+/// column-name validity, tag/field collision, role conflicts including
+/// columns introduced earlier in the same batch, and the memory-estimate
+/// overflow guard) without cloning rows or building Arrow columns.
+pub(crate) struct BatchValidator<'a> {
+    measurement: &'a str,
+    buffer: Option<&'a MeasurementBuffer>,
+    new_columns: BTreeMap<String, ColumnRole>,
+    estimated_bytes: usize,
+}
+
+impl<'a> BatchValidator<'a> {
+    pub(crate) fn new(measurement: &'a str, buffer: Option<&'a MeasurementBuffer>) -> Self {
+        Self {
+            measurement,
+            buffer,
+            new_columns: BTreeMap::new(),
+            estimated_bytes: buffer.map_or(0, MeasurementBuffer::estimated_bytes),
+        }
+    }
+
+    fn column_role(&self, name: &str) -> Option<ColumnRole> {
+        self.buffer
+            .and_then(|buffer| buffer.columns.get(name).map(|column| column.role))
+            .or_else(|| self.new_columns.get(name).copied())
+    }
+
+    pub(crate) fn validate(&mut self, row: &WideRow) -> Result<()> {
+        if row.series().measurement() != self.measurement {
+            return Err(TsmError::InvalidInput(format!(
+                "measurement '{}' does not match buffer '{}'",
+                row.series().measurement(),
+                self.measurement
+            )));
+        }
+        for name in row.series().tags().keys() {
+            validate_user_column_name(name)?;
+            if row.fields().contains_key(name) {
+                return Err(TsmError::InvalidInput(format!(
+                    "column '{name}' cannot be both a tag and a field"
+                )));
+            }
+            match self.column_role(name) {
+                Some(ColumnRole::Tag) => {}
+                Some(_) => return Err(column_role_conflict(name)),
+                None => {
+                    self.new_columns.insert(name.clone(), ColumnRole::Tag);
+                }
+            }
+        }
+        for (name, value) in row.fields() {
+            validate_user_column_name(name)?;
+            let expected = ColumnRole::Field(value.field_type());
+            match self.column_role(name) {
+                Some(role) if role == expected => {}
+                Some(_) => return Err(column_role_conflict(name)),
+                None => {
+                    self.new_columns.insert(name.clone(), expected);
+                }
+            }
+        }
+        let row_bytes = estimated_row_bytes(row)?;
+        self.estimated_bytes = self
+            .estimated_bytes
+            .checked_add(row_bytes)
+            .ok_or_else(|| TsmError::ResourceLimit("buffer memory estimate overflow".into()))?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -538,7 +609,7 @@ mod tests {
     fn sparse_fields_and_late_columns_are_arrow_nulls() {
         let mut buffer = MeasurementBuffer::new("weather", unlimited_policy());
         buffer
-            .append(sequenced(
+            .append(&sequenced(
                 1,
                 "weather",
                 &[("region", "east")],
@@ -547,7 +618,7 @@ mod tests {
             ))
             .expect("first row");
         buffer
-            .append(sequenced(
+            .append(&sequenced(
                 2,
                 "weather",
                 &[("region", "east"), ("zone", "1a")],
@@ -588,7 +659,7 @@ mod tests {
     fn every_field_type_keeps_its_arrow_type_and_value() {
         let mut buffer = MeasurementBuffer::new("mixed", unlimited_policy());
         buffer
-            .append(sequenced(
+            .append(&sequenced(
                 7,
                 "mixed",
                 &[],
@@ -694,7 +765,7 @@ mod tests {
                 Fields::from([("value".into(), FieldValue::Integer(1))]),
             ),
         ] {
-            buffer.append(row).expect("append row");
+            buffer.append(&row).expect("append row");
         }
 
         let batch = buffer.to_sorted_record_batch().expect("record batch");
@@ -757,7 +828,7 @@ mod tests {
     fn measurement_or_field_type_conflicts_do_not_partially_mutate_the_buffer() {
         let mut buffer = MeasurementBuffer::new("cpu", unlimited_policy());
         buffer
-            .append(sequenced(
+            .append(&sequenced(
                 1,
                 "cpu",
                 &[],
@@ -767,7 +838,7 @@ mod tests {
             .expect("initial row");
 
         assert!(buffer
-            .append(sequenced(
+            .append(&sequenced(
                 2,
                 "memory",
                 &[],
@@ -776,7 +847,7 @@ mod tests {
             ))
             .is_err());
         assert!(buffer
-            .append(sequenced(
+            .append(&sequenced(
                 3,
                 "cpu",
                 &[],
@@ -792,18 +863,18 @@ mod tests {
         let mut row_limited =
             MeasurementBuffer::new("cpu", FlushPolicy::new(2, usize::MAX).expect("policy"));
         row_limited
-            .append(sequenced(1, "cpu", &[], 1, Fields::new()))
+            .append(&sequenced(1, "cpu", &[], 1, Fields::new()))
             .expect("first row");
         assert!(!row_limited.should_flush());
         row_limited
-            .append(sequenced(2, "cpu", &[], 2, Fields::new()))
+            .append(&sequenced(2, "cpu", &[], 2, Fields::new()))
             .expect("second row");
         assert!(row_limited.should_flush());
 
         let mut memory_limited =
             MeasurementBuffer::new("logs", FlushPolicy::new(100, 32).expect("policy"));
         memory_limited
-            .append(sequenced(
+            .append(&sequenced(
                 1,
                 "logs",
                 &[],
@@ -818,7 +889,7 @@ mod tests {
     fn draining_a_sorted_batch_resets_only_after_success() {
         let mut buffer = MeasurementBuffer::new("cpu", unlimited_policy());
         buffer
-            .append(sequenced(1, "cpu", &[], 1, Fields::new()))
+            .append(&sequenced(1, "cpu", &[], 1, Fields::new()))
             .expect("row");
 
         let batch = buffer.drain_sorted().expect("drain");

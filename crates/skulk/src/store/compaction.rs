@@ -133,7 +133,7 @@ impl Compactor {
             .ok_or_else(|| TsmError::Corruption("compaction input contains no rows".into()))?;
         let mut buffer = MeasurementBuffer::new(measurement, self.config.buffer);
         for row in winners.into_values() {
-            buffer.append(row)?;
+            buffer.append(&row)?;
         }
         let batch = buffer.drain_sorted()?;
         let output_row_count = batch.num_rows();
