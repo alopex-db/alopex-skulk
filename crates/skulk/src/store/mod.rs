@@ -7,6 +7,7 @@ pub mod lock;
 pub mod manifest;
 pub mod parquet_reader;
 pub mod parquet_writer;
+pub mod reader;
 pub mod recovery;
 pub mod retention;
 pub mod seq;

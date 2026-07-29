@@ -163,7 +163,7 @@ impl ParquetReader {
     }
 }
 
-fn decode_batch(
+pub(crate) fn decode_batch(
     measurement: &str,
     batch: &RecordBatch,
     output: &mut Vec<SequencedRow>,
