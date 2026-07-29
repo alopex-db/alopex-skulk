@@ -1,7 +1,7 @@
 //! Pruning-aware storage scan contract and local implementation.
 
 use crate::error::{Result, TsmError};
-use crate::model::Timestamp;
+use crate::model::{Tags, Timestamp};
 use crate::store::buffer::{
     COLUMN_KIND_METADATA_KEY, FIELD_COLUMN_KIND, INGEST_SEQ_COLUMN, INGEST_SEQ_COLUMN_KIND,
     TAG_COLUMN_KIND, TIME_COLUMN, TIME_COLUMN_KIND,
@@ -11,11 +11,20 @@ use crate::store::parquet_reader::decode_batch;
 use crate::store::seq::SequencedRow;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ProjectionMask;
+use parquet::basic::{Encoding, PageType};
+use parquet::column::page::Page;
 use parquet::file::metadata::RowGroupMetaData;
+use parquet::file::reader::FileReader;
+use parquet::file::serialized_reader::SerializedFileReader;
 use parquet::file::statistics::Statistics;
+use regex::{Regex, RegexBuilder};
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+
+const MAX_TAG_REGEX_BYTES: usize = 64 * 1024;
+const MAX_TAG_REGEX_AUTOMATON_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TAG_DICTIONARY_PRUNING_BYTES: i64 = 4 * 1024 * 1024;
 
 /// Inclusive timestamp bounds used by the storage scan contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,12 +77,131 @@ impl ScanTimeRange {
     }
 }
 
+/// A storage-level tag comparison operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TagPredicateOp {
+    /// The tag value must equal the predicate value.
+    Equal,
+    /// The tag value must not equal the predicate value.
+    NotEqual,
+    /// The entire tag value must match the regular expression.
+    Regex,
+    /// The entire tag value must not match the regular expression.
+    NotRegex,
+}
+
+/// A predicate over one tag column.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TagPredicate {
+    name: String,
+    op: TagPredicateOp,
+    value: String,
+}
+
+impl TagPredicate {
+    /// Creates a tag predicate from string-like values.
+    pub fn new(name: impl Into<String>, op: TagPredicateOp, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            op,
+            value: value.into(),
+        }
+    }
+
+    /// Returns the tag column name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the comparison operation.
+    pub const fn op(&self) -> TagPredicateOp {
+        self.op
+    }
+
+    /// Returns the literal or regular-expression value.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    fn prepare(&self) -> Result<PreparedTagPredicate> {
+        if self.name.is_empty() {
+            return Err(TsmError::InvalidInput(
+                "tag predicate name must be non-empty".into(),
+            ));
+        }
+        let operation = match self.op {
+            TagPredicateOp::Equal => PreparedTagPredicateOp::Equal(self.value.clone()),
+            TagPredicateOp::NotEqual => PreparedTagPredicateOp::NotEqual(self.value.clone()),
+            TagPredicateOp::Regex | TagPredicateOp::NotRegex => {
+                if self.value.len() > MAX_TAG_REGEX_BYTES {
+                    return Err(TsmError::ResourceLimit(format!(
+                        "tag regular expression has {} bytes, limit is {MAX_TAG_REGEX_BYTES}",
+                        self.value.len()
+                    )));
+                }
+                let anchored = format!(r"\A(?:{})\z", self.value);
+                let regex = RegexBuilder::new(&anchored)
+                    .size_limit(MAX_TAG_REGEX_AUTOMATON_BYTES)
+                    .dfa_size_limit(MAX_TAG_REGEX_AUTOMATON_BYTES)
+                    .build()
+                    .map_err(|error| {
+                        TsmError::InvalidInput(format!(
+                            "invalid tag regular expression '{}': {error}",
+                            self.value
+                        ))
+                    })?;
+                if self.op == TagPredicateOp::Regex {
+                    PreparedTagPredicateOp::Regex(regex)
+                } else {
+                    PreparedTagPredicateOp::NotRegex(regex)
+                }
+            }
+        };
+        Ok(PreparedTagPredicate {
+            name: self.name.clone(),
+            operation,
+        })
+    }
+}
+
+enum PreparedTagPredicateOp {
+    Equal(String),
+    NotEqual(String),
+    Regex(Regex),
+    NotRegex(Regex),
+}
+
+struct PreparedTagPredicate {
+    name: String,
+    operation: PreparedTagPredicateOp,
+}
+
+impl PreparedTagPredicate {
+    fn matches(&self, tags: &Tags) -> bool {
+        let value = tags.get(&self.name).map_or("", String::as_str);
+        match &self.operation {
+            PreparedTagPredicateOp::Equal(expected) => value == expected,
+            PreparedTagPredicateOp::NotEqual(expected) => value != expected,
+            PreparedTagPredicateOp::Regex(regex) => regex.is_match(value),
+            PreparedTagPredicateOp::NotRegex(regex) => !regex.is_match(value),
+        }
+    }
+
+    fn equal_value(&self) -> Option<&str> {
+        match &self.operation {
+            PreparedTagPredicateOp::Equal(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
 /// One immutable storage scan request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanRequest {
     measurement: String,
     time_range: ScanTimeRange,
     field_projection: Option<BTreeSet<String>>,
+    tag_predicates: Vec<TagPredicate>,
 }
 
 impl ScanRequest {
@@ -83,6 +211,7 @@ impl ScanRequest {
             measurement: measurement.into(),
             time_range,
             field_projection: None,
+            tag_predicates: Vec::new(),
         }
     }
 
@@ -93,6 +222,15 @@ impl ScanRequest {
         S: Into<String>,
     {
         self.field_projection = Some(fields.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Adds tag predicates that must all match a row.
+    pub fn with_tag_predicates<I>(mut self, predicates: I) -> Self
+    where
+        I: IntoIterator<Item = TagPredicate>,
+    {
+        self.tag_predicates = predicates.into_iter().collect();
         self
     }
 
@@ -109,6 +247,11 @@ impl ScanRequest {
     /// Returns the requested field names, or `None` when all fields are needed.
     pub fn field_projection(&self) -> Option<&BTreeSet<String>> {
         self.field_projection.as_ref()
+    }
+
+    /// Returns the conjunctive tag predicates.
+    pub fn tag_predicates(&self) -> &[TagPredicate] {
+        &self.tag_predicates
     }
 }
 
@@ -173,6 +316,7 @@ pub struct ScanStats {
     files_opened: usize,
     row_groups_considered: usize,
     row_groups_pruned: usize,
+    row_groups_pruned_by_tag: usize,
     row_groups_decoded: usize,
     decoded_rows: usize,
     decoded_bytes: usize,
@@ -203,6 +347,11 @@ impl ScanStats {
     /// Returns row groups rejected by timestamp statistics.
     pub const fn row_groups_pruned(&self) -> usize {
         self.row_groups_pruned
+    }
+
+    /// Returns row groups rejected specifically by tag statistics or dictionaries.
+    pub const fn row_groups_pruned_by_tag(&self) -> usize {
+        self.row_groups_pruned_by_tag
     }
 
     /// Returns row groups passed to the Parquet decoder.
@@ -285,6 +434,11 @@ impl StorageReader for ManifestStorageReader<'_> {
                 "scan measurement must be non-empty".into(),
             ));
         }
+        let tag_predicates = request
+            .tag_predicates()
+            .iter()
+            .map(TagPredicate::prepare)
+            .collect::<Result<Vec<_>>>()?;
 
         let mut stats = ScanStats::default();
         let mut rows = Vec::new();
@@ -309,6 +463,7 @@ impl StorageReader for ManifestStorageReader<'_> {
                 active_file.row_count(),
                 &self.segments_dir,
                 request,
+                &tag_predicates,
                 self.config,
                 &mut stats,
                 &mut rows,
@@ -325,6 +480,7 @@ fn scan_file(
     manifest_rows: u64,
     segments_dir: &Path,
     request: &ScanRequest,
+    tag_predicates: &[PreparedTagPredicate],
     config: StorageReaderConfig,
     stats: &mut ScanStats,
     output: &mut Vec<SequencedRow>,
@@ -352,6 +508,12 @@ fn scan_file(
         "projected field count",
     )?;
 
+    let path = segments_dir.join(file_name);
+    let dictionary_reader = tag_predicates
+        .iter()
+        .any(|predicate| predicate.equal_value().is_some())
+        .then(|| SerializedFileReader::new(File::open(&path)?).map_err(parquet_error))
+        .transpose()?;
     let mut selected_row_groups = Vec::new();
     for (index, row_group) in builder.metadata().row_groups().iter().enumerate() {
         stats.row_groups_considered =
@@ -359,6 +521,22 @@ fn scan_file(
         if !row_group_overlaps(row_group, time_index, request.time_range())? {
             stats.row_groups_pruned =
                 checked_add(stats.row_groups_pruned, 1, "pruned row-group count")?;
+            continue;
+        }
+        if !tag_predicates_allow_row_group(
+            index,
+            row_group,
+            schema.fields(),
+            tag_predicates,
+            dictionary_reader.as_ref(),
+        )? {
+            stats.row_groups_pruned =
+                checked_add(stats.row_groups_pruned, 1, "pruned row-group count")?;
+            stats.row_groups_pruned_by_tag = checked_add(
+                stats.row_groups_pruned_by_tag,
+                1,
+                "tag-pruned row-group count",
+            )?;
             continue;
         }
         charge_row_group(row_group, &projected_indices, config, stats)?;
@@ -403,11 +581,12 @@ fn scan_file(
             decoded.len()
         )));
     }
-    output.extend(
-        decoded
-            .into_iter()
-            .filter(|row| request.time_range().contains(row.row().timestamp())),
-    );
+    output.extend(decoded.into_iter().filter(|row| {
+        request.time_range().contains(row.row().timestamp())
+            && tag_predicates
+                .iter()
+                .all(|predicate| predicate.matches(row.row().series().tags()))
+    }));
     Ok(())
 }
 
@@ -468,6 +647,149 @@ fn row_group_overlaps(
         (Some(min), Some(max)) => Ok(range.overlaps(*min, *max)),
         _ => Ok(true),
     }
+}
+
+fn tag_predicates_allow_row_group(
+    row_group_index: usize,
+    row_group: &RowGroupMetaData,
+    fields: &arrow_schema::Fields,
+    predicates: &[PreparedTagPredicate],
+    dictionary_reader: Option<&SerializedFileReader<File>>,
+) -> Result<bool> {
+    for predicate in predicates {
+        let Some(expected) = predicate.equal_value() else {
+            continue;
+        };
+        let column_index = fields.iter().position(|field| {
+            field.name() == &predicate.name
+                && field
+                    .metadata()
+                    .get(COLUMN_KIND_METADATA_KEY)
+                    .is_some_and(|kind| kind == TAG_COLUMN_KIND)
+        });
+        let Some(column_index) = column_index else {
+            if !expected.is_empty() {
+                return Ok(false);
+            }
+            continue;
+        };
+        let column = row_group.column(column_index);
+        let Some(statistics) = column.statistics() else {
+            continue;
+        };
+        let null_count = statistics.null_count_opt();
+        let Statistics::ByteArray(statistics) = statistics else {
+            return Err(TsmError::Corruption(format!(
+                "Parquet tag column '{}' statistics are not byte arrays",
+                predicate.name
+            )));
+        };
+        let row_group_rows = u64::try_from(row_group.num_rows()).map_err(|_| {
+            TsmError::Corruption("Parquet row group has a negative row count".into())
+        })?;
+        if expected.is_empty() && null_count.is_some_and(|count| count > 0) {
+            continue;
+        }
+        if !expected.is_empty() && null_count.is_some_and(|count| count == row_group_rows) {
+            return Ok(false);
+        }
+        if let (Some(min), Some(max)) = (statistics.min_opt(), statistics.max_opt()) {
+            if expected.as_bytes() < min.data() || expected.as_bytes() > max.data() {
+                return Ok(false);
+            }
+        }
+        if dictionary_data_pages_only(column)
+            && column.compressed_size() >= 0
+            && column.compressed_size() <= MAX_TAG_DICTIONARY_PRUNING_BYTES
+            && (expected.is_empty() && null_count == Some(0) || !expected.is_empty())
+        {
+            let reader = dictionary_reader.ok_or_else(|| {
+                TsmError::Corruption("dictionary pruning reader is unavailable".into())
+            })?;
+            if dictionary_contains(reader, row_group_index, column_index, expected)? == Some(false)
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn dictionary_data_pages_only(column: &parquet::file::metadata::ColumnChunkMetaData) -> bool {
+    let Some(statistics) = column.page_encoding_stats() else {
+        return false;
+    };
+    let mut saw_data_page = false;
+    for statistic in statistics {
+        if matches!(
+            statistic.page_type,
+            PageType::DATA_PAGE | PageType::DATA_PAGE_V2
+        ) {
+            saw_data_page = true;
+            if !matches!(
+                statistic.encoding,
+                Encoding::PLAIN_DICTIONARY | Encoding::RLE_DICTIONARY
+            ) {
+                return false;
+            }
+        }
+    }
+    saw_data_page
+}
+
+fn dictionary_contains(
+    reader: &SerializedFileReader<File>,
+    row_group_index: usize,
+    column_index: usize,
+    expected: &str,
+) -> Result<Option<bool>> {
+    let row_group = reader
+        .get_row_group(row_group_index)
+        .map_err(parquet_error)?;
+    let mut pages = row_group
+        .get_column_page_reader(column_index)
+        .map_err(parquet_error)?;
+    match pages.get_next_page().map_err(parquet_error)? {
+        Some(Page::DictionaryPage {
+            buf,
+            num_values,
+            encoding,
+            ..
+        }) => {
+            if encoding != Encoding::PLAIN {
+                return Ok(None);
+            }
+            plain_dictionary_contains(&buf, num_values, expected).map(Some)
+        }
+        Some(Page::DataPage { .. } | Page::DataPageV2 { .. }) | None => Ok(None),
+    }
+}
+
+fn plain_dictionary_contains(bytes: &[u8], num_values: u32, expected: &str) -> Result<bool> {
+    let mut offset = 0_usize;
+    for _ in 0..num_values {
+        let length_end = offset
+            .checked_add(4)
+            .ok_or_else(|| TsmError::Corruption("dictionary offset overflow".into()))?;
+        let encoded_length: [u8; 4] = bytes
+            .get(offset..length_end)
+            .ok_or_else(|| TsmError::Corruption("truncated dictionary value length".into()))?
+            .try_into()
+            .map_err(|_| TsmError::Corruption("invalid dictionary value length".into()))?;
+        let length = usize::try_from(u32::from_le_bytes(encoded_length))
+            .map_err(|_| TsmError::ResourceLimit("dictionary value exceeds usize".into()))?;
+        let value_end = length_end
+            .checked_add(length)
+            .ok_or_else(|| TsmError::Corruption("dictionary value offset overflow".into()))?;
+        let value = bytes
+            .get(length_end..value_end)
+            .ok_or_else(|| TsmError::Corruption("truncated dictionary value".into()))?;
+        if value == expected.as_bytes() {
+            return Ok(true);
+        }
+        offset = value_end;
+    }
+    Ok(false)
 }
 
 fn charge_row_group(
@@ -542,6 +864,7 @@ fn parquet_error(error: parquet::errors::ParquetError) -> TsmError {
 mod tests {
     use super::{
         ManifestStorageReader, ScanRequest, ScanTimeRange, StorageReader, StorageReaderConfig,
+        TagPredicate, TagPredicateOp,
     };
     use crate::error::{Result, TsmError};
     use crate::model::{FieldValue, Fields, SeriesKey, Tags, WideRow};
@@ -549,15 +872,28 @@ mod tests {
     use crate::store::manifest::{ActiveFile, ManifestStore, ManifestUpdate};
     use crate::store::parquet_writer::{ParquetWriter, ParquetWriterConfig};
     use crate::store::seq::{IngestSeq, SequencedRow};
+    use proptest::prelude::*;
 
     fn sequenced(sequence: u64, measurement: &str, timestamp: i64, fields: Fields) -> SequencedRow {
+        sequenced_with_tags(
+            sequence,
+            measurement,
+            timestamp,
+            Tags::from([("host".into(), "edge-a".into())]),
+            fields,
+        )
+    }
+
+    fn sequenced_with_tags(
+        sequence: u64,
+        measurement: &str,
+        timestamp: i64,
+        tags: Tags,
+        fields: Fields,
+    ) -> SequencedRow {
         SequencedRow::new(
             IngestSeq::new(sequence),
-            WideRow::new(
-                SeriesKey::new(measurement, Tags::from([("host".into(), "edge-a".into())])),
-                timestamp,
-                fields,
-            ),
+            WideRow::new(SeriesKey::new(measurement, tags), timestamp, fields),
         )
     }
 
@@ -770,5 +1106,158 @@ mod tests {
         assert!(StorageReaderConfig::new(0, 1, 1).is_err());
         assert!(StorageReaderConfig::new(1, 0, 1).is_err());
         assert!(StorageReaderConfig::new(1, 1, 0).is_err());
+        assert!(matches!(
+            TagPredicate::new("", TagPredicateOp::Equal, "x").prepare(),
+            Err(TsmError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            TagPredicate::new("foo", TagPredicateOp::Regex, "(").prepare(),
+            Err(TsmError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            TagPredicate::new(
+                "foo",
+                TagPredicateOp::Regex,
+                "x".repeat(super::MAX_TAG_REGEX_BYTES + 1),
+            )
+            .prepare(),
+            Err(TsmError::ResourceLimit(_))
+        ));
+    }
+
+    #[test]
+    fn tag_dictionary_prunes_an_in_range_but_absent_equal_value() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = ManifestStore::open(root.path()).expect("manifest");
+        let rows = [
+            sequenced_with_tags(
+                1,
+                "cpu",
+                1,
+                Tags::from([("foo".into(), "a".into())]),
+                Fields::new(),
+            ),
+            sequenced_with_tags(
+                2,
+                "cpu",
+                2,
+                Tags::from([("foo".into(), "z".into())]),
+                Fields::new(),
+            ),
+        ];
+        let file = persist(&store, "cpu", "cpu.parquet", &rows, 2);
+        store
+            .publish(ManifestUpdate::new().add_file(file))
+            .expect("publish");
+        let state = store.state().expect("state");
+        let reader =
+            ManifestStorageReader::new(&state, store.segments_dir(), reader_config(10, usize::MAX));
+        let request = ScanRequest::new("cpu", ScanTimeRange::all())
+            .with_tag_predicates([TagPredicate::new("foo", TagPredicateOp::Equal, "m")]);
+        let result = reader.scan(&request).expect("scan");
+
+        assert!(result.rows().is_empty());
+        assert_eq!(result.stats().row_groups_pruned_by_tag(), 1);
+        assert_eq!(result.stats().row_groups_decoded(), 0);
+    }
+
+    #[test]
+    fn missing_tag_is_evaluated_as_empty_for_every_operator() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = ManifestStore::open(root.path()).expect("manifest");
+        let rows = [sequenced_with_tags(1, "cpu", 1, Tags::new(), Fields::new())];
+        let file = persist(&store, "cpu", "cpu.parquet", &rows, 1);
+        store
+            .publish(ManifestUpdate::new().add_file(file))
+            .expect("publish");
+        let state = store.state().expect("state");
+        let reader =
+            ManifestStorageReader::new(&state, store.segments_dir(), reader_config(10, usize::MAX));
+
+        for (op, value, should_match) in [
+            (TagPredicateOp::Equal, "", true),
+            (TagPredicateOp::NotEqual, "x", true),
+            (TagPredicateOp::Regex, ".*", true),
+            (TagPredicateOp::NotRegex, ".*", false),
+        ] {
+            let request = ScanRequest::new("cpu", ScanTimeRange::all())
+                .with_tag_predicates([TagPredicate::new("foo", op, value)]);
+            assert_eq!(
+                reader.scan(&request).expect("scan").rows().len(),
+                usize::from(should_match),
+                "{op:?} {value:?}"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        #[test]
+        fn pruning_matches_full_scan_then_filter_for_arbitrary_tag_rows(
+            values in proptest::collection::vec(prop::option::of("[a-c]{0,2}"), 1..8),
+            op_index in 0_u8..4,
+            target in "[a-c]{0,2}",
+        ) {
+            let root = tempfile::tempdir().expect("tempdir");
+            let store = ManifestStore::open(root.path()).expect("manifest");
+            let rows = values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let mut tags = Tags::new();
+                    if let Some(value) = value {
+                        tags.insert("foo".into(), value.clone());
+                    }
+                    sequenced_with_tags(
+                        index as u64 + 1,
+                        "cpu",
+                        index as i64,
+                        tags,
+                        Fields::new(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let file = persist(&store, "cpu", "cpu.parquet", &rows, 2);
+            store
+                .publish(ManifestUpdate::new().add_file(file))
+                .expect("publish");
+            let op = match op_index {
+                0 => TagPredicateOp::Equal,
+                1 => TagPredicateOp::NotEqual,
+                2 => TagPredicateOp::Regex,
+                _ => TagPredicateOp::NotRegex,
+            };
+            let state = store.state().expect("state");
+            let reader = ManifestStorageReader::new(
+                &state,
+                store.segments_dir(),
+                reader_config(100, usize::MAX),
+            );
+            let request = ScanRequest::new("cpu", ScanTimeRange::all())
+                .with_tag_predicates([TagPredicate::new("foo", op, target.clone())]);
+            let actual = reader
+                .scan(&request)
+                .expect("scan")
+                .rows()
+                .iter()
+                .map(|row| row.row().timestamp())
+                .collect::<Vec<_>>();
+            let expected = values
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| {
+                    let value = value.as_deref().unwrap_or("");
+                    let equal = value == target;
+                    let matches = match op {
+                        TagPredicateOp::Equal | TagPredicateOp::Regex => equal,
+                        TagPredicateOp::NotEqual | TagPredicateOp::NotRegex => !equal,
+                    };
+                    matches.then_some(index as i64)
+                })
+                .collect::<Vec<_>>();
+
+            prop_assert_eq!(actual, expected);
+        }
     }
 }
