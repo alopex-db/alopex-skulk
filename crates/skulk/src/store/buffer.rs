@@ -294,7 +294,8 @@ impl MeasurementBuffer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ColumnRole {
+/// Role of one buffered column: tag or typed field.
+pub(crate) enum ColumnRole {
     Tag,
     Field(FieldType),
 }
@@ -579,6 +580,18 @@ impl MeasurementState {
         Ok(())
     }
 
+    /// Applies one validated batch's columns and totals in bulk.
+    pub(crate) fn apply_batch(
+        &mut self,
+        new_columns: BTreeMap<String, ColumnRole>,
+        estimated_bytes: usize,
+        added_rows: usize,
+    ) {
+        self.columns.extend(new_columns);
+        self.estimated_bytes = estimated_bytes;
+        self.row_count += added_rows;
+    }
+
     /// Forgets recorded rows and columns after a successful flush.
     pub fn clear(&mut self) {
         self.columns.clear();
@@ -597,16 +610,30 @@ pub(crate) struct BatchValidator<'a> {
     state: Option<&'a MeasurementState>,
     new_columns: BTreeMap<String, ColumnRole>,
     estimated_bytes: usize,
+    max_entry_bytes: usize,
+    validated_rows: usize,
 }
 
 impl<'a> BatchValidator<'a> {
-    pub(crate) fn new(measurement: &'a str, state: Option<&'a MeasurementState>) -> Self {
+    pub(crate) fn new(
+        measurement: &'a str,
+        state: Option<&'a MeasurementState>,
+        max_entry_bytes: usize,
+    ) -> Self {
         Self {
             measurement,
             state,
             new_columns: BTreeMap::new(),
             estimated_bytes: state.map_or(0, MeasurementState::estimated_bytes),
+            max_entry_bytes,
+            validated_rows: 0,
         }
+    }
+
+    /// Returns the batch-introduced columns, the final memory estimate and
+    /// the number of validated rows for one bulk state application.
+    pub(crate) fn finish(self) -> (BTreeMap<String, ColumnRole>, usize, usize) {
+        (self.new_columns, self.estimated_bytes, self.validated_rows)
     }
 
     fn column_role(&self, name: &str) -> Option<ColumnRole> {
@@ -623,7 +650,9 @@ impl<'a> BatchValidator<'a> {
                 self.measurement
             )));
         }
-        for name in row.series().tags().keys() {
+        let mut entry_bytes = 8 + 8 + 4 + row.series().measurement().len() + 4 + 4;
+        let mut row_bytes = std::mem::size_of::<i64>() + std::mem::size_of::<u64>();
+        for (name, value) in row.series().tags() {
             validate_user_column_name(name)?;
             if row.fields().contains_key(name) {
                 return Err(TsmError::InvalidInput(format!(
@@ -637,6 +666,8 @@ impl<'a> BatchValidator<'a> {
                     self.new_columns.insert(name.clone(), ColumnRole::Tag);
                 }
             }
+            entry_bytes += 8 + name.len() + value.len();
+            row_bytes += name.len() + value.len().saturating_mul(2);
         }
         for (name, value) in row.fields() {
             validate_user_column_name(name)?;
@@ -648,12 +679,29 @@ impl<'a> BatchValidator<'a> {
                     self.new_columns.insert(name.clone(), expected);
                 }
             }
+            entry_bytes += 4 + name.len() + 1;
+            row_bytes += name.len();
+            let (memory, encoded) = match value {
+                FieldValue::Float(_) => (8, 8),
+                FieldValue::Integer(_) => (8, 8),
+                FieldValue::Unsigned(_) => (8, 8),
+                FieldValue::Boolean(_) => (1, 1),
+                FieldValue::String(value) => (value.len(), 4 + value.len()),
+            };
+            row_bytes += memory;
+            entry_bytes += encoded;
         }
-        let row_bytes = estimated_row_bytes(row)?;
+        if entry_bytes > self.max_entry_bytes {
+            return Err(TsmError::ResourceLimit(format!(
+                "encoded WAL entry is {entry_bytes} bytes, limit is {}",
+                self.max_entry_bytes
+            )));
+        }
         self.estimated_bytes = self
             .estimated_bytes
             .checked_add(row_bytes)
             .ok_or_else(|| TsmError::ResourceLimit("buffer memory estimate overflow".into()))?;
+        self.validated_rows += 1;
         Ok(())
     }
 }

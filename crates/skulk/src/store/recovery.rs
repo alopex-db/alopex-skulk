@@ -186,27 +186,44 @@ impl RecoveryStore {
         }
         let affected = rows
             .iter()
-            .map(|row| row.series().measurement().to_owned())
-            .collect::<BTreeSet<_>>();
+            .map(|row| row.series().measurement())
+            .collect::<BTreeSet<&str>>();
+        let max_entry_bytes = self.config.wal.max_entry_bytes();
         let mut validation = BTreeMap::new();
+        let mut cutoffs = BTreeMap::new();
         for measurement in &affected {
             validation.insert(
-                measurement.as_str(),
-                BatchValidator::new(measurement, self.buffers.get(measurement.as_str())),
+                *measurement,
+                BatchValidator::new(measurement, self.buffers.get(*measurement), max_entry_bytes),
+            );
+            cutoffs.insert(
+                *measurement,
+                self.retention.reject_cutoff(measurement, now)?,
             );
         }
         for row in rows.iter() {
             let measurement = row.series().measurement();
             TimePartition::for_timestamp(row.timestamp())?;
-            self.retention
-                .validate_write(measurement, row.timestamp(), now)?;
+            if let Some(Some(cutoff)) = cutoffs.get(measurement) {
+                if row.timestamp() < *cutoff {
+                    return Err(TsmError::InvalidInput(format!(
+                        "timestamp {} is older than retention cutoff {cutoff} for '{measurement}'",
+                        row.timestamp()
+                    )));
+                }
+            }
             validation
                 .get_mut(measurement)
                 .ok_or_else(|| TsmError::Corruption("batch validation state is missing".into()))?
                 .validate(row)?;
-            self.wal.validate_row(row)?;
         }
 
+        let applied = validation
+            .into_iter()
+            .map(|(measurement, validator)| (measurement.to_owned(), validator.finish()))
+            .collect::<Vec<_>>();
+        drop(cutoffs);
+        drop(affected);
         let sequenced = self.sequencer.issue_batch(rows)?;
         self.wal.append_batch(
             sequenced
@@ -215,15 +232,24 @@ impl RecoveryStore {
         )?;
         self.wal.sync()?;
 
+        for (measurement, (new_columns, estimated_bytes, validated_rows)) in applied {
+            if let Some(state) = self.buffers.get_mut(&measurement) {
+                state.apply_batch(new_columns, estimated_bytes, validated_rows);
+            } else {
+                let mut state = MeasurementState::new(&measurement);
+                state.apply_batch(new_columns, estimated_bytes, validated_rows);
+                self.buffers.insert(measurement, state);
+            }
+        }
         let mut sequences = Vec::with_capacity(sequenced.len());
         for row in sequenced {
-            let measurement = row.row().series().measurement().to_owned();
-            self.buffers
-                .entry(measurement.clone())
-                .or_insert_with(|| MeasurementState::new(&measurement))
-                .record(row.row())?;
             sequences.push(row.ingest_seq());
-            self.pending.entry(measurement).or_default().push(row);
+            if let Some(rows) = self.pending.get_mut(row.row().series().measurement()) {
+                rows.push(row);
+            } else {
+                let measurement = row.row().series().measurement().to_owned();
+                self.pending.entry(measurement).or_default().push(row);
+            }
         }
         Ok(sequences)
     }

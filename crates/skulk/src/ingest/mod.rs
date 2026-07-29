@@ -8,10 +8,9 @@ pub mod remote_write;
 
 use crate::error::{Result, TsmError};
 use crate::model::{FieldValue, SeriesId, WideRow};
-use crate::store::buffer::{estimated_row_bytes, INGEST_SEQ_COLUMN, TIME_COLUMN};
+use crate::store::buffer::{INGEST_SEQ_COLUMN, TIME_COLUMN};
 use crate::store::recovery::RecoveryStore;
 use crate::store::seq::IngestSeq;
-use crate::store::wal::encoded_frame_size;
 use std::collections::BTreeSet;
 use std::mem::size_of;
 
@@ -499,16 +498,14 @@ impl<S: IngestSink> Ingestor<S> {
                 self.limits.request.max_series,
             )?;
 
-            let row_bytes = estimate_and_validate_row_resources(&candidate.row, self.limits.row)?;
+            let (row_bytes, admitted) = admit_row(&candidate.row, self.limits.row)?;
             candidate_bytes = checked_add(
                 candidate_bytes,
                 row_bytes,
                 "expanded row byte estimate overflow",
             )?;
-            match validate_common_names(&candidate.row, self.limits.row) {
-                Ok(()) => {
-                    let buffer_bytes = estimated_row_bytes(&candidate.row)?;
-                    let wal_bytes = encoded_frame_size(&candidate.row)?;
+            match admitted {
+                Ok((buffer_bytes, wal_bytes)) => {
                     valid.push((candidate, buffer_bytes, wal_bytes));
                 }
                 Err(reason) => rejections.push(IngestRejection::new(candidate.source, reason)),
@@ -569,54 +566,6 @@ impl<S: IngestSink> Ingestor<S> {
     }
 }
 
-fn estimate_and_validate_row_resources(row: &WideRow, limits: RowLimits) -> Result<usize> {
-    ensure_at_most("tags per row", row.series().tags().len(), limits.max_tags)?;
-    ensure_at_most("fields per row", row.fields().len(), limits.max_fields)?;
-
-    let mut bytes = checked_add(
-        size_of::<i64>() + size_of::<u64>(),
-        row.series().measurement().len(),
-        "row byte estimate overflow",
-    )?;
-    for (name, value) in row.series().tags() {
-        ensure_at_most("tag value bytes", value.len(), limits.max_string_bytes)?;
-        bytes = checked_add(bytes, name.len(), "row byte estimate overflow")?;
-        bytes = checked_add(bytes, value.len(), "row byte estimate overflow")?;
-    }
-    for (name, value) in row.fields() {
-        bytes = checked_add(bytes, name.len(), "row byte estimate overflow")?;
-        let value_bytes = match value {
-            FieldValue::Float(_) => size_of::<f64>(),
-            FieldValue::Integer(_) => size_of::<i64>(),
-            FieldValue::Unsigned(_) => size_of::<u64>(),
-            FieldValue::Boolean(_) => size_of::<bool>(),
-            FieldValue::String(value) => {
-                ensure_at_most("string field bytes", value.len(), limits.max_string_bytes)?;
-                value.len()
-            }
-        };
-        bytes = checked_add(bytes, value_bytes, "row byte estimate overflow")?;
-    }
-    Ok(bytes)
-}
-
-fn validate_common_names(row: &WideRow, limits: RowLimits) -> std::result::Result<(), String> {
-    validate_identifier("measurement", row.series().measurement(), limits)?;
-    if row.fields().is_empty() {
-        return Err("row must contain at least one field".into());
-    }
-    for name in row.series().tags().keys() {
-        validate_identifier("tag", name, limits)?;
-        if row.fields().contains_key(name) {
-            return Err(format!("column '{name}' cannot be both a tag and a field"));
-        }
-    }
-    for name in row.fields().keys() {
-        validate_identifier("field", name, limits)?;
-    }
-    Ok(())
-}
-
 fn validate_identifier(
     kind: &str,
     name: &str,
@@ -638,6 +587,88 @@ fn validate_identifier(
         return Err(format!("{kind} name '{name}' is reserved by Skulk"));
     }
     Ok(())
+}
+
+/// Single-walk row admission: enforces row resource limits (hard errors),
+/// name validity (per-row rejection), and computes the expanded-, buffer-
+/// and WAL-byte estimates in one pass. Byte formulas are identical to
+/// `estimate_and_validate_row_resources`, `estimated_row_bytes` and
+/// `encoded_frame_size`.
+#[allow(clippy::type_complexity)]
+fn admit_row(
+    row: &WideRow,
+    limits: RowLimits,
+) -> Result<(usize, std::result::Result<(usize, usize), String>)> {
+    ensure_at_most("tags per row", row.series().tags().len(), limits.max_tags)?;
+    ensure_at_most("fields per row", row.fields().len(), limits.max_fields)?;
+
+    let measurement = row.series().measurement();
+    let base = size_of::<i64>() + size_of::<u64>();
+    let mut row_bytes = checked_add(base, measurement.len(), "row byte estimate overflow")?;
+    let mut buffer_bytes = base;
+    // frame = payload(seq 8 + ts 8 + (4+measurement) + 4 + tags + 4 + fields) + trailer 8
+    let mut wal_bytes = 8 + 8 + 4 + measurement.len() + 4 + 4 + 8;
+    let mut reject: Option<String> = None;
+    if let Err(reason) = validate_identifier("measurement", measurement, limits) {
+        reject.get_or_insert(reason);
+    }
+    if row.fields().is_empty() && reject.is_none() {
+        reject = Some("row must contain at least one field".into());
+    }
+    for (name, value) in row.series().tags() {
+        ensure_at_most("tag value bytes", value.len(), limits.max_string_bytes)?;
+        row_bytes = checked_add(row_bytes, name.len(), "row byte estimate overflow")?;
+        row_bytes = checked_add(row_bytes, value.len(), "row byte estimate overflow")?;
+        buffer_bytes = checked_add(buffer_bytes, name.len(), "row byte estimate overflow")?;
+        buffer_bytes = checked_add(
+            buffer_bytes,
+            value
+                .len()
+                .checked_mul(2)
+                .ok_or_else(|| TsmError::ResourceLimit("buffer memory estimate overflow".into()))?,
+            "row byte estimate overflow",
+        )?;
+        wal_bytes = checked_add(
+            wal_bytes,
+            8 + name.len() + value.len(),
+            "WAL entry size overflow",
+        )?;
+        if reject.is_none() {
+            if let Err(reason) = validate_identifier("tag", name, limits) {
+                reject = Some(reason);
+            } else if row.fields().contains_key(name) {
+                reject = Some(format!("column '{name}' cannot be both a tag and a field"));
+            }
+        }
+    }
+    for (name, value) in row.fields() {
+        row_bytes = checked_add(row_bytes, name.len(), "row byte estimate overflow")?;
+        buffer_bytes = checked_add(buffer_bytes, name.len(), "row byte estimate overflow")?;
+        wal_bytes = checked_add(wal_bytes, 4 + name.len() + 1, "WAL entry size overflow")?;
+        let (resource_size, buffer_size, wal_size) = match value {
+            FieldValue::Float(_) => (size_of::<f64>(), size_of::<f64>(), 8),
+            FieldValue::Integer(_) => (size_of::<i64>(), size_of::<i64>(), 8),
+            FieldValue::Unsigned(_) => (size_of::<u64>(), size_of::<u64>(), 8),
+            FieldValue::Boolean(_) => (size_of::<bool>(), size_of::<bool>(), 1),
+            FieldValue::String(value) => {
+                ensure_at_most("string field bytes", value.len(), limits.max_string_bytes)?;
+                (value.len(), value.len(), 4 + value.len())
+            }
+        };
+        row_bytes = checked_add(row_bytes, resource_size, "row byte estimate overflow")?;
+        buffer_bytes = checked_add(buffer_bytes, buffer_size, "row byte estimate overflow")?;
+        wal_bytes = checked_add(wal_bytes, wal_size, "WAL entry size overflow")?;
+        if reject.is_none() {
+            if let Err(reason) = validate_identifier("field", name, limits) {
+                reject = Some(reason);
+            }
+        }
+    }
+    let admitted = match reject {
+        Some(reason) => Err(reason),
+        None => Ok((buffer_bytes, wal_bytes)),
+    };
+    Ok((row_bytes, admitted))
 }
 
 fn enforce_admission(

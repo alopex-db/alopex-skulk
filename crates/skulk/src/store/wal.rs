@@ -706,10 +706,6 @@ fn encode_payload_into(
     Ok(())
 }
 
-pub(crate) fn encoded_frame_size(row: &WideRow) -> Result<usize> {
-    checked_size_add(encoded_row_size(row)?, 8)
-}
-
 fn encoded_row_size(row: &WideRow) -> Result<usize> {
     let measurement_size = string_size(row.series().measurement())?;
     let mut size = 8_usize
