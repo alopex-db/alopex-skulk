@@ -170,7 +170,7 @@ impl RecoveryStore {
         let sequenced = self.sequencer.issue(row)?;
         let sequence = sequenced.ingest_seq();
         self.wal
-            .append_durable(&WalEntry::new(sequence.get(), sequenced.row().clone()))?;
+            .append_durable_row(sequence.get(), sequenced.row())?;
         self.buffers
             .entry(measurement.clone())
             .or_insert_with(|| MeasurementBuffer::new(&measurement, self.config.buffer))
@@ -223,10 +223,11 @@ impl RecoveryStore {
         }
 
         let sequenced = self.sequencer.issue_batch(rows)?;
-        for row in &sequenced {
-            self.wal
-                .append_buffered(&WalEntry::new(row.ingest_seq().get(), row.row().clone()))?;
-        }
+        self.wal.append_batch(
+            sequenced
+                .iter()
+                .map(|row| (row.ingest_seq().get(), row.row())),
+        )?;
         self.wal.sync()?;
 
         let mut sequences = Vec::with_capacity(sequenced.len());

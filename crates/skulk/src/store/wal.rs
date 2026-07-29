@@ -183,7 +183,12 @@ pub struct Wal {
     durable_through: Option<u64>,
     recovered: Vec<WalEntry>,
     poisoned: bool,
+    frame_scratch: Vec<u8>,
+    payload_scratch: Vec<u8>,
 }
+
+/// Frame bytes accumulated in the batch scratch before one write syscall.
+const BATCH_WRITE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 impl Wal {
     /// Opens a WAL using the system monotonic clock.
@@ -228,29 +233,85 @@ impl Wal {
             durable_through,
             recovered: report.entries,
             poisoned: false,
+            frame_scratch: Vec::new(),
+            payload_scratch: Vec::new(),
         })
     }
 
     /// Appends an entry and synchronizes only when the configured interval is due.
     ///
     /// A `Pending` result is not an acknowledgement boundary.
-    pub fn append_buffered(&mut self, entry: &WalEntry) -> Result<AppendDurability> {
-        self.write_entry(entry)?;
+    pub fn append_buffered_row(
+        &mut self,
+        sequence: u64,
+        row: &WideRow,
+    ) -> Result<AppendDurability> {
+        self.write_row(sequence, row)?;
         let now = self.time.now();
         let elapsed = now.checked_sub(self.last_sync).unwrap_or_default();
         if elapsed >= self.config.sync_interval {
             self.sync()?;
-            Ok(AppendDurability::DurableThrough(entry.sequence))
+            Ok(AppendDurability::DurableThrough(sequence))
         } else {
-            Ok(AppendDurability::Pending(entry.sequence))
+            Ok(AppendDurability::Pending(sequence))
         }
     }
 
-    /// Appends and synchronizes an entry before returning its acknowledgeable sequence.
-    pub fn append_durable(&mut self, entry: &WalEntry) -> Result<u64> {
-        self.write_entry(entry)?;
+    /// Appends a borrowed row durably without constructing an owned entry.
+    pub fn append_durable_row(&mut self, sequence: u64, row: &WideRow) -> Result<u64> {
+        self.write_row(sequence, row)?;
         self.sync()?;
-        Ok(entry.sequence)
+        Ok(sequence)
+    }
+
+    /// Appends a batch of borrowed rows with a bounded number of write syscalls.
+    ///
+    /// Frames are encoded into a reusable scratch buffer and flushed in chunks,
+    /// so the syscall count is constant per batch instead of linear in rows.
+    /// Durability still requires a subsequent [`Wal::sync`] before acknowledging.
+    pub fn append_batch<'a, I>(&mut self, rows: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (u64, &'a WideRow)>,
+    {
+        self.ensure_writable()?;
+        self.frame_scratch.clear();
+        let mut appended_through: Option<u64> = None;
+        for (sequence, row) in rows {
+            let encoded = encode_frame(
+                &mut self.frame_scratch,
+                &mut self.payload_scratch,
+                sequence,
+                row,
+                self.config.max_entry_bytes,
+            );
+            if let Err(error) = encoded {
+                self.frame_scratch.clear();
+                return Err(error);
+            }
+            appended_through =
+                Some(appended_through.map_or(sequence, |through| through.max(sequence)));
+            if self.frame_scratch.len() >= BATCH_WRITE_CHUNK_BYTES {
+                if let Err(error) = self.file.write_all(&self.frame_scratch) {
+                    self.poisoned = true;
+                    return Err(error.into());
+                }
+                self.frame_scratch.clear();
+            }
+        }
+        if !self.frame_scratch.is_empty() {
+            if let Err(error) = self.file.write_all(&self.frame_scratch) {
+                self.poisoned = true;
+                return Err(error.into());
+            }
+            self.frame_scratch.clear();
+        }
+        if let Some(through) = appended_through {
+            self.pending_through = Some(
+                self.pending_through
+                    .map_or(through, |pending| pending.max(through)),
+            );
+        }
+        Ok(())
     }
 
     /// Synchronizes every pending frame and returns the durable sequence boundary.
@@ -264,21 +325,22 @@ impl Wal {
         Ok(self.durable_through)
     }
 
-    /// Returns all retained entries, including appends made on this handle.
+    /// Returns the entries recovered when this handle was opened.
+    ///
+    /// Behavior change in v0.3.1: appends made on this handle are no longer
+    /// retained in memory. Replay consumers read this snapshot once at open.
     pub fn recovered_entries(&self) -> &[WalEntry] {
         &self.recovered
     }
 
     /// Atomically removes entries at or below a manifest-persisted sequence.
+    ///
+    /// The retained suffix is streamed from the just-synchronized log file, so
+    /// the rewrite no longer depends on appended entries staying resident in
+    /// memory. Atomicity is unchanged: temp file + fsync + rename + dir sync.
     pub fn checkpoint_through(&mut self, persisted_through: u64) -> Result<()> {
         self.ensure_writable()?;
         self.sync()?;
-        let retained = self
-            .recovered
-            .iter()
-            .filter(|entry| entry.sequence > persisted_through)
-            .cloned()
-            .collect::<Vec<_>>();
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         let checkpoint = parent.join(format!(
             "{CHECKPOINT_PREFIX}{}-{}",
@@ -286,17 +348,53 @@ impl Wal {
             CHECKPOINT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         let mut cleanup = CheckpointFile::new(checkpoint.clone());
-        let mut file = OpenOptions::new()
+        let mut target = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&checkpoint)?;
-        file.write_all(&WAL_MAGIC)?;
-        file.write_all(&WAL_VERSION.to_le_bytes())?;
-        for entry in &retained {
-            write_frame(&mut file, entry, self.config.max_entry_bytes)?;
+        target.write_all(&WAL_MAGIC)?;
+        target.write_all(&WAL_VERSION.to_le_bytes())?;
+        let mut source = File::open(&self.path)?;
+        read_and_validate_header(&mut source)?;
+        let mut retained_through: Option<u64> = None;
+        let mut payload = Vec::new();
+        loop {
+            let mut length_bytes = [0_u8; 4];
+            match read_exact_or_tail(&mut source, &mut length_bytes)? {
+                ReadState::Complete => {}
+                ReadState::CleanEof | ReadState::Partial => break,
+            }
+            let payload_len = u32::from_le_bytes(length_bytes) as usize;
+            if payload_len > self.config.max_entry_bytes || payload_len < 8 {
+                break;
+            }
+            payload.clear();
+            payload.resize(payload_len, 0);
+            if read_exact_or_tail(&mut source, &mut payload)? != ReadState::Complete {
+                break;
+            }
+            let mut checksum_bytes = [0_u8; 4];
+            if read_exact_or_tail(&mut source, &mut checksum_bytes)? != ReadState::Complete {
+                break;
+            }
+            let mut crc = Crc32::new();
+            crc.update(&payload);
+            if crc.finalize() != u32::from_le_bytes(checksum_bytes) {
+                break;
+            }
+            let mut sequence_bytes = [0_u8; 8];
+            sequence_bytes.copy_from_slice(&payload[..8]);
+            let sequence = u64::from_le_bytes(sequence_bytes);
+            if sequence > persisted_through {
+                target.write_all(&length_bytes)?;
+                target.write_all(&payload)?;
+                target.write_all(&checksum_bytes)?;
+                retained_through =
+                    Some(retained_through.map_or(sequence, |through| through.max(sequence)));
+            }
         }
-        file.sync_all()?;
-        drop(file);
+        target.sync_all()?;
+        drop(target);
         fs::rename(&checkpoint, &self.path)?;
         cleanup.disarm();
         sync_directory(parent)?;
@@ -304,9 +402,10 @@ impl Wal {
             .read(true)
             .append(true)
             .open(&self.path)?;
-        self.recovered = retained;
+        self.recovered
+            .retain(|entry| entry.sequence > persisted_through);
         self.pending_through = None;
-        self.durable_through = self.recovered.iter().map(WalEntry::sequence).max();
+        self.durable_through = retained_through;
         self.last_sync = self.time.now();
         Ok(())
     }
@@ -337,27 +436,24 @@ impl Wal {
         Ok(())
     }
 
-    fn write_entry(&mut self, entry: &WalEntry) -> Result<()> {
+    fn write_row(&mut self, sequence: u64, row: &WideRow) -> Result<()> {
         self.ensure_writable()?;
-        let payload = encode_entry(entry, self.config.max_entry_bytes)?;
-        let mut crc = Crc32::new();
-        crc.update(&payload);
-        let checksum = crc.finalize();
-
-        let write_result = (|| -> std::io::Result<()> {
-            self.file.write_all(&(payload.len() as u32).to_le_bytes())?;
-            self.file.write_all(&payload)?;
-            self.file.write_all(&checksum.to_le_bytes())
-        })();
-        if let Err(error) = write_result {
+        self.frame_scratch.clear();
+        encode_frame(
+            &mut self.frame_scratch,
+            &mut self.payload_scratch,
+            sequence,
+            row,
+            self.config.max_entry_bytes,
+        )?;
+        if let Err(error) = self.file.write_all(&self.frame_scratch) {
             self.poisoned = true;
             return Err(error.into());
         }
         self.pending_through = Some(
             self.pending_through
-                .map_or(entry.sequence, |pending| pending.max(entry.sequence)),
+                .map_or(sequence, |pending| pending.max(sequence)),
         );
-        self.recovered.push(entry.clone());
         Ok(())
     }
 
@@ -391,16 +487,6 @@ fn cleanup_checkpoint_files(root: &Path) -> Result<()> {
     if removed {
         sync_directory(root)?;
     }
-    Ok(())
-}
-
-fn write_frame(file: &mut File, entry: &WalEntry, max_entry_bytes: usize) -> Result<()> {
-    let payload = encode_entry(entry, max_entry_bytes)?;
-    let mut crc = Crc32::new();
-    crc.update(&payload);
-    file.write_all(&(payload.len() as u32).to_le_bytes())?;
-    file.write_all(&payload)?;
-    file.write_all(&crc.finalize().to_le_bytes())?;
     Ok(())
 }
 
@@ -548,26 +634,51 @@ fn read_exact_or_tail(reader: &mut File, target: &mut [u8]) -> Result<ReadState>
     Ok(ReadState::Complete)
 }
 
-fn encode_entry(entry: &WalEntry, max_entry_bytes: usize) -> Result<Vec<u8>> {
-    let size = encoded_size(entry)?;
+/// Encodes one frame (length + payload + checksum) into `frame`, byte-for-byte
+/// identical to the v0.3.0 format, reusing `payload` as scratch space.
+fn encode_frame(
+    frame: &mut Vec<u8>,
+    payload: &mut Vec<u8>,
+    sequence: u64,
+    row: &WideRow,
+    max_entry_bytes: usize,
+) -> Result<()> {
+    payload.clear();
+    encode_payload_into(payload, sequence, row, max_entry_bytes)?;
+    let mut crc = Crc32::new();
+    crc.update(payload);
+    frame.extend_from_slice(&count_u32(payload.len())?.to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame.extend_from_slice(&crc.finalize().to_le_bytes());
+    Ok(())
+}
+
+fn encode_payload_into(
+    output: &mut Vec<u8>,
+    sequence: u64,
+    row: &WideRow,
+    max_entry_bytes: usize,
+) -> Result<()> {
+    let size = encoded_row_size(row)?;
     if size > max_entry_bytes {
         return Err(TsmError::ResourceLimit(format!(
             "encoded WAL entry is {size} bytes, limit is {max_entry_bytes}"
         )));
     }
 
-    let mut output = Vec::with_capacity(size);
-    output.extend_from_slice(&entry.sequence.to_le_bytes());
-    output.extend_from_slice(&entry.row.timestamp().to_le_bytes());
-    encode_string(&mut output, entry.row.series().measurement())?;
-    output.extend_from_slice(&count_u32(entry.row.series().tags().len())?.to_le_bytes());
-    for (name, value) in entry.row.series().tags() {
-        encode_string(&mut output, name)?;
-        encode_string(&mut output, value)?;
+    output.reserve(size);
+    let start = output.len();
+    output.extend_from_slice(&sequence.to_le_bytes());
+    output.extend_from_slice(&row.timestamp().to_le_bytes());
+    encode_string(output, row.series().measurement())?;
+    output.extend_from_slice(&count_u32(row.series().tags().len())?.to_le_bytes());
+    for (name, value) in row.series().tags() {
+        encode_string(output, name)?;
+        encode_string(output, value)?;
     }
-    output.extend_from_slice(&count_u32(entry.row.fields().len())?.to_le_bytes());
-    for (name, value) in entry.row.fields() {
-        encode_string(&mut output, name)?;
+    output.extend_from_slice(&count_u32(row.fields().len())?.to_le_bytes());
+    for (name, value) in row.fields() {
+        encode_string(output, name)?;
         match value {
             FieldValue::Float(value) => {
                 output.push(1);
@@ -587,16 +698,12 @@ fn encode_entry(entry: &WalEntry, max_entry_bytes: usize) -> Result<Vec<u8>> {
             }
             FieldValue::String(value) => {
                 output.push(5);
-                encode_string(&mut output, value)?;
+                encode_string(output, value)?;
             }
         }
     }
-    debug_assert_eq!(output.len(), size);
-    Ok(output)
-}
-
-fn encoded_size(entry: &WalEntry) -> Result<usize> {
-    encoded_row_size(entry.row())
+    debug_assert_eq!(output.len() - start, size);
+    Ok(())
 }
 
 pub(crate) fn encoded_frame_size(row: &WideRow) -> Result<usize> {
@@ -840,7 +947,11 @@ mod tests {
         let entry = WalEntry::new(7, row(42));
         let mut wal = Wal::open(root.path(), config()).expect("open WAL");
 
-        assert_eq!(wal.append_durable(&entry).expect("durable append"), 7);
+        assert_eq!(
+            wal.append_durable_row(entry.sequence(), entry.row())
+                .expect("durable append"),
+            7
+        );
         drop(wal);
 
         let reopened = Wal::open(root.path(), config()).expect("reopen WAL");
@@ -891,7 +1002,7 @@ mod tests {
         };
         let root = PathBuf::from(root);
         let mut wal = Wal::open(&root, config()).expect("open child WAL");
-        wal.append_durable(&WalEntry::new(9, row(99)))
+        wal.append_durable_row(9, &row(99))
             .expect("durable child append");
         let marker = File::create(root.join(ACK_MARKER_FILE)).expect("create ack marker");
         marker.sync_all().expect("persist ack marker");
@@ -904,10 +1015,8 @@ mod tests {
     fn recovery_stops_at_a_torn_tail_and_open_truncates_it() {
         let root = tempfile::tempdir().expect("tempdir");
         let mut wal = Wal::open(root.path(), config()).expect("open WAL");
-        wal.append_durable(&WalEntry::new(1, row(1)))
-            .expect("first append");
-        wal.append_durable(&WalEntry::new(2, row(2)))
-            .expect("second append");
+        wal.append_durable_row(1, &row(1)).expect("first append");
+        wal.append_durable_row(2, &row(2)).expect("second append");
         drop(wal);
 
         let path = root.path().join(WAL_FILE_NAME);
@@ -939,10 +1048,8 @@ mod tests {
     fn recovery_limits_checksum_corruption_to_the_tail() {
         let root = tempfile::tempdir().expect("tempdir");
         let mut wal = Wal::open(root.path(), config()).expect("open WAL");
-        wal.append_durable(&WalEntry::new(1, row(1)))
-            .expect("first append");
-        wal.append_durable(&WalEntry::new(2, row(2)))
-            .expect("second append");
+        wal.append_durable_row(1, &row(1)).expect("first append");
+        wal.append_durable_row(2, &row(2)).expect("second append");
         drop(wal);
 
         let path = root.path().join(WAL_FILE_NAME);
@@ -1006,7 +1113,8 @@ mod tests {
             ),
         );
         let mut wal = Wal::open(root.path(), config()).expect("open WAL");
-        wal.append_durable(&entry).expect("append typed row");
+        wal.append_durable_row(entry.sequence(), entry.row())
+            .expect("append typed row");
         drop(wal);
 
         let reopened = Wal::open(root.path(), config()).expect("reopen typed row");
@@ -1021,16 +1129,14 @@ mod tests {
             Wal::open_with_time_source(root.path(), config(), time.clone()).expect("open WAL");
 
         assert_eq!(
-            wal.append_buffered(&WalEntry::new(1, row(1)))
-                .expect("pending append"),
+            wal.append_buffered_row(1, &row(1)).expect("pending append"),
             AppendDurability::Pending(1)
         );
         assert_eq!(wal.durable_through(), None);
 
         time.advance(Duration::from_secs(1));
         assert_eq!(
-            wal.append_buffered(&WalEntry::new(2, row(2)))
-                .expect("due append"),
+            wal.append_buffered_row(2, &row(2)).expect("due append"),
             AppendDurability::DurableThrough(2)
         );
         assert_eq!(wal.durable_through(), Some(2));
@@ -1049,13 +1155,84 @@ mod tests {
         );
 
         assert!(matches!(
-            wal.append_durable(&WalEntry::new(1, oversized)),
+            wal.append_durable_row(1, &oversized),
             Err(crate::TsmError::ResourceLimit(_))
         ));
         assert_eq!(
             std::fs::metadata(wal.path()).expect("metadata").len(),
             before
         );
+    }
+
+    #[test]
+    fn append_batch_keeps_no_entries_resident_at_scale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut wal = Wal::open(dir.path(), WalConfig::default()).expect("open");
+        let rows: Vec<WideRow> = (0..10_000).map(|value| row(value as i64)).collect();
+        wal.append_batch(
+            rows.iter()
+                .enumerate()
+                .map(|(index, row)| ((index + 1) as u64, row)),
+        )
+        .expect("batch append");
+        wal.sync().expect("sync");
+        assert!(wal.recovered_entries().is_empty());
+        assert_eq!(wal.durable_through(), Some(10_000));
+        drop(wal);
+        let reopened = Wal::open(dir.path(), WalConfig::default()).expect("reopen");
+        assert_eq!(reopened.recovered_entries().len(), 10_000);
+        assert_eq!(reopened.recovered_entries()[9_999].sequence(), 10_000);
+    }
+
+    #[test]
+    fn checkpoint_streams_retained_suffix_from_file_after_large_append() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut wal = Wal::open(dir.path(), WalConfig::default()).expect("open");
+        let rows: Vec<WideRow> = (0..10_000).map(|value| row(value as i64)).collect();
+        wal.append_batch(
+            rows.iter()
+                .enumerate()
+                .map(|(index, row)| ((index + 1) as u64, row)),
+        )
+        .expect("batch append");
+        wal.sync().expect("sync");
+        let before = std::fs::metadata(wal.path()).expect("metadata").len();
+        wal.checkpoint_through(5_000).expect("checkpoint");
+        let after = std::fs::metadata(wal.path()).expect("metadata").len();
+        assert!(after < before);
+        assert_eq!(wal.durable_through(), Some(10_000));
+        drop(wal);
+        let reopened = Wal::open(dir.path(), WalConfig::default()).expect("reopen");
+        assert_eq!(reopened.recovered_entries().len(), 5_000);
+        assert_eq!(reopened.recovered_entries()[0].sequence(), 5_001);
+        assert_eq!(reopened.recovered_entries()[4_999].sequence(), 10_000);
+    }
+
+    #[test]
+    fn append_batch_recovers_all_rows_beyond_one_write_chunk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = WalConfig::new(Duration::from_secs(1), 1024 * 1024).expect("config");
+        let mut wal = Wal::open(dir.path(), config).expect("open");
+        let payload = "x".repeat(512 * 1024);
+        let rows: Vec<WideRow> = (0..12)
+            .map(|index| {
+                WideRow::new(
+                    SeriesKey::new("cpu", Tags::new()),
+                    index as i64,
+                    Fields::from([("message".to_string(), FieldValue::String(payload.clone()))]),
+                )
+            })
+            .collect();
+        wal.append_batch(
+            rows.iter()
+                .enumerate()
+                .map(|(index, row)| ((index + 1) as u64, row)),
+        )
+        .expect("batch append beyond one chunk");
+        wal.sync().expect("sync");
+        drop(wal);
+        let reopened = Wal::open(dir.path(), config).expect("reopen");
+        assert_eq!(reopened.recovered_entries().len(), 12);
     }
 
     #[test]
@@ -1071,7 +1248,7 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let mut wal = Wal::open(root.path(), config()).expect("open WAL");
         for sequence in 1..=4 {
-            wal.append_durable(&WalEntry::new(sequence, row(sequence as i64)))
+            wal.append_durable_row(sequence, &row(sequence as i64))
                 .expect("append");
         }
 
