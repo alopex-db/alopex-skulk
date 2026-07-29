@@ -1,6 +1,7 @@
 use alopex_skulk::model::{FieldValue, Fields, SeriesKey, Tags, WideRow};
 use alopex_skulk::store::reader::{ScanRequest, ScanTimeRange, StorageReader};
 use alopex_skulk::store::recovery::{RecoveryConfig, RecoveryStore};
+use alopex_skulk::store::schema::ColumnDataType;
 
 fn row(host: &str, timestamp: i64, fields: Fields) -> WideRow {
     WideRow::new(
@@ -53,6 +54,24 @@ fn recovery_store_scan_merges_pending_deduplicates_and_is_flush_invariant() {
 
     let request =
         ScanRequest::new("cpu", ScanTimeRange::all()).with_field_projection(["value", "right"]);
+    let schema_before = store
+        .measurement_schema("cpu")
+        .expect("schema before flush");
+    assert_eq!(
+        schema_before
+            .column("left")
+            .expect("durable left")
+            .data_type(),
+        ColumnDataType::Utf8
+    );
+    assert_eq!(
+        schema_before
+            .column("right")
+            .expect("pending right")
+            .data_type(),
+        ColumnDataType::Boolean
+    );
+    assert_eq!(store.measurement_names().expect("names"), ["cpu"]);
     let before = StorageReader::scan(&store, &request).expect("scan before flush");
     assert_eq!(before.stats().pending_rows_considered(), 2);
     assert_eq!(
@@ -88,4 +107,9 @@ fn recovery_store_scan_merges_pending_deduplicates_and_is_flush_invariant() {
     let after = StorageReader::scan(&store, &request).expect("scan after flush");
     assert_eq!(after.stats().pending_rows_considered(), 0);
     assert_eq!(after.rows(), before_rows);
+    assert!(store
+        .measurement_schema("cpu")
+        .expect("schema after flush")
+        .column("right")
+        .is_some());
 }

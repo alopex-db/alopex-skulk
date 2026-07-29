@@ -20,6 +20,7 @@ use crate::store::reader::{
 use crate::store::retention::{
     current_timestamp_nanos, RetentionPolicy, RetentionResult, RetentionStore, TimePartition,
 };
+use crate::store::schema::{MeasurementSchema, SchemaResolver};
 use crate::store::seq::{IngestSeq, SequencedRow, Sequencer};
 use crate::store::wal::{Wal, WalConfig, WalEntry};
 use std::collections::{BTreeMap, BTreeSet};
@@ -104,6 +105,7 @@ pub struct RecoveryStore {
     sequencer: Sequencer,
     buffers: BTreeMap<String, MeasurementState>,
     pending: BTreeMap<String, Vec<SequencedRow>>,
+    schema: SchemaResolver,
     replayed_row_count: usize,
     config: RecoveryConfig,
 }
@@ -159,6 +161,7 @@ impl RecoveryStore {
             sequencer,
             buffers,
             pending,
+            schema: SchemaResolver::new(),
             replayed_row_count,
             config,
         })
@@ -480,6 +483,26 @@ impl RecoveryStore {
     /// Returns the recorded column state for one measurement, if any.
     pub fn measurement_state(&self, measurement: &str) -> Option<&MeasurementState> {
         self.buffers.get(measurement)
+    }
+
+    /// Resolves the current durable-plus-pending schema for one measurement.
+    pub fn measurement_schema(&self, measurement: &str) -> Result<MeasurementSchema> {
+        self.schema.resolve(
+            &self.manifest.state()?,
+            self.manifest.segments_dir(),
+            measurement,
+            self.buffers.get(measurement),
+        )
+    }
+
+    /// Lists durable and pending measurement names in deterministic order.
+    pub fn measurement_names(&self) -> Result<Vec<String>> {
+        Ok(self.schema.measurement_names(
+            &self.manifest.state()?,
+            self.buffers
+                .iter()
+                .filter_map(|(name, state)| (state.row_count() > 0).then_some(name)),
+        ))
     }
 
     /// Returns the WAL entry size limit for admission-time qualification.

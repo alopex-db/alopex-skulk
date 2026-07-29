@@ -25,6 +25,22 @@ pub enum TsmError {
     #[error("data corruption: {0}")]
     Corruption(String),
 
+    /// Durable and pending columns disagree on a query-visible schema.
+    #[error(
+        "schema conflict for measurement '{measurement}', column '{column}': \
+         existing {existing}, incoming {incoming}"
+    )]
+    SchemaConflict {
+        /// The affected measurement.
+        measurement: String,
+        /// The conflicting column name.
+        column: String,
+        /// The already observed role and type.
+        existing: String,
+        /// The newly observed role and type.
+        incoming: String,
+    },
+
     /// Serialization or deserialization failed.
     #[error("serialization error: {0}")]
     Serialization(String),

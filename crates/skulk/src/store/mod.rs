@@ -10,5 +10,6 @@ pub mod parquet_writer;
 pub mod reader;
 pub mod recovery;
 pub mod retention;
+pub mod schema;
 pub mod seq;
 pub mod wal;

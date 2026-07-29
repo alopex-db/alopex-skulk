@@ -527,6 +527,14 @@ impl MeasurementState {
         self.row_count
     }
 
+    pub(crate) fn measurement(&self) -> &str {
+        &self.measurement
+    }
+
+    pub(crate) fn columns(&self) -> &BTreeMap<String, ColumnRole> {
+        &self.columns
+    }
+
     /// Validates one row against the recorded column roles without mutating.
     pub(crate) fn validate_append(&self, row: &WideRow) -> Result<usize> {
         if row.series().measurement() != self.measurement {
