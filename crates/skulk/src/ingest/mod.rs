@@ -536,23 +536,21 @@ impl<S: IngestSink> Ingestor<S> {
         let max_entry_bytes = self.sink.max_entry_bytes();
         let mut validators: BTreeMap<String, BatchValidator<'_>> = BTreeMap::new();
         for candidate in batch.rows {
-            observed_series.insert(candidate.row.series_id());
-            ensure_at_most(
-                "distinct series",
-                observed_series.len(),
-                self.limits.request.max_series,
-            )?;
+            if observed_series.insert(candidate.row.series_id()) {
+                ensure_at_most(
+                    "distinct series",
+                    observed_series.len(),
+                    self.limits.request.max_series,
+                )?;
+            }
 
             let measurement = candidate.row.series().measurement();
-            if !validators.contains_key(measurement) {
-                validators.insert(
-                    measurement.to_owned(),
-                    BatchValidator::new(self.sink.measurement_state(measurement), max_entry_bytes),
-                );
-            }
-            let validator = validators
-                .get_mut(measurement)
-                .ok_or_else(|| TsmError::Corruption("qualification state is missing".into()))?;
+            let validator = match validators.get_mut(measurement) {
+                Some(validator) => validator,
+                None => validators.entry(measurement.to_owned()).or_insert_with(|| {
+                    BatchValidator::new(self.sink.measurement_state(measurement), max_entry_bytes)
+                }),
+            };
             let (row_bytes, admitted) =
                 qualify_row(&candidate.row, self.limits.row, validator, max_entry_bytes)?;
             candidate_bytes = checked_add(
