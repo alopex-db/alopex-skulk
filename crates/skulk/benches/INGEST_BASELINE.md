@@ -11,8 +11,16 @@ Attribution uses same-session paired runs (code change is the only delta).
 | --- | ---: | ---: | ---: | --- |
 | Line Protocol decode | 118.9-147.4 K/s | 225.2-324.7 K/s (~2.2x) | - | improved |
 | Remote Write decode | 201.5-217.9 K/s | 595.7-743.3 K/s | - | improved |
-| Line Protocol -> WAL ACK | 34.1-37.8 K/s | 64.1-107.2 K/s (~2-2.7x) | >= 70 K/s (revised, see spec P3) | PASS |
+| Line Protocol -> WAL ACK | 34.1-37.8 K/s | 153.97-189.54 K/s CI in clean runs (mids 161.3-172.8 K/s, ~4.5x) | >= 150 K/s (original gate restored) | PASS |
 | Remote Write -> WAL ACK | 34.1-39.8 K/s | 95.0-159.1 K/s (~3-4x; 141.9-159.1 K/s after the buffer-state rework even under load avg 3) | >= 100 K/s (published) | PASS |
+
+Additional fixes after the first remeasurement: single-walk row admission
+per layer (influxdb3 validator architecture), type-state qualified batches
+(store trusts the ingest-layer walk), Arc-shared series identity with a
+memoized id, and an escape-free Line Protocol fast path with reference
+fallback whose equivalence is enforced by a differential proptest.
+Contaminated runs are identified by simultaneous collapse of the untouched
+Remote Write path and excluded.
 
 Fixes: borrow-based batch WAL append (zero row clones, O(1) syscalls per
 batch, streamed checkpoint, no entry residency), clone-free batch

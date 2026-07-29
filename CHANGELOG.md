@@ -4,10 +4,13 @@
 
 ### Fixed
 
-- Durable ingest throughput: ~3-4x on Remote Write -> WAL ACK
-  (34-40K -> 95-159K samples/s) and ~2-2.7x on Line Protocol -> WAL ACK
-  (34-38K -> 64-107K points/s) on the fixed 10K-point baseline workload.
-  Line Protocol decode alone roughly doubled (119-147K -> 225-325K pts/s).
+- Durable ingest throughput on the fixed 10K-point baseline workload:
+  Line Protocol -> WAL ACK ~4.5x (34-38K -> 161-173K pts/s in clean runs)
+  and Remote Write -> WAL ACK ~3-4x (34-40K -> up to 141-185K samples/s).
+  Achieved via single-walk row admission (influxdb3 validator
+  architecture), type-state qualified batches, Arc-shared series
+  identity, and an escape-free Line Protocol fast path with reference
+  fallback (differential-proptest equivalence).
   Root causes removed: per-row deep clones on the WAL path, per-row write
   syscalls, WAL entry residency in memory, per-batch re-cloning of pending
   rows during validation, ingest-time Arrow column building whose output
