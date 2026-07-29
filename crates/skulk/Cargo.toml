@@ -1,6 +1,6 @@
 [package]
 name = "alopex-skulk"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Alopex Skulk - Time Series Storage Engine"
 license = "Apache-2.0 OR MIT"
@@ -15,35 +15,38 @@ readme = "README.md"
 default = []
 
 [dependencies]
-# Alopex core for WAL and MemTable traits
-alopex-core = { workspace = true }
-
-# Async runtime
-tokio = { workspace = true }
-
 # Serialization
 serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Protocol parsing (official InfluxData parser; pure Rust)
+influxdb-line-protocol = { version = "=2.0.0", default-features = false }
+prost = { version = "=0.13.5", default-features = false, features = ["derive", "std"] }
+snap = { version = "=1.1.1", default-features = false }
+
+# Columnar storage (pure Rust; depend only on the Arrow components we use)
+arrow-array = { version = "=55.2.0", default-features = false }
+arrow-schema = { version = "=55.2.0", default-features = false }
+arrow-select = { version = "=55.2.0", default-features = false }
+parquet = { version = "=55.2.0", default-features = false, features = ["arrow", "brotli"] }
 
 # Error handling
 thiserror = { workspace = true }
 
 # Compression and checksums
 crc32fast = { workspace = true }
-bitvec = { workspace = true }
-bytes = { workspace = true }
+fs2 = "0.4"
 xxhash-rust = { workspace = true }
-
-# Logging
-tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
-rand = { workspace = true }
 proptest = { workspace = true }
-tracing-subscriber = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [[bench]]
-name = "tsm_bench"
+name = "storage_bench"
+harness = false
+
+[[bench]]
+name = "ingest_bench"
 harness = false
