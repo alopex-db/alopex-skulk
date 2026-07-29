@@ -11,7 +11,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{BrotliLevel, Compression, Encoding};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -151,7 +151,12 @@ impl ParquetWriter {
         writer.write(batch).map_err(parquet_error)?;
         writer.close().map_err(parquet_error)?;
 
-        File::open(&temporary_path)?.sync_all()?;
+        // Windows requires write access for FlushFileBuffers. Keep this handle
+        // scoped to the statement so it is closed before the atomic rename.
+        OpenOptions::new()
+            .write(true)
+            .open(&temporary_path)?
+            .sync_all()?;
         hook.before_publish(&temporary_path)?;
         fs::rename(&temporary_path, final_path)?;
         cleanup.disarm();
@@ -253,7 +258,7 @@ impl Drop for TemporaryFile {
 
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
+    fs::File::open(path)?.sync_all()?;
     Ok(())
 }
 

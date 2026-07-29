@@ -8,7 +8,7 @@ separately in [`INGEST_BASELINE.md`](INGEST_BASELINE.md).
 
 | Check | Result | Evidence |
 | --- | --- | --- |
-| Minimal columnar release footprint | PASS | 3,664,480 bytes; `opt-level="z"`, fat LTO, one codegen unit, symbols stripped, panic abort |
+| Minimal columnar release footprint | PASS | 3,664,464 bytes; `opt-level="z"`, fat LTO, one codegen unit, symbols stripped, panic abort |
 | Native build dependencies | PASS | No `cc` or `*-sys` crate in the normal/build dependency tree |
 | Volatile gauge compression | PASS | Parquet 107,881 B vs v0.2 Gorilla 167,512 B (1.553× smaller) |
 | Repeated-value compression | PASS | Parquet 23,433 B vs v0.2 Gorilla 167,512 B (7.149× smaller) |
