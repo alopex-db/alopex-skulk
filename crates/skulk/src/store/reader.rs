@@ -6,6 +6,7 @@ use crate::store::buffer::{
     COLUMN_KIND_METADATA_KEY, FIELD_COLUMN_KIND, INGEST_SEQ_COLUMN, INGEST_SEQ_COLUMN_KIND,
     TAG_COLUMN_KIND, TIME_COLUMN, TIME_COLUMN_KIND,
 };
+use crate::store::compaction::deduplicate_latest;
 use crate::store::manifest::ManifestState;
 use crate::store::parquet_reader::decode_batch;
 use crate::store::seq::SequencedRow;
@@ -264,6 +265,13 @@ pub struct StorageReaderConfig {
 }
 
 impl StorageReaderConfig {
+    /// The default embedded scan limits.
+    pub const DEFAULT: Self = Self {
+        batch_rows: 8_192,
+        max_decoded_rows: 1_000_000,
+        max_decoded_bytes: 256 * 1024 * 1024,
+    };
+
     /// Creates non-zero scan limits.
     pub fn new(
         batch_rows: usize,
@@ -300,11 +308,7 @@ impl StorageReaderConfig {
 
 impl Default for StorageReaderConfig {
     fn default() -> Self {
-        Self {
-            batch_rows: 8_192,
-            max_decoded_rows: 1_000_000,
-            max_decoded_bytes: 256 * 1024 * 1024,
-        }
+        Self::DEFAULT
     }
 }
 
@@ -321,6 +325,8 @@ pub struct ScanStats {
     decoded_rows: usize,
     decoded_bytes: usize,
     projected_field_columns: usize,
+    pending_rows_considered: usize,
+    rows_returned: usize,
 }
 
 impl ScanStats {
@@ -372,6 +378,16 @@ impl ScanStats {
     /// Returns field-column projections applied across opened files.
     pub const fn projected_field_columns(&self) -> usize {
         self.projected_field_columns
+    }
+
+    /// Returns unflushed rows considered for the requested measurement.
+    pub const fn pending_rows_considered(&self) -> usize {
+        self.pending_rows_considered
+    }
+
+    /// Returns rows remaining after exact filtering and deduplication.
+    pub const fn rows_returned(&self) -> usize {
+        self.rows_returned
     }
 }
 
@@ -469,9 +485,69 @@ impl StorageReader for ManifestStorageReader<'_> {
                 &mut rows,
             )?;
         }
-        rows.sort_by_key(SequencedRow::ingest_seq);
+        rows = finalize_visible_rows(rows)?;
+        stats.rows_returned = rows.len();
         Ok(ScanResult { rows, stats })
     }
+}
+
+pub(crate) fn merge_pending_rows(
+    mut result: ScanResult,
+    pending: &[SequencedRow],
+    request: &ScanRequest,
+) -> Result<ScanResult> {
+    let predicates = request
+        .tag_predicates()
+        .iter()
+        .map(TagPredicate::prepare)
+        .collect::<Result<Vec<_>>>()?;
+    result.stats.pending_rows_considered = checked_add(
+        result.stats.pending_rows_considered,
+        pending.len(),
+        "pending row count",
+    )?;
+    for row in pending {
+        if request.time_range().contains(row.row().timestamp())
+            && predicates
+                .iter()
+                .all(|predicate| predicate.matches(row.row().series().tags()))
+        {
+            result
+                .rows
+                .push(project_pending_row(row, request.field_projection()));
+        }
+    }
+
+    result.rows = finalize_visible_rows(result.rows)?;
+    result.stats.rows_returned = result.rows.len();
+    Ok(result)
+}
+
+fn finalize_visible_rows(rows: Vec<SequencedRow>) -> Result<Vec<SequencedRow>> {
+    let mut sequences = BTreeSet::new();
+    if let Some(duplicate) = rows
+        .iter()
+        .map(SequencedRow::ingest_seq)
+        .find(|sequence| !sequences.insert(*sequence))
+    {
+        return Err(TsmError::Corruption(format!(
+            "duplicate visible ingest sequence {}",
+            duplicate.get()
+        )));
+    }
+    Ok(deduplicate_latest(rows).into_values().collect())
+}
+
+fn project_pending_row(row: &SequencedRow, projection: Option<&BTreeSet<String>>) -> SequencedRow {
+    let (sequence, row) = row.clone().into_parts();
+    let (series, timestamp, mut fields) = row.into_parts();
+    if let Some(projection) = projection {
+        fields.retain(|name, _| projection.contains(name));
+    }
+    SequencedRow::new(
+        sequence,
+        crate::model::WideRow::new(series, timestamp, fields),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1243,18 +1319,31 @@ mod tests {
                 .iter()
                 .map(|row| row.row().timestamp())
                 .collect::<Vec<_>>();
-            let expected = values
+            let mut expected = values
                 .iter()
                 .enumerate()
                 .filter_map(|(index, value)| {
-                    let value = value.as_deref().unwrap_or("");
-                    let equal = value == target;
+                    let actual = value.as_deref().unwrap_or("");
+                    let equal = actual == target;
                     let matches = match op {
                         TagPredicateOp::Equal | TagPredicateOp::Regex => equal,
                         TagPredicateOp::NotEqual | TagPredicateOp::NotRegex => !equal,
                     };
-                    matches.then_some(index as i64)
+                    matches.then(|| {
+                        let mut tags = Tags::new();
+                        if let Some(value) = value {
+                            tags.insert("foo".into(), value.clone());
+                        }
+                        (tags, index as i64)
+                    })
                 })
+                .collect::<Vec<_>>();
+            expected.sort_by(|left, right| {
+                left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+            });
+            let expected = expected
+                .into_iter()
+                .map(|(_, timestamp)| timestamp)
                 .collect::<Vec<_>>();
 
             prop_assert_eq!(actual, expected);

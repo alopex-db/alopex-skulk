@@ -13,6 +13,10 @@ use crate::store::parquet_reader::{ParquetReader, ParquetReaderConfig};
 use crate::store::parquet_writer::{
     ParquetWriter, ParquetWriterConfig, PublishHook, PublishedParquet,
 };
+use crate::store::reader::{
+    merge_pending_rows, ManifestStorageReader, ScanRequest, ScanResult, StorageReader,
+    StorageReaderConfig,
+};
 use crate::store::retention::{
     current_timestamp_nanos, RetentionPolicy, RetentionResult, RetentionStore, TimePartition,
 };
@@ -31,6 +35,7 @@ pub struct RecoveryConfig {
     buffer: FlushPolicy,
     writer: ParquetWriterConfig,
     reader: ParquetReaderConfig,
+    storage_reader: StorageReaderConfig,
 }
 
 impl RecoveryConfig {
@@ -46,7 +51,14 @@ impl RecoveryConfig {
             buffer,
             writer,
             reader,
+            storage_reader: StorageReaderConfig::DEFAULT,
         }
+    }
+
+    /// Replaces the query scan policy while retaining durability policies.
+    pub const fn with_storage_reader(mut self, storage_reader: StorageReaderConfig) -> Self {
+        self.storage_reader = storage_reader;
+        self
     }
 }
 
@@ -500,5 +512,22 @@ impl RecoveryStore {
         }
         self.pending.clear();
         Ok(())
+    }
+}
+
+impl StorageReader for RecoveryStore {
+    fn scan(&self, request: &ScanRequest) -> Result<ScanResult> {
+        let manifest = self.manifest.state()?;
+        let durable = ManifestStorageReader::new(
+            &manifest,
+            self.manifest.segments_dir(),
+            self.config.storage_reader,
+        )
+        .scan(request)?;
+        let pending = self
+            .pending
+            .get(request.measurement())
+            .map_or(&[][..], Vec::as_slice);
+        merge_pending_rows(durable, pending, request)
     }
 }

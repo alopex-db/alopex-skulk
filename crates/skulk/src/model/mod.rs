@@ -27,7 +27,7 @@ impl SeriesId {
 }
 
 /// Measurement and tags that define one time-series identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SeriesKey {
     measurement: String,
     tags: Tags,
