@@ -2,7 +2,7 @@
 
 use crate::error::{Result, TsmError};
 use crate::model::WideRow;
-use crate::store::buffer::{BatchValidator, FlushPolicy, MeasurementBuffer};
+use crate::store::buffer::{BatchValidator, FlushPolicy, MeasurementBuffer, MeasurementState};
 use crate::store::compaction::{CompactionConfig, CompactionResult, Compactor};
 use crate::store::format::reject_legacy_data_root;
 use crate::store::lock::DataRootLock;
@@ -88,7 +88,7 @@ pub struct RecoveryStore {
     retention: RetentionStore,
     wal: Wal,
     sequencer: Sequencer,
-    buffers: BTreeMap<String, MeasurementBuffer>,
+    buffers: BTreeMap<String, MeasurementState>,
     pending: BTreeMap<String, Vec<SequencedRow>>,
     replayed_row_count: usize,
     config: RecoveryConfig,
@@ -111,7 +111,7 @@ impl RecoveryStore {
             .max()
             .map(IngestSeq::new);
         let sequencer = manifest.resume_sequencer(wal_high_water)?;
-        let mut buffers = BTreeMap::new();
+        let mut buffers: BTreeMap<String, MeasurementState> = BTreeMap::new();
         let mut pending: BTreeMap<String, Vec<SequencedRow>> = BTreeMap::new();
         let mut observed_sequences = BTreeSet::new();
         let mut replayed_row_count = 0;
@@ -131,8 +131,8 @@ impl RecoveryStore {
             let measurement = sequenced.row().series().measurement().to_owned();
             buffers
                 .entry(measurement.clone())
-                .or_insert_with(|| MeasurementBuffer::new(&measurement, config.buffer))
-                .append(&sequenced)?;
+                .or_insert_with(|| MeasurementState::new(&measurement))
+                .record(sequenced.row())?;
             pending.entry(measurement).or_default().push(sequenced);
             replayed_row_count += 1;
         }
@@ -161,10 +161,10 @@ impl RecoveryStore {
         TimePartition::for_timestamp(row.timestamp())?;
         self.retention
             .validate_write(&measurement, row.timestamp(), now)?;
-        if let Some(buffer) = self.buffers.get(&measurement) {
-            buffer.validate_append(&row)?;
+        if let Some(state) = self.buffers.get(&measurement) {
+            state.validate_append(&row)?;
         } else {
-            MeasurementBuffer::new(&measurement, self.config.buffer).validate_append(&row)?;
+            MeasurementState::new(&measurement).validate_append(&row)?;
         }
         self.wal.validate_row(&row)?;
         let sequenced = self.sequencer.issue(row)?;
@@ -173,8 +173,8 @@ impl RecoveryStore {
             .append_durable_row(sequence.get(), sequenced.row())?;
         self.buffers
             .entry(measurement.clone())
-            .or_insert_with(|| MeasurementBuffer::new(&measurement, self.config.buffer))
-            .append(&sequenced)?;
+            .or_insert_with(|| MeasurementState::new(&measurement))
+            .record(sequenced.row())?;
         self.pending.entry(measurement).or_default().push(sequenced);
         Ok(sequence)
     }
@@ -220,8 +220,8 @@ impl RecoveryStore {
             let measurement = row.row().series().measurement().to_owned();
             self.buffers
                 .entry(measurement.clone())
-                .or_insert_with(|| MeasurementBuffer::new(&measurement, self.config.buffer))
-                .append(&row)?;
+                .or_insert_with(|| MeasurementState::new(&measurement))
+                .record(row.row())?;
             sequences.push(row.ingest_seq());
             self.pending.entry(measurement).or_default().push(row);
         }
@@ -394,9 +394,9 @@ impl RecoveryStore {
 
     /// Returns the current in-memory buffer estimate for admission control.
     pub fn pending_estimated_bytes(&self) -> Result<usize> {
-        self.buffers.values().try_fold(0_usize, |total, buffer| {
+        self.buffers.values().try_fold(0_usize, |total, state| {
             total
-                .checked_add(buffer.estimated_bytes())
+                .checked_add(state.estimated_bytes())
                 .ok_or_else(|| TsmError::ResourceLimit("buffer pressure estimate overflow".into()))
         })
     }
@@ -412,10 +412,8 @@ impl RecoveryStore {
     }
 
     fn clear_persisted_buffers(&mut self) -> Result<()> {
-        for buffer in self.buffers.values_mut() {
-            if buffer.row_count() != 0 {
-                let _ = buffer.drain_sorted()?;
-            }
+        for state in self.buffers.values_mut() {
+            state.clear();
         }
         self.pending.clear();
         Ok(())

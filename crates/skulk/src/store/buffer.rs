@@ -494,6 +494,99 @@ fn arrow_error(error: ArrowError) -> TsmError {
     TsmError::Serialization(format!("Arrow record batch: {error}"))
 }
 
+/// Lightweight per-measurement ingest state: column roles for validation and
+/// the flush-policy memory estimate. Since v0.3.1 the acked row data lives
+/// once in the pending set and Arrow columns are built only at flush time.
+#[derive(Debug)]
+pub struct MeasurementState {
+    measurement: String,
+    columns: BTreeMap<String, ColumnRole>,
+    estimated_bytes: usize,
+    row_count: usize,
+}
+
+impl MeasurementState {
+    /// Creates an empty state for one measurement.
+    pub fn new(measurement: impl Into<String>) -> Self {
+        Self {
+            measurement: measurement.into(),
+            columns: BTreeMap::new(),
+            estimated_bytes: 0,
+            row_count: 0,
+        }
+    }
+
+    /// Returns the memory estimate used by the flush policy.
+    pub const fn estimated_bytes(&self) -> usize {
+        self.estimated_bytes
+    }
+
+    /// Returns the number of recorded (unflushed) rows.
+    pub const fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    /// Validates one row against the recorded column roles without mutating.
+    pub(crate) fn validate_append(&self, row: &WideRow) -> Result<usize> {
+        if row.series().measurement() != self.measurement {
+            return Err(TsmError::InvalidInput(format!(
+                "measurement '{}' does not match buffer '{}'",
+                row.series().measurement(),
+                self.measurement
+            )));
+        }
+        for name in row.series().tags().keys() {
+            validate_user_column_name(name)?;
+            if row.fields().contains_key(name) {
+                return Err(TsmError::InvalidInput(format!(
+                    "column '{name}' cannot be both a tag and a field"
+                )));
+            }
+            if let Some(role) = self.columns.get(name) {
+                if *role != ColumnRole::Tag {
+                    return Err(column_role_conflict(name));
+                }
+            }
+        }
+        for (name, value) in row.fields() {
+            validate_user_column_name(name)?;
+            let expected = ColumnRole::Field(value.field_type());
+            if let Some(role) = self.columns.get(name) {
+                if *role != expected {
+                    return Err(column_role_conflict(name));
+                }
+            }
+        }
+        let row_bytes = estimated_row_bytes(row)?;
+        self.estimated_bytes
+            .checked_add(row_bytes)
+            .ok_or_else(|| TsmError::ResourceLimit("buffer memory estimate overflow".into()))
+    }
+
+    /// Validates and records one acked row's columns and memory estimate.
+    pub fn record(&mut self, row: &WideRow) -> Result<()> {
+        let estimated_bytes = self.validate_append(row)?;
+        for name in row.series().tags().keys() {
+            self.columns.entry(name.clone()).or_insert(ColumnRole::Tag);
+        }
+        for (name, value) in row.fields() {
+            self.columns
+                .entry(name.clone())
+                .or_insert(ColumnRole::Field(value.field_type()));
+        }
+        self.estimated_bytes = estimated_bytes;
+        self.row_count += 1;
+        Ok(())
+    }
+
+    /// Forgets recorded rows and columns after a successful flush.
+    pub fn clear(&mut self) {
+        self.columns.clear();
+        self.estimated_bytes = 0;
+        self.row_count = 0;
+    }
+}
+
 /// Clone-free validation of one incoming batch against a buffer's column
 /// state. Mirrors `MeasurementBuffer::append`'s checks (measurement match,
 /// column-name validity, tag/field collision, role conflicts including
@@ -501,24 +594,24 @@ fn arrow_error(error: ArrowError) -> TsmError {
 /// overflow guard) without cloning rows or building Arrow columns.
 pub(crate) struct BatchValidator<'a> {
     measurement: &'a str,
-    buffer: Option<&'a MeasurementBuffer>,
+    state: Option<&'a MeasurementState>,
     new_columns: BTreeMap<String, ColumnRole>,
     estimated_bytes: usize,
 }
 
 impl<'a> BatchValidator<'a> {
-    pub(crate) fn new(measurement: &'a str, buffer: Option<&'a MeasurementBuffer>) -> Self {
+    pub(crate) fn new(measurement: &'a str, state: Option<&'a MeasurementState>) -> Self {
         Self {
             measurement,
-            buffer,
+            state,
             new_columns: BTreeMap::new(),
-            estimated_bytes: buffer.map_or(0, MeasurementBuffer::estimated_bytes),
+            estimated_bytes: state.map_or(0, MeasurementState::estimated_bytes),
         }
     }
 
     fn column_role(&self, name: &str) -> Option<ColumnRole> {
-        self.buffer
-            .and_then(|buffer| buffer.columns.get(name).map(|column| column.role))
+        self.state
+            .and_then(|state| state.columns.get(name).copied())
             .or_else(|| self.new_columns.get(name).copied())
     }
 
