@@ -659,14 +659,6 @@ fn encode_payload_into(
     row: &WideRow,
     max_entry_bytes: usize,
 ) -> Result<()> {
-    let size = encoded_row_size(row)?;
-    if size > max_entry_bytes {
-        return Err(TsmError::ResourceLimit(format!(
-            "encoded WAL entry is {size} bytes, limit is {max_entry_bytes}"
-        )));
-    }
-
-    output.reserve(size);
     let start = output.len();
     output.extend_from_slice(&sequence.to_le_bytes());
     output.extend_from_slice(&row.timestamp().to_le_bytes());
@@ -702,7 +694,13 @@ fn encode_payload_into(
             }
         }
     }
-    debug_assert_eq!(output.len() - start, size);
+    let size = output.len() - start;
+    if size > max_entry_bytes {
+        output.truncate(start);
+        return Err(TsmError::ResourceLimit(format!(
+            "encoded WAL entry is {size} bytes, limit is {max_entry_bytes}"
+        )));
+    }
     Ok(())
 }
 
