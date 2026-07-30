@@ -1,10 +1,10 @@
 //! PromQL to language-independent logical plan conversion.
 
 use super::{
-    AggregateKind, AggregateNode, AggregationStage, ArithmeticKind, BinaryNode, FilterNode,
-    LogicalPlan, MeasurementSelection, PlanContext, PlanNode, PlanPredicate, PlanTimeRange,
-    PlanValueType, RangeFunctionKind, RangeFunctionNode, ScanNode, SeriesGroupNode, SeriesGrouping,
-    SeriesWindow, SeriesWindowKind,
+    AggregateCall, AggregateInput, AggregateKind, AggregateNode, AggregationStage, ArithmeticKind,
+    BinaryNode, FilterNode, LogicalPlan, MeasurementSelection, PlanContext, PlanNode,
+    PlanPredicate, PlanTimeRange, PlanValueType, RangeFunctionKind, RangeFunctionNode, ScanNode,
+    SeriesGroupKind, SeriesGroupNode, SeriesGrouping, SeriesWindow, SeriesWindowKind,
 };
 use crate::query::promql::{
     AggregationOp, BinaryOp, PromDuration, PromExpr, PromExprKind, PromFunction, PromLabelMatcher,
@@ -82,13 +82,18 @@ fn plan_expression(expression: &PromExpr, context: PlanContext) -> Result<PlanNo
             without,
         } => Ok(PlanNode::Aggregate(AggregateNode {
             input: Box::new(plan_expression(expr, context)?),
-            kind: aggregate_kind(*op),
+            calls: vec![AggregateCall {
+                kind: aggregate_kind(*op),
+                argument: AggregateInput::CurrentValue,
+                parameter: None,
+                auxiliary: Vec::new(),
+                distinct: false,
+            }],
             grouping: grouping.as_ref().map(|labels| SeriesGrouping {
                 labels: labels.clone(),
                 without: *without,
             }),
             stage: AggregationStage::Single,
-            parameter: None,
         })),
         PromExprKind::Binary { left, op, right } => Ok(PlanNode::Binary(BinaryNode {
             left: Box::new(plan_expression(left, context)?),
@@ -138,7 +143,7 @@ fn plan_selector(
             "selector window starts outside the supported timestamp range".to_string(),
         )
     })?;
-    let time_range = PlanTimeRange::new(start_exclusive, evaluation_time)
+    let time_range = PlanTimeRange::prometheus_window(start_exclusive, evaluation_time)
         .map_err(|error| plan_error(span, error.to_string()))?;
 
     let mut measurement = MeasurementSelection {
@@ -185,7 +190,9 @@ fn plan_selector(
         measurement,
         time_range,
         tag_equalities,
-        field_projection: BTreeSet::from([field.unwrap_or_else(|| DEFAULT_FIELD.to_string())]),
+        field_projection: Some(BTreeSet::from([
+            field.unwrap_or_else(|| DEFAULT_FIELD.to_string())
+        ])),
     });
     let input = if residual.is_empty() {
         scan
@@ -197,11 +204,11 @@ fn plan_selector(
     };
     Ok(PlanNode::SeriesGroup(SeriesGroupNode {
         input: Box::new(input),
-        window: SeriesWindow {
+        kind: SeriesGroupKind::Window(SeriesWindow {
             kind: window_kind,
             evaluation_time,
             duration_ns: window_ns,
-        },
+        }),
     }))
 }
 
@@ -220,10 +227,15 @@ fn plan_function(
         };
         return Ok(PlanNode::Aggregate(AggregateNode {
             input: Box::new(plan_expression(input, context)?),
-            kind: AggregateKind::HistogramQuantile,
+            calls: vec![AggregateCall {
+                kind: AggregateKind::HistogramQuantile,
+                argument: AggregateInput::CurrentValue,
+                parameter: Some(Box::new(plan_expression(parameter, context)?)),
+                auxiliary: Vec::new(),
+                distinct: false,
+            }],
             grouping: None,
             stage: AggregationStage::Single,
-            parameter: Some(Box::new(plan_expression(parameter, context)?)),
         }));
     }
 

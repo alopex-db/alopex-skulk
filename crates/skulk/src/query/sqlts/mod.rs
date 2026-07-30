@@ -879,7 +879,7 @@ fn duration_argument(expression: &SqlExpr) -> Result<Duration> {
     parse_duration(raw).map_err(|message| type_error(expression.span, message))
 }
 
-fn parse_duration(raw: &str) -> std::result::Result<Duration, String> {
+pub(crate) fn parse_duration(raw: &str) -> std::result::Result<Duration, String> {
     let normalized = raw.trim().to_ascii_lowercase();
     if normalized.is_empty() {
         return Err("duration must not be empty".to_string());

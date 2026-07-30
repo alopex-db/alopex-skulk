@@ -325,7 +325,10 @@ impl TypeChecker<'_> {
             SqlLiteral::String(_) => Ok(ExprType::Scalar(SqlValueType::Utf8)),
             SqlLiteral::Boolean(_) => Ok(ExprType::Scalar(SqlValueType::Boolean)),
             SqlLiteral::Null => Ok(ExprType::Null),
-            SqlLiteral::Interval(_) => Ok(ExprType::Interval),
+            SqlLiteral::Interval(raw) => {
+                super::parse_duration(raw).map_err(|message| type_error(span, message))?;
+                Ok(ExprType::Interval)
+            }
         }
     }
 

@@ -2,7 +2,7 @@
 
 use alopex_skulk::query::plan::{
     plan_promql, AggregateKind, AggregationStage, PlanContext, PlanNode, PlanPredicate,
-    RangeFunctionKind, SeriesWindowKind,
+    RangeFunctionKind, SeriesGroupKind, SeriesWindowKind,
 };
 use alopex_skulk::query::promql::parse;
 use alopex_skulk::query::MatchOp;
@@ -29,7 +29,7 @@ fn builds_scan_filter_group_function_and_aggregate_pipeline() {
     let PlanNode::Aggregate(aggregate) = &logical.root else {
         panic!("expected aggregate");
     };
-    assert_eq!(aggregate.kind, AggregateKind::Sum);
+    assert_eq!(aggregate.calls[0].kind, AggregateKind::Sum);
     assert_eq!(aggregate.stage, AggregationStage::Single);
     assert_eq!(
         aggregate.grouping.as_ref().expect("grouping").labels,
@@ -43,12 +43,12 @@ fn builds_scan_filter_group_function_and_aggregate_pipeline() {
     let PlanNode::SeriesGroup(group) = function.input.as_ref() else {
         panic!("expected series group");
     };
-    assert_eq!(group.window.kind, SeriesWindowKind::Range);
-    assert_eq!(group.window.duration_ns, 300 * SECOND);
-    assert_eq!(
-        group.window.evaluation_time,
-        evaluation_time - 3_600 * SECOND
-    );
+    let SeriesGroupKind::Window(window) = group.kind else {
+        panic!("expected range window");
+    };
+    assert_eq!(window.kind, SeriesWindowKind::Range);
+    assert_eq!(window.duration_ns, 300 * SECOND);
+    assert_eq!(window.evaluation_time, evaluation_time - 3_600 * SECOND);
 
     let PlanNode::Filter(filter) = group.input.as_ref() else {
         panic!("expected residual filter");
@@ -73,16 +73,20 @@ fn builds_scan_filter_group_function_and_aggregate_pipeline() {
                 && matcher.value == "a"
     ));
     assert_eq!(
-        scan.field_projection.iter().collect::<Vec<_>>(),
+        scan.field_projection
+            .as_ref()
+            .expect("projection")
+            .iter()
+            .collect::<Vec<_>>(),
         [&"value".to_string()]
     );
     assert_eq!(
-        scan.time_range.start_exclusive(),
-        evaluation_time - 3_900 * SECOND
+        scan.time_range.start.expect("start").value,
+        evaluation_time - 3_900 * SECOND,
     );
     assert_eq!(
-        scan.time_range.end_inclusive(),
-        evaluation_time - 3_600 * SECOND
+        scan.time_range.end.expect("end").value,
+        evaluation_time - 3_600 * SECOND,
     );
 }
 
@@ -110,7 +114,11 @@ fn extracts_reserved_measurement_and_field_matchers() {
     assert_eq!(scan.measurement.matchers.len(), 1);
     assert_eq!(scan.measurement.matchers[0].name, "__name__");
     assert_eq!(
-        scan.field_projection.iter().collect::<Vec<_>>(),
+        scan.field_projection
+            .as_ref()
+            .expect("projection")
+            .iter()
+            .collect::<Vec<_>>(),
         [&"usage".to_string()]
     );
     assert_eq!(scan.tag_equalities[0].name, "host");
@@ -127,9 +135,12 @@ fn shifts_each_selector_range_for_offset_inside_binary_plans() {
     let PlanNode::SeriesGroup(group) = binary.right.as_ref() else {
         panic!("expected right vector");
     };
-    assert_eq!(group.window.kind, SeriesWindowKind::Instant);
-    assert_eq!(group.window.evaluation_time, evaluation_time - 300 * SECOND);
-    assert_eq!(group.window.duration_ns, 300 * SECOND);
+    let SeriesGroupKind::Window(window) = group.kind else {
+        panic!("expected instant window");
+    };
+    assert_eq!(window.kind, SeriesWindowKind::Instant);
+    assert_eq!(window.evaluation_time, evaluation_time - 300 * SECOND);
+    assert_eq!(window.duration_ns, 300 * SECOND);
 }
 
 #[test]
@@ -180,9 +191,9 @@ fn maps_every_range_function_and_histogram_quantile() {
     assert!(matches!(
         logical.root,
         PlanNode::Aggregate(ref aggregate)
-            if aggregate.kind == AggregateKind::HistogramQuantile
+            if aggregate.calls[0].kind == AggregateKind::HistogramQuantile
                 && matches!(
-                    aggregate.parameter.as_deref(),
+                    aggregate.calls[0].parameter.as_deref(),
                     Some(PlanNode::Scalar(value)) if (*value - 0.95).abs() < f64::EPSILON
                 )
     ));
