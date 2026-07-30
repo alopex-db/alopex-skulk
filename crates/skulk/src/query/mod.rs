@@ -6,6 +6,8 @@ mod nimffi;
 #[cfg(feature = "promql")]
 pub mod promql;
 
+pub mod engine;
+
 pub mod exec;
 
 pub mod plan;
@@ -15,4 +17,5 @@ pub mod sqlts;
 
 mod types;
 
+pub use engine::{MetadataRequest, QueryEngine};
 pub use types::{LabelMatcher, MatchOp, QueryResult, QueryResultKind, TSFunction};

@@ -503,42 +503,54 @@ impl<'a> Executor<'a> {
                 scan.resolution.name()
             )));
         }
-        let Some(measurement) = scan.measurement.exact.as_deref() else {
-            return Err(unsupported_operator(
-                "matcher-only measurement enumeration is provided by the unified query engine",
-            ));
-        };
-        for matcher in &scan.measurement.matchers {
-            if !label_matches_value(matcher, measurement)? {
-                return Ok(OperatorValue::Rows(RowSet {
-                    rows: Vec::new(),
-                    field_projection: scan.field_projection.clone(),
-                }));
-            }
-        }
         let Some(time_range) = storage_time_range(scan.time_range)? else {
             return Ok(OperatorValue::Rows(RowSet {
                 rows: Vec::new(),
                 field_projection: scan.field_projection.clone(),
             }));
         };
-        let mut request = ScanRequest::new(measurement, time_range);
-        if let Some(fields) = &scan.field_projection {
-            request = request.with_field_projection(fields.iter().cloned());
-        }
+        let mut measurements = match scan.measurement.exact.as_deref() {
+            Some(measurement) => vec![measurement.to_string()],
+            None => self.reader.measurement_names()?,
+        };
+        measurements.sort();
+        measurements.dedup();
+        let measurement_predicates = scan
+            .measurement
+            .matchers
+            .iter()
+            .map(|matcher| to_tag_predicate(matcher)?.prepare())
+            .collect::<Result<Vec<PreparedTagPredicate>>>()?;
         let predicates = scan
             .tag_equalities
             .iter()
             .map(to_tag_predicate)
             .collect::<Result<Vec<_>>>()?;
-        request = request.with_tag_predicates(predicates);
 
-        let rows = self.reader.scan(&request)?.into_rows();
-        check_limit(
-            rows.len(),
-            self.config.max_intermediate_rows,
-            "scan result rows",
-        )?;
+        let mut rows = Vec::new();
+        for measurement in measurements {
+            if !measurement_predicates
+                .iter()
+                .all(|predicate| predicate.matches_value(&measurement))
+            {
+                continue;
+            }
+            let mut request = ScanRequest::new(measurement, time_range);
+            if let Some(fields) = &scan.field_projection {
+                request = request.with_field_projection(fields.iter().cloned());
+            }
+            request = request.with_tag_predicates(predicates.clone());
+            let mut scanned = self.reader.scan(&request)?.into_rows();
+            let row_count = rows.len().checked_add(scanned.len()).ok_or_else(|| {
+                TsmError::ResourceLimit("scan result row count overflows".to_string())
+            })?;
+            check_limit(
+                row_count,
+                self.config.max_intermediate_rows,
+                "scan result rows",
+            )?;
+            rows.append(&mut scanned);
+        }
         Ok(OperatorValue::Rows(RowSet {
             rows,
             field_projection: scan.field_projection.clone(),
@@ -747,10 +759,6 @@ impl PreparedSeriesMatcher {
 /// Evaluates one label matcher, treating a missing label as the empty string.
 pub fn label_matches(matcher: &LabelMatcher, series: &SeriesKey) -> Result<bool> {
     Ok(prepare_label_matcher(matcher)?.matches(series))
-}
-
-fn label_matches_value(matcher: &LabelMatcher, value: &str) -> Result<bool> {
-    Ok(to_tag_predicate(matcher)?.prepare()?.matches_value(value))
 }
 
 fn prepare_label_matcher(matcher: &LabelMatcher) -> Result<PreparedSeriesMatcher> {

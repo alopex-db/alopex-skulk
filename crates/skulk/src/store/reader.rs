@@ -9,6 +9,7 @@ use crate::store::buffer::{
 use crate::store::compaction::deduplicate_latest;
 use crate::store::manifest::ManifestState;
 use crate::store::parquet_reader::decode_batch;
+use crate::store::schema::MeasurementSchema;
 use crate::store::seq::SequencedRow;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ProjectionMask;
@@ -437,6 +438,28 @@ impl ScanResult {
 pub trait StorageReader {
     /// Scans one measurement using storage-level pruning and projection.
     fn scan(&self, request: &ScanRequest) -> Result<ScanResult>;
+
+    /// Lists queryable measurements in deterministic order when the reader
+    /// supports matcher-only measurement selection.
+    fn measurement_names(&self) -> Result<Vec<String>> {
+        Err(TsmError::Unsupported {
+            feature: "storage reader does not provide measurement enumeration".to_string(),
+            line: 0,
+            column: 0,
+            offset: 0,
+        })
+    }
+
+    /// Resolves one query-visible measurement schema when the reader provides
+    /// schema catalog access.
+    fn measurement_schema(&self, _measurement: &str) -> Result<MeasurementSchema> {
+        Err(TsmError::Unsupported {
+            feature: "storage reader does not provide schema resolution".to_string(),
+            line: 0,
+            column: 0,
+            offset: 0,
+        })
+    }
 }
 
 /// A pruning-aware reader over one immutable manifest snapshot.
@@ -506,6 +529,17 @@ impl StorageReader for ManifestStorageReader<'_> {
         rows = finalize_visible_rows(rows)?;
         stats.rows_returned = rows.len();
         Ok(ScanResult { rows, stats })
+    }
+
+    fn measurement_names(&self) -> Result<Vec<String>> {
+        Ok(self
+            .manifest
+            .active_files()
+            .values()
+            .map(|file| file.measurement().to_string())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
     }
 }
 

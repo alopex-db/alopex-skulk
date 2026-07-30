@@ -553,4 +553,12 @@ impl StorageReader for RecoveryStore {
             .map_or(&[][..], Vec::as_slice);
         merge_pending_rows(durable, pending, request)
     }
+
+    fn measurement_names(&self) -> Result<Vec<String>> {
+        RecoveryStore::measurement_names(self)
+    }
+
+    fn measurement_schema(&self, measurement: &str) -> Result<MeasurementSchema> {
+        RecoveryStore::measurement_schema(self, measurement)
+    }
 }

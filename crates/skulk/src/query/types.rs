@@ -102,7 +102,8 @@ pub enum QueryResultKind {
 ///
 /// Physical values are carried as Arrow record batches. Time-series frontends
 /// use the canonical long-form schema, while SQL queries preserve their table
-/// schema.
+/// schema. Numeric Arrow columns are eligible for downstream zero-copy
+/// transfer; string and dictionary-label columns make no zero-copy guarantee.
 #[derive(Debug, Clone)]
 pub enum QueryResult {
     /// One scalar sample represented by a single-row record batch.
