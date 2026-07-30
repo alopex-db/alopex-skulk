@@ -64,6 +64,19 @@ pub enum TsmError {
         offset: usize,
     },
 
+    /// A validated query could not be converted into a logical execution plan.
+    #[error("query planning error at line {line}, column {column}, offset {offset}: {message}")]
+    Plan {
+        /// Description of the planning constraint that failed.
+        message: String,
+        /// One-based source line, or zero for a programmatic plan.
+        line: usize,
+        /// One-based source column, or zero for a programmatic plan.
+        column: usize,
+        /// Zero-based UTF-8 byte offset.
+        offset: usize,
+    },
+
     /// The vendored query parser violated or did not match its wire contract.
     #[error("Nim parser FFI contract error: {0}")]
     FfiContract(String),

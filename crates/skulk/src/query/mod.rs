@@ -6,6 +6,8 @@ mod nimffi;
 #[cfg(feature = "promql")]
 pub mod promql;
 
+pub mod plan;
+
 #[cfg(feature = "sql-ts")]
 pub mod sqlts;
 
