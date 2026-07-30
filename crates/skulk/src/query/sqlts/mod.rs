@@ -1,5 +1,7 @@
 //! SQL-TS wire-AST mapping and schema-independent semantic expressions.
 
+pub mod typecheck;
+
 use super::nimffi::{self, ParserLanguage};
 use super::TSFunction;
 use crate::{Result, TsmError};
@@ -228,7 +230,12 @@ pub enum PatternKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlFunction {
     /// A time-series transformation shared with query-common.
-    TimeSeries(TSFunction),
+    TimeSeries {
+        /// Query-common function identity and normalized bare column names.
+        function: TSFunction,
+        /// Original qualified column references retained for schema validation.
+        columns: Vec<SqlColumnReference>,
+    },
     /// A standard aggregate.
     Aggregate {
         /// Aggregate identity.
@@ -240,6 +247,17 @@ pub enum SqlFunction {
     },
     /// Current evaluation time.
     Now,
+}
+
+/// One source-spanned column argument retained by a resolved function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlColumnReference {
+    /// Optional measurement or measurement-alias qualifier.
+    pub qualifier: Option<String>,
+    /// Bare column name.
+    pub name: String,
+    /// Source span of the argument.
+    pub span: SqlSpan,
 }
 
 /// A standard SQL aggregate supported by SQL-TS.
@@ -665,48 +683,65 @@ fn map_function(
         "TIME_BUCKET" => {
             reject_function_flags(name, distinct, star, span)?;
             expect_argument_count(name, &arguments, 2, span)?;
-            Some(TSFunction::TimeBucket {
-                interval: duration_argument(&arguments[0])?,
-                column: column_argument(name, &arguments[1])?,
-            })
+            let column = column_argument(name, &arguments[1])?;
+            Some((
+                TSFunction::TimeBucket {
+                    interval: duration_argument(&arguments[0])?,
+                    column: column.name.clone(),
+                },
+                vec![column],
+            ))
         }
         "RATE" => {
             reject_function_flags(name, distinct, star, span)?;
             expect_argument_count(name, &arguments, 1, span)?;
-            Some(TSFunction::Rate {
-                column: column_argument(name, &arguments[0])?,
-            })
+            let column = column_argument(name, &arguments[0])?;
+            Some((
+                TSFunction::Rate {
+                    column: column.name.clone(),
+                },
+                vec![column],
+            ))
         }
         "DELTA" => {
             reject_function_flags(name, distinct, star, span)?;
             expect_argument_count(name, &arguments, 1, span)?;
-            Some(TSFunction::Delta {
-                column: column_argument(name, &arguments[0])?,
-            })
+            let column = column_argument(name, &arguments[0])?;
+            Some((
+                TSFunction::Delta {
+                    column: column.name.clone(),
+                },
+                vec![column],
+            ))
         }
         "DERIVATIVE" => {
             reject_function_flags(name, distinct, star, span)?;
             expect_argument_count(name, &arguments, 1, span)?;
-            Some(TSFunction::Derivative {
-                column: column_argument(name, &arguments[0])?,
-            })
+            let column = column_argument(name, &arguments[0])?;
+            Some((
+                TSFunction::Derivative {
+                    column: column.name.clone(),
+                },
+                vec![column],
+            ))
         }
         "FIRST" | "LAST" => {
             reject_function_flags(name, distinct, star, span)?;
             expect_argument_count(name, &arguments, 2, span)?;
             let value_column = column_argument(name, &arguments[0])?;
             let time_column = column_argument(name, &arguments[1])?;
-            Some(if normalized == "FIRST" {
+            let function = if normalized == "FIRST" {
                 TSFunction::First {
-                    value_column,
-                    time_column,
+                    value_column: value_column.name.clone(),
+                    time_column: time_column.name.clone(),
                 }
             } else {
                 TSFunction::Last {
-                    value_column,
-                    time_column,
+                    value_column: value_column.name.clone(),
+                    time_column: time_column.name.clone(),
                 }
-            })
+            };
+            Some((function, vec![value_column, time_column]))
         }
         "HISTOGRAM_QUANTILE" => {
             reject_function_flags(name, distinct, star, span)?;
@@ -718,15 +753,19 @@ fn map_function(
                     format!("{name} quantile must be between 0 and 1"),
                 ));
             }
-            Some(TSFunction::HistogramQuantile {
-                quantile,
-                column: column_argument(name, &arguments[1])?,
-            })
+            let column = column_argument(name, &arguments[1])?;
+            Some((
+                TSFunction::HistogramQuantile {
+                    quantile,
+                    column: column.name.clone(),
+                },
+                vec![column],
+            ))
         }
         _ => None,
     };
-    if let Some(function) = time_series {
-        return Ok(SqlFunction::TimeSeries(function));
+    if let Some((function, columns)) = time_series {
+        return Ok(SqlFunction::TimeSeries { function, columns });
     }
 
     if normalized == "NOW" {
@@ -795,9 +834,13 @@ fn expect_argument_count(
     Ok(())
 }
 
-fn column_argument(function: &str, expression: &SqlExpr) -> Result<String> {
+fn column_argument(function: &str, expression: &SqlExpr) -> Result<SqlColumnReference> {
     match &expression.kind {
-        SqlExprKind::Column { name, .. } if name != "*" => Ok(name.clone()),
+        SqlExprKind::Column { qualifier, name } if name != "*" => Ok(SqlColumnReference {
+            qualifier: qualifier.clone(),
+            name: name.clone(),
+            span: expression.span,
+        }),
         _ => Err(type_error(
             expression.span,
             format!("{function} expects a column argument"),
@@ -1071,9 +1114,10 @@ fn contains_time_column(expression: &SqlExpr) -> bool {
         SqlExprKind::InList { expr, list, .. } => {
             contains_time_column(expr) || list.iter().any(contains_time_column)
         }
-        SqlExprKind::Function(SqlFunction::TimeSeries(TSFunction::TimeBucket {
-            column, ..
-        })) => column.eq_ignore_ascii_case("time"),
+        SqlExprKind::Function(SqlFunction::TimeSeries {
+            function: TSFunction::TimeBucket { column, .. },
+            ..
+        }) => column.eq_ignore_ascii_case("time"),
         SqlExprKind::Literal(_) | SqlExprKind::Function(_) => false,
     }
 }

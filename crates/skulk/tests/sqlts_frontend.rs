@@ -37,10 +37,13 @@ fn maps_the_time_bucket_spec_example_and_aliases() {
     assert_eq!(alias, "bucket");
     assert!(matches!(
         &expr.kind,
-        SqlExprKind::Function(SqlFunction::TimeSeries(TSFunction::TimeBucket {
-            interval,
-            column,
-        })) if *interval == Duration::from_secs(3_600) && column == "time"
+        SqlExprKind::Function(SqlFunction::TimeSeries {
+            function: TSFunction::TimeBucket {
+                interval,
+                column,
+            },
+            ..
+        }) if *interval == Duration::from_secs(3_600) && column == "time"
     ));
 
     assert!(matches!(
@@ -88,39 +91,57 @@ fn resolves_all_required_time_series_and_aggregate_functions() {
 
     assert!(matches!(
         functions[0],
-        SqlExprKind::Function(SqlFunction::TimeSeries(TSFunction::Rate { column }))
+        SqlExprKind::Function(SqlFunction::TimeSeries {
+            function: TSFunction::Rate { column },
+            ..
+        })
             if column == "counter"
     ));
     assert!(matches!(
         functions[1],
-        SqlExprKind::Function(SqlFunction::TimeSeries(TSFunction::Delta { column }))
+        SqlExprKind::Function(SqlFunction::TimeSeries {
+            function: TSFunction::Delta { column },
+            ..
+        })
             if column == "gauge"
     ));
     assert!(matches!(
         functions[2],
-        SqlExprKind::Function(SqlFunction::TimeSeries(TSFunction::Derivative { column }))
+        SqlExprKind::Function(SqlFunction::TimeSeries {
+            function: TSFunction::Derivative { column },
+            ..
+        })
             if column == "position"
     ));
     assert!(matches!(
         functions[3],
-        SqlExprKind::Function(SqlFunction::TimeSeries(TSFunction::First {
-            value_column,
-            time_column,
-        })) if value_column == "price" && time_column == "time"
+        SqlExprKind::Function(SqlFunction::TimeSeries {
+            function: TSFunction::First {
+                value_column,
+                time_column,
+            },
+            ..
+        }) if value_column == "price" && time_column == "time"
     ));
     assert!(matches!(
         functions[4],
-        SqlExprKind::Function(SqlFunction::TimeSeries(TSFunction::Last {
-            value_column,
-            time_column,
-        })) if value_column == "price" && time_column == "time"
+        SqlExprKind::Function(SqlFunction::TimeSeries {
+            function: TSFunction::Last {
+                value_column,
+                time_column,
+            },
+            ..
+        }) if value_column == "price" && time_column == "time"
     ));
     assert!(matches!(
         functions[5],
-        SqlExprKind::Function(SqlFunction::TimeSeries(TSFunction::HistogramQuantile {
-            quantile,
-            column,
-        })) if (*quantile - 0.95).abs() < f64::EPSILON && column == "bucket"
+        SqlExprKind::Function(SqlFunction::TimeSeries {
+            function: TSFunction::HistogramQuantile {
+                quantile,
+                column,
+            },
+            ..
+        }) if (*quantile - 0.95).abs() < f64::EPSILON && column == "bucket"
     ));
 
     for (kind, expected) in [

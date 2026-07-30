@@ -74,7 +74,7 @@ pub struct MeasurementSchema {
 }
 
 impl MeasurementSchema {
-    fn new(measurement: impl Into<String>) -> Self {
+    pub(crate) fn new(measurement: impl Into<String>) -> Self {
         let mut columns = BTreeMap::new();
         columns.insert(
             TIME_COLUMN.to_owned(),
@@ -101,7 +101,7 @@ impl MeasurementSchema {
         self.columns.get(name)
     }
 
-    fn merge(&mut self, name: &str, incoming: ColumnSchema) -> Result<()> {
+    pub(crate) fn merge(&mut self, name: &str, incoming: ColumnSchema) -> Result<()> {
         if matches!(name, "time" | "__name__") {
             return Err(schema_conflict(
                 &self.measurement,
