@@ -1,16 +1,19 @@
 //! Pruning-aware storage scan contract and local implementation.
 
 use crate::error::{Result, TsmError};
-use crate::model::{Tags, Timestamp};
+use crate::model::{FieldValue, SeriesKey, Tags, Timestamp};
 use crate::store::buffer::{
     COLUMN_KIND_METADATA_KEY, FIELD_COLUMN_KIND, INGEST_SEQ_COLUMN, INGEST_SEQ_COLUMN_KIND,
     TAG_COLUMN_KIND, TIME_COLUMN, TIME_COLUMN_KIND,
 };
 use crate::store::compaction::deduplicate_latest;
 use crate::store::manifest::ManifestState;
-use crate::store::parquet_reader::decode_batch;
+use crate::store::parquet_reader::{
+    decode_batch_with_series_cache, decode_float_batch_with_series_cache, DecodedFloatSample,
+    DecodedSeriesCache,
+};
 use crate::store::schema::MeasurementSchema;
-use crate::store::seq::SequencedRow;
+use crate::store::seq::{IngestSeq, SequencedRow};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ProjectionMask;
 use parquet::basic::{Encoding, PageType};
@@ -20,9 +23,10 @@ use parquet::file::reader::FileReader;
 use parquet::file::serialized_reader::SerializedFileReader;
 use parquet::file::statistics::Statistics;
 use regex::{Regex, RegexBuilder};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const MAX_TAG_REGEX_BYTES: usize = 64 * 1024;
 const MAX_TAG_REGEX_AUTOMATON_BYTES: usize = 2 * 1024 * 1024;
@@ -502,10 +506,125 @@ impl ScanResult {
     }
 }
 
+/// One deduplicated float sample from the lightweight series scan.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FloatPoint {
+    timestamp: Timestamp,
+    ingest_seq: IngestSeq,
+    value: Option<f64>,
+}
+
+impl FloatPoint {
+    /// Creates a sample whose sequence participates in latest-write-wins merging.
+    pub const fn new(timestamp: Timestamp, ingest_seq: IngestSeq, value: Option<f64>) -> Self {
+        Self {
+            timestamp,
+            ingest_seq,
+            value,
+        }
+    }
+
+    /// Returns the nanosecond timestamp.
+    pub const fn timestamp(self) -> Timestamp {
+        self.timestamp
+    }
+
+    /// Returns the durable ingest sequence.
+    pub const fn ingest_seq(self) -> IngestSeq {
+        self.ingest_seq
+    }
+
+    /// Returns the sample value, or `None` for a sparse row.
+    pub const fn value(self) -> Option<f64> {
+        self.value
+    }
+}
+
+/// Chronologically ordered float samples for one canonical series.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FloatSeries {
+    series: SeriesKey,
+    points: Vec<FloatPoint>,
+}
+
+impl FloatSeries {
+    /// Creates one series result for custom or distributed storage readers.
+    pub const fn new(series: SeriesKey, points: Vec<FloatPoint>) -> Self {
+        Self { series, points }
+    }
+
+    /// Returns the canonical measurement and tags.
+    pub const fn series(&self) -> &SeriesKey {
+        &self.series
+    }
+
+    /// Returns timestamp-ordered, latest-write-wins samples.
+    pub fn points(&self) -> &[FloatPoint] {
+        &self.points
+    }
+
+    fn into_parts(self) -> (SeriesKey, Vec<FloatPoint>) {
+        (self.series, self.points)
+    }
+}
+
+/// Lightweight float-series output and the same pruning accounting as a row scan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FloatSeriesScanResult {
+    series: Vec<FloatSeries>,
+    stats: ScanStats,
+}
+
+impl FloatSeriesScanResult {
+    /// Creates a result for custom or distributed storage readers.
+    pub const fn new(series: Vec<FloatSeries>, stats: ScanStats) -> Self {
+        Self { series, stats }
+    }
+
+    /// Returns canonical series in deterministic order.
+    pub fn series(&self) -> &[FloatSeries] {
+        &self.series
+    }
+
+    /// Consumes the result and returns its series.
+    pub fn into_series(self) -> Vec<FloatSeries> {
+        self.series
+    }
+
+    /// Returns pruning and decode accounting.
+    pub const fn stats(&self) -> &ScanStats {
+        &self.stats
+    }
+
+    fn into_parts(self) -> (Vec<FloatSeries>, ScanStats) {
+        (self.series, self.stats)
+    }
+}
+
 /// Read-only query boundary implemented by local and future distributed stores.
 pub trait StorageReader {
     /// Scans one measurement using storage-level pruning and projection.
     fn scan(&self, request: &ScanRequest) -> Result<ScanResult>;
+
+    /// Tries a series-oriented float scan without materializing wide rows.
+    ///
+    /// Readers return `None` when the selected field is not float-compatible;
+    /// the executor then uses the general row path.
+    fn try_scan_float_series(
+        &self,
+        request: &ScanRequest,
+        field: &str,
+    ) -> Result<Option<Arc<FloatSeriesScanResult>>> {
+        let result = self.scan(request)?;
+        let stats = *result.stats();
+        let Some(samples) = float_samples_from_rows(result.into_rows(), field)? else {
+            return Ok(None);
+        };
+        let series = finish_float_samples(samples)?;
+        let mut stats = stats;
+        stats.rows_returned = float_point_count(&series)?;
+        Ok(Some(Arc::new(FloatSeriesScanResult { series, stats })))
+    }
 
     /// Lists queryable measurements in deterministic order when the reader
     /// supports matcher-only measurement selection.
@@ -600,6 +719,58 @@ impl StorageReader for ManifestStorageReader<'_> {
         Ok(ScanResult { rows, stats })
     }
 
+    fn try_scan_float_series(
+        &self,
+        request: &ScanRequest,
+        field: &str,
+    ) -> Result<Option<Arc<FloatSeriesScanResult>>> {
+        if request.measurement().is_empty() || field.is_empty() {
+            return Err(TsmError::InvalidInput(
+                "float-series scan measurement and field must be non-empty".into(),
+            ));
+        }
+        let tag_predicates = request
+            .tag_predicates()
+            .iter()
+            .map(TagPredicate::prepare)
+            .collect::<Result<Vec<_>>>()?;
+        let mut stats = ScanStats::default();
+        let mut samples = Vec::new();
+        let config = self.config.constrained_by(request.decode_limits());
+        for active_file in self
+            .manifest
+            .active_files()
+            .values()
+            .filter(|file| file.measurement() == request.measurement())
+        {
+            stats.files_considered = checked_add(stats.files_considered, 1, "file count")?;
+            if !request
+                .time_range()
+                .overlaps(active_file.min_timestamp(), active_file.max_timestamp())
+            {
+                stats.files_pruned = checked_add(stats.files_pruned, 1, "pruned file count")?;
+                continue;
+            }
+            stats.files_opened = checked_add(stats.files_opened, 1, "opened file count")?;
+            if !scan_float_file(
+                active_file.name(),
+                active_file.row_count(),
+                &self.segments_dir,
+                request,
+                field,
+                &tag_predicates,
+                config,
+                &mut stats,
+                &mut samples,
+            )? {
+                return Ok(None);
+            }
+        }
+        let series = finish_float_samples(samples)?;
+        stats.rows_returned = float_point_count(&series)?;
+        Ok(Some(Arc::new(FloatSeriesScanResult { series, stats })))
+    }
+
     fn measurement_names(&self) -> Result<Vec<String>> {
         Ok(self
             .manifest
@@ -610,6 +781,59 @@ impl StorageReader for ManifestStorageReader<'_> {
             .into_iter()
             .collect())
     }
+}
+
+pub(crate) fn merge_pending_float_series(
+    durable: FloatSeriesScanResult,
+    pending: &[SequencedRow],
+    request: &ScanRequest,
+    field: &str,
+) -> Result<Option<FloatSeriesScanResult>> {
+    let (durable, mut stats) = durable.into_parts();
+    let mut samples = Vec::with_capacity(float_point_count(&durable)? + pending.len());
+    for series in durable {
+        let (series, points) = series.into_parts();
+        let series = Arc::new(series);
+        samples.extend(points.into_iter().map(|point| SequencedFloatSample {
+            series: Arc::clone(&series),
+            timestamp: point.timestamp(),
+            ingest_seq: point.ingest_seq(),
+            value: point.value(),
+        }));
+    }
+    let predicates = request
+        .tag_predicates()
+        .iter()
+        .map(TagPredicate::prepare)
+        .collect::<Result<Vec<_>>>()?;
+    stats.pending_rows_considered = checked_add(
+        stats.pending_rows_considered,
+        pending.len(),
+        "pending row count",
+    )?;
+    for row in pending {
+        if !request.time_range().contains(row.row().timestamp())
+            || !predicates
+                .iter()
+                .all(|predicate| predicate.matches(row.row().series().tags()))
+        {
+            continue;
+        }
+        let value = match row.row().field(field) {
+            Some(FieldValue::Float(value)) => Some(*value),
+            Some(_) => return Ok(None),
+            None => None,
+        };
+        samples.push(SequencedFloatSample {
+            series: row.row().shared_series(),
+            timestamp: row.row().timestamp(),
+            ingest_seq: row.ingest_seq(),
+            value,
+        });
+    }
+    let series = finish_float_samples(samples)?;
+    stats.rows_returned = float_point_count(&series)?;
+    Ok(Some(FloatSeriesScanResult { series, stats }))
 }
 
 pub(crate) fn merge_pending_rows(
@@ -642,6 +866,94 @@ pub(crate) fn merge_pending_rows(
     result.rows = finalize_visible_rows(result.rows)?;
     result.stats.rows_returned = result.rows.len();
     Ok(result)
+}
+
+struct SequencedFloatSample {
+    series: Arc<SeriesKey>,
+    timestamp: Timestamp,
+    ingest_seq: IngestSeq,
+    value: Option<f64>,
+}
+
+impl From<DecodedFloatSample> for SequencedFloatSample {
+    fn from(sample: DecodedFloatSample) -> Self {
+        Self {
+            series: sample.series,
+            timestamp: sample.timestamp,
+            ingest_seq: sample.ingest_seq,
+            value: sample.value,
+        }
+    }
+}
+
+fn float_samples_from_rows(
+    rows: Vec<SequencedRow>,
+    field: &str,
+) -> Result<Option<Vec<SequencedFloatSample>>> {
+    let mut samples = Vec::with_capacity(rows.len());
+    for row in rows {
+        let value = match row.row().field(field) {
+            Some(FieldValue::Float(value)) => Some(*value),
+            Some(_) => return Ok(None),
+            None => None,
+        };
+        samples.push(SequencedFloatSample {
+            series: row.row().shared_series(),
+            timestamp: row.row().timestamp(),
+            ingest_seq: row.ingest_seq(),
+            value,
+        });
+    }
+    Ok(Some(samples))
+}
+
+fn finish_float_samples(samples: Vec<SequencedFloatSample>) -> Result<Vec<FloatSeries>> {
+    let mut sequences = HashSet::with_capacity(samples.len());
+    let mut grouped: BTreeMap<Arc<SeriesKey>, Vec<SequencedFloatSample>> = BTreeMap::new();
+    for sample in samples {
+        if !sequences.insert(sample.ingest_seq) {
+            return Err(TsmError::Corruption(format!(
+                "duplicate visible ingest sequence {}",
+                sample.ingest_seq.get()
+            )));
+        }
+        grouped
+            .entry(Arc::clone(&sample.series))
+            .or_default()
+            .push(sample);
+    }
+
+    grouped
+        .into_iter()
+        .map(|(series, mut samples)| {
+            samples.sort_by(|left, right| {
+                left.timestamp
+                    .cmp(&right.timestamp)
+                    .then_with(|| left.ingest_seq.cmp(&right.ingest_seq))
+            });
+            let mut points: Vec<FloatPoint> = Vec::with_capacity(samples.len());
+            for sample in samples {
+                let point = FloatPoint::new(sample.timestamp, sample.ingest_seq, sample.value);
+                if points
+                    .last()
+                    .is_some_and(|previous| previous.timestamp() == sample.timestamp)
+                {
+                    if let Some(previous) = points.last_mut() {
+                        *previous = point;
+                    }
+                } else {
+                    points.push(point);
+                }
+            }
+            Ok(FloatSeries::new((*series).clone(), points))
+        })
+        .collect()
+}
+
+fn float_point_count(series: &[FloatSeries]) -> Result<usize> {
+    series.iter().try_fold(0_usize, |total, series| {
+        checked_add(total, series.points().len(), "float sample count")
+    })
 }
 
 fn finalize_visible_rows(rows: Vec<SequencedRow>) -> Result<Vec<SequencedRow>> {
@@ -765,10 +1077,12 @@ fn scan_file(
         .build()
         .map_err(parquet_error)?;
     let mut decoded = Vec::with_capacity(expected_rows);
+    let mut series_cache = DecodedSeriesCache::default();
     for batch in reader {
-        decode_batch(
+        decode_batch_with_series_cache(
             request.measurement(),
             &batch.map_err(arrow_error)?,
+            &mut series_cache,
             &mut decoded,
         )?;
     }
@@ -785,6 +1099,136 @@ fn scan_file(
                 .all(|predicate| predicate.matches(row.row().series().tags()))
     }));
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_float_file(
+    file_name: &str,
+    manifest_rows: u64,
+    segments_dir: &Path,
+    request: &ScanRequest,
+    field: &str,
+    tag_predicates: &[PreparedTagPredicate],
+    config: StorageReaderConfig,
+    stats: &mut ScanStats,
+    output: &mut Vec<SequencedFloatSample>,
+) -> Result<bool> {
+    let path = segments_dir.join(file_name);
+    let file = File::open(&path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(parquet_error)?;
+    let metadata_rows = u64::try_from(builder.metadata().file_metadata().num_rows())
+        .map_err(|_| TsmError::Corruption("Parquet file has a negative row count".into()))?;
+    if metadata_rows != manifest_rows {
+        return Err(TsmError::Corruption(format!(
+            "Parquet '{file_name}' row count {metadata_rows} differs from manifest {manifest_rows}"
+        )));
+    }
+
+    let schema = builder.schema();
+    let time_index = schema.index_of(TIME_COLUMN).map_err(arrow_error)?;
+    let sequence_index = schema.index_of(INGEST_SEQ_COLUMN).map_err(arrow_error)?;
+    validate_system_column(schema.field(time_index), TIME_COLUMN_KIND)?;
+    validate_system_column(schema.field(sequence_index), INGEST_SEQ_COLUMN_KIND)?;
+    let requested_fields = BTreeSet::from([field.to_string()]);
+    let (projected_indices, projected_fields) =
+        projected_indices(schema.fields(), Some(&requested_fields))?;
+    stats.projected_field_columns = checked_add(
+        stats.projected_field_columns,
+        projected_fields,
+        "projected field count",
+    )?;
+
+    let dictionary_reader = tag_predicates
+        .iter()
+        .any(|predicate| predicate.equal_value().is_some())
+        .then(|| SerializedFileReader::new(File::open(&path)?).map_err(parquet_error))
+        .transpose()?;
+    let mut selected_row_groups = Vec::new();
+    for (index, row_group) in builder.metadata().row_groups().iter().enumerate() {
+        stats.row_groups_considered =
+            checked_add(stats.row_groups_considered, 1, "row-group count")?;
+        if !row_group_overlaps(row_group, time_index, request.time_range())? {
+            stats.row_groups_pruned =
+                checked_add(stats.row_groups_pruned, 1, "pruned row-group count")?;
+            continue;
+        }
+        if !tag_predicates_allow_row_group(
+            index,
+            row_group,
+            schema.fields(),
+            tag_predicates,
+            dictionary_reader.as_ref(),
+        )? {
+            stats.row_groups_pruned =
+                checked_add(stats.row_groups_pruned, 1, "pruned row-group count")?;
+            stats.row_groups_pruned_by_tag = checked_add(
+                stats.row_groups_pruned_by_tag,
+                1,
+                "tag-pruned row-group count",
+            )?;
+            continue;
+        }
+        charge_row_group(row_group, &projected_indices, config, stats)?;
+        selected_row_groups.push(index);
+    }
+    stats.row_groups_decoded = checked_add(
+        stats.row_groups_decoded,
+        selected_row_groups.len(),
+        "decoded row-group count",
+    )?;
+    if selected_row_groups.is_empty() {
+        return Ok(true);
+    }
+
+    let expected_rows = selected_row_groups
+        .iter()
+        .try_fold(0_usize, |total, index| {
+            let rows = non_negative_usize(
+                builder.metadata().row_group(*index).num_rows(),
+                "Parquet row group has a negative row count",
+            )?;
+            checked_add(total, rows, "selected row count")
+        })?;
+    let projection = ProjectionMask::roots(builder.parquet_schema(), projected_indices);
+    let reader = builder
+        .with_row_groups(selected_row_groups)
+        .with_projection(projection)
+        .with_batch_size(config.batch_rows())
+        .build()
+        .map_err(parquet_error)?;
+    let mut decoded = Vec::new();
+    let mut decoded_rows = 0_usize;
+    let mut series_cache = DecodedSeriesCache::default();
+    for batch in reader {
+        let batch = batch.map_err(arrow_error)?;
+        decoded_rows = checked_add(decoded_rows, batch.num_rows(), "decoded row count")?;
+        if !decode_float_batch_with_series_cache(
+            request.measurement(),
+            field,
+            &batch,
+            &mut series_cache,
+            &mut decoded,
+        )? {
+            return Ok(false);
+        }
+    }
+    if decoded_rows != expected_rows {
+        return Err(TsmError::Corruption(format!(
+            "Parquet '{file_name}' decoded {decoded_rows} rows but selected metadata declares {expected_rows}"
+        )));
+    }
+    output.extend(
+        decoded
+            .into_iter()
+            .filter(|sample| {
+                request.time_range().contains(sample.timestamp)
+                    && tag_predicates
+                        .iter()
+                        .all(|predicate| predicate.matches(sample.series.tags()))
+            })
+            .map(SequencedFloatSample::from),
+    );
+    Ok(true)
 }
 
 fn projected_indices(

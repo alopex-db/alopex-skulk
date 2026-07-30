@@ -14,8 +14,8 @@ use crate::store::parquet_writer::{
     ParquetWriter, ParquetWriterConfig, PublishHook, PublishedParquet,
 };
 use crate::store::reader::{
-    merge_pending_rows, ManifestStorageReader, ScanRequest, ScanResult, StorageReader,
-    StorageReaderConfig,
+    merge_pending_float_series, merge_pending_rows, FloatSeriesScanResult, ManifestStorageReader,
+    ScanRequest, ScanResult, StorageReader, StorageReaderConfig,
 };
 use crate::store::retention::{
     current_timestamp_nanos, RetentionPolicy, RetentionResult, RetentionStore, TimePartition,
@@ -26,6 +26,7 @@ use crate::store::wal::{Wal, WalConfig, WalEntry};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 static SEGMENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -106,8 +107,17 @@ pub struct RecoveryStore {
     buffers: BTreeMap<String, MeasurementState>,
     pending: BTreeMap<String, Vec<SequencedRow>>,
     schema: SchemaResolver,
+    float_scan_cache: Mutex<Option<FloatScanCacheEntry>>,
     replayed_row_count: usize,
     config: RecoveryConfig,
+}
+
+struct FloatScanCacheEntry {
+    manifest_generation: u64,
+    issued_through: Option<IngestSeq>,
+    request: ScanRequest,
+    field: String,
+    result: Arc<FloatSeriesScanResult>,
 }
 
 impl RecoveryStore {
@@ -162,6 +172,7 @@ impl RecoveryStore {
             buffers,
             pending,
             schema: SchemaResolver::new(),
+            float_scan_cache: Mutex::new(None),
             replayed_row_count,
             config,
         })
@@ -548,6 +559,46 @@ impl RecoveryStore {
         self.pending.clear();
         Ok(())
     }
+
+    fn cached_float_scan(
+        &self,
+        manifest_generation: u64,
+        issued_through: Option<IngestSeq>,
+        request: &ScanRequest,
+        field: &str,
+    ) -> Result<Option<Arc<FloatSeriesScanResult>>> {
+        let cache = self.float_scan_cache.lock().map_err(|_| {
+            TsmError::Corruption("float-series scan cache lock is poisoned".to_string())
+        })?;
+        Ok(cache.as_ref().and_then(|entry| {
+            (entry.manifest_generation == manifest_generation
+                && entry.issued_through == issued_through
+                && entry.request == *request
+                && entry.field == field)
+                .then(|| Arc::clone(&entry.result))
+        }))
+    }
+
+    fn store_float_scan(
+        &self,
+        manifest_generation: u64,
+        issued_through: Option<IngestSeq>,
+        request: &ScanRequest,
+        field: &str,
+        result: Arc<FloatSeriesScanResult>,
+    ) -> Result<Arc<FloatSeriesScanResult>> {
+        let mut cache = self.float_scan_cache.lock().map_err(|_| {
+            TsmError::Corruption("float-series scan cache lock is poisoned".to_string())
+        })?;
+        *cache = Some(FloatScanCacheEntry {
+            manifest_generation,
+            issued_through,
+            request: request.clone(),
+            field: field.to_string(),
+            result: Arc::clone(&result),
+        });
+        Ok(result)
+    }
 }
 
 impl StorageReader for RecoveryStore {
@@ -564,6 +615,53 @@ impl StorageReader for RecoveryStore {
             .get(request.measurement())
             .map_or(&[][..], Vec::as_slice);
         merge_pending_rows(durable, pending, request)
+    }
+
+    fn try_scan_float_series(
+        &self,
+        request: &ScanRequest,
+        field: &str,
+    ) -> Result<Option<Arc<FloatSeriesScanResult>>> {
+        let manifest = self.manifest.state()?;
+        let issued_through = self.sequencer.highest_issued();
+        if let Some(cached) =
+            self.cached_float_scan(manifest.generation(), issued_through, request, field)?
+        {
+            return Ok(Some(cached));
+        }
+        let Some(durable) = ManifestStorageReader::new(
+            &manifest,
+            self.manifest.segments_dir(),
+            self.config.storage_reader,
+        )
+        .try_scan_float_series(request, field)?
+        else {
+            return Ok(None);
+        };
+        let pending = self
+            .pending
+            .get(request.measurement())
+            .map_or(&[][..], Vec::as_slice);
+        let result = if pending.is_empty() {
+            Some(durable)
+        } else {
+            let durable = match Arc::try_unwrap(durable) {
+                Ok(durable) => durable,
+                Err(shared) => (*shared).clone(),
+            };
+            merge_pending_float_series(durable, pending, request, field)?.map(Arc::new)
+        };
+        result
+            .map(|result| {
+                self.store_float_scan(
+                    manifest.generation(),
+                    issued_through,
+                    request,
+                    field,
+                    result,
+                )
+            })
+            .transpose()
     }
 
     fn measurement_names(&self) -> Result<Vec<String>> {

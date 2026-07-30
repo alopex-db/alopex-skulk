@@ -4,10 +4,11 @@ use super::{execution_error, InstantSample, OperatorValue};
 use crate::model::{FieldValue, SeriesKey, Tags, Timestamp};
 use crate::query::plan::{
     AggregateCall, AggregateInput, AggregateKind, AggregateNode, AggregationStage, ArithmeticKind,
-    PatternMatchKind, PlanDataType, PlanExpression, PlanExpressionKind, ProjectNode,
-    ProjectionExpression, ProjectionItem, ScalarBinaryKind, ScalarUnaryKind, SeriesGrouping,
-    SortKey,
+    PatternMatchKind, PlanDataType, PlanExpression, PlanExpressionKind, PlanNode, ProjectNode,
+    ProjectionExpression, ProjectionItem, ScalarBinaryKind, ScalarUnaryKind, ScanNode,
+    SeriesGroupKind, SeriesGrouping, SortKey,
 };
+use crate::store::reader::FloatSeriesScanResult;
 use crate::store::seq::SequencedRow;
 use crate::{Result, TsmError};
 use regex::RegexBuilder;
@@ -170,6 +171,124 @@ pub(super) fn group_rows(input: OperatorValue, keys: &[PlanExpression]) -> Resul
     Ok(OperatorValue::Groups(GroupSet {
         keys: keys.to_vec(),
         groups: grouped.into_values().collect(),
+    }))
+}
+
+pub(super) fn float_time_bucket_scan(node: &AggregateNode) -> Option<(&ScanNode, &str, i64)> {
+    if node.stage != AggregationStage::Single || node.grouping.is_some() || node.calls.is_empty() {
+        return None;
+    }
+    let PlanNode::SeriesGroup(group) = node.input.as_ref() else {
+        return None;
+    };
+    let SeriesGroupKind::Keys(keys) = &group.kind else {
+        return None;
+    };
+    let [key] = keys.as_slice() else {
+        return None;
+    };
+    let PlanExpressionKind::TimeBucket {
+        interval_ns,
+        column,
+    } = &key.kind
+    else {
+        return None;
+    };
+    if *interval_ns <= 0 || !column.eq_ignore_ascii_case("time") {
+        return None;
+    }
+    let PlanNode::Scan(scan) = group.input.as_ref() else {
+        return None;
+    };
+    if !scan.resolution.is_raw()
+        || scan.measurement.exact.is_none()
+        || !scan.measurement.matchers.is_empty()
+    {
+        return None;
+    }
+
+    let mut field = None;
+    for call in &node.calls {
+        if !matches!(
+            call.kind,
+            AggregateKind::Sum
+                | AggregateKind::Avg
+                | AggregateKind::Min
+                | AggregateKind::Max
+                | AggregateKind::Count
+        ) || call.parameter.is_some()
+            || !call.auxiliary.is_empty()
+            || call.distinct
+        {
+            return None;
+        }
+        let AggregateInput::Expression(PlanExpression {
+            kind: PlanExpressionKind::Column { name },
+        }) = &call.argument
+        else {
+            return None;
+        };
+        if field.is_some_and(|selected| selected != name) {
+            return None;
+        }
+        field = Some(name.as_str());
+    }
+    field.map(|field| (scan, field, *interval_ns))
+}
+
+pub(super) fn aggregate_float_time_buckets(
+    result: &FloatSeriesScanResult,
+    node: &AggregateNode,
+    interval_ns: i64,
+) -> Result<OperatorValue> {
+    let PlanNode::SeriesGroup(group) = node.input.as_ref() else {
+        return Err(execution_error(
+            "float time-bucket aggregation requires a SeriesGroup",
+        ));
+    };
+    let SeriesGroupKind::Keys(keys) = &group.kind else {
+        return Err(execution_error(
+            "float time-bucket aggregation requires SQL grouping keys",
+        ));
+    };
+    let mut buckets: BTreeMap<Timestamp, Vec<f64>> = BTreeMap::new();
+    for series in result.series() {
+        for point in series.points() {
+            let bucket = floor_time_bucket(point.timestamp(), interval_ns)?;
+            let values = buckets.entry(bucket).or_default();
+            if let Some(value) = point.value() {
+                values.push(value);
+            }
+        }
+    }
+
+    let rows = buckets
+        .into_iter()
+        .map(|(bucket, values)| {
+            let table_values = values
+                .into_iter()
+                .map(TableValue::Float64)
+                .collect::<Vec<_>>();
+            let values = node
+                .calls
+                .iter()
+                .map(|call| {
+                    if call.kind == AggregateKind::Count {
+                        Ok(TableValue::UInt64(table_values.len() as u64))
+                    } else {
+                        sql_standard_aggregate(call.kind, &table_values)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(AggregateRow {
+                key_values: vec![TableValue::TimestampNanosecond(bucket)],
+                values,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(OperatorValue::AggregateRows(AggregateSet {
+        keys: keys.clone(),
+        rows,
     }))
 }
 

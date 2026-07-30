@@ -14,13 +14,14 @@ use crate::query::plan::{
 };
 use crate::query::{LabelMatcher, MatchOp};
 use crate::store::reader::{
-    PreparedTagPredicate, ScanDecodeLimits, ScanRequest, ScanTimeRange, StorageReader,
-    TagPredicate, TagPredicateOp,
+    FloatSeriesScanResult, PreparedTagPredicate, ScanDecodeLimits, ScanRequest, ScanTimeRange,
+    StorageReader, TagPredicate, TagPredicateOp,
 };
 use crate::store::seq::SequencedRow;
 use crate::{Result, TsmError};
 use limits::{ParsingLimits, QueryExecutionContext, QueryLimits};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// Prometheus's exact IEEE-754 staleness marker bit pattern.
 pub const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
@@ -408,33 +409,37 @@ impl<'a> Executor<'a> {
                 Ok(OperatorValue::InstantVector(vector))
             }
             PlanNode::Aggregate(node) => {
-                let input = self.evaluate_node(&node.input, output_timestamp)?;
-                let mut parameters = Vec::with_capacity(node.calls.len());
-                for call in &node.calls {
-                    let value = if let Some(parameter) = &call.parameter {
-                        match self.evaluate_node(parameter, output_timestamp)? {
-                            OperatorValue::Scalar(value) => Some(value),
-                            _ => {
-                                return Err(execution_error(
-                                    "aggregate parameters must evaluate to scalars",
-                                ));
+                if let Some(output) = self.try_float_time_bucket_aggregate(node)? {
+                    Ok(output)
+                } else {
+                    let input = self.evaluate_node(&node.input, output_timestamp)?;
+                    let mut parameters = Vec::with_capacity(node.calls.len());
+                    for call in &node.calls {
+                        let value = if let Some(parameter) = &call.parameter {
+                            match self.evaluate_node(parameter, output_timestamp)? {
+                                OperatorValue::Scalar(value) => Some(value),
+                                _ => {
+                                    return Err(execution_error(
+                                        "aggregate parameters must evaluate to scalars",
+                                    ));
+                                }
                             }
-                        }
-                    } else {
-                        None
-                    };
-                    parameters.push(value);
+                        } else {
+                            None
+                        };
+                        parameters.push(value);
+                    }
+                    let output =
+                        aggregate::evaluate_aggregate(input, node, &parameters, output_timestamp)?;
+                    if let OperatorValue::InstantVector(vector) = &output {
+                        check_limit(
+                            vector.len(),
+                            self.context.limits().execution().max_output_samples(),
+                            "aggregate output samples",
+                        )?;
+                    }
+                    Ok(output)
                 }
-                let output =
-                    aggregate::evaluate_aggregate(input, node, &parameters, output_timestamp)?;
-                if let OperatorValue::InstantVector(vector) = &output {
-                    check_limit(
-                        vector.len(),
-                        self.context.limits().execution().max_output_samples(),
-                        "aggregate output samples",
-                    )?;
-                }
-                Ok(output)
             }
             PlanNode::Binary(node) => {
                 let left = self.evaluate_node(&node.left, output_timestamp)?;
@@ -460,6 +465,75 @@ impl<'a> Executor<'a> {
         };
         self.context.check()?;
         result
+    }
+
+    fn try_float_time_bucket_aggregate(
+        &self,
+        node: &crate::query::plan::AggregateNode,
+    ) -> Result<Option<OperatorValue>> {
+        let Some((scan, field, interval_ns)) = aggregate::float_time_bucket_scan(node) else {
+            return Ok(None);
+        };
+        let Some(time_range) = storage_time_range(scan.time_range)? else {
+            let empty = FloatSeriesScanResult::new(Vec::new(), Default::default());
+            return aggregate::aggregate_float_time_buckets(&empty, node, interval_ns).map(Some);
+        };
+        let measurement = scan
+            .measurement
+            .exact
+            .as_deref()
+            .ok_or_else(|| execution_error("float scan requires one exact measurement"))?;
+        let parsing_limits = self.context.limits().parsing();
+        let predicates = scan
+            .tag_equalities
+            .iter()
+            .map(to_tag_predicate)
+            .collect::<Result<Vec<_>>>()?;
+        for predicate in &predicates {
+            predicate.prepare_with_limits(
+                parsing_limits.max_regex_bytes(),
+                parsing_limits.max_regex_automaton_bytes(),
+            )?;
+        }
+        let scan_limits = self.context.limits().scan();
+        let request = ScanRequest::new(measurement, time_range)
+            .with_field_projection([field])
+            .with_tag_predicates(predicates)
+            .with_decode_limits(ScanDecodeLimits::new(
+                scan_limits.max_decoded_rows(),
+                scan_limits.max_decoded_bytes(),
+            ));
+        self.context.check()?;
+        let Some(result) = self.reader.try_scan_float_series(&request, field)? else {
+            return Ok(None);
+        };
+        self.context.check()?;
+        check_limit(
+            result.stats().decoded_rows(),
+            scan_limits.max_decoded_rows(),
+            "query decoded rows",
+        )?;
+        check_limit(
+            result.stats().decoded_bytes(),
+            scan_limits.max_decoded_bytes(),
+            "query decoded bytes",
+        )?;
+        check_limit(
+            result.series().len(),
+            scan_limits.max_series_expansion(),
+            "series expansion",
+        )?;
+        let point_count = result.series().iter().try_fold(0_usize, |total, series| {
+            total.checked_add(series.points().len()).ok_or_else(|| {
+                TsmError::ResourceLimit("float scan point count overflows".to_string())
+            })
+        })?;
+        check_limit(
+            point_count,
+            self.context.limits().execution().max_intermediate_rows(),
+            "float scan result rows",
+        )?;
+        aggregate::aggregate_float_time_buckets(result.as_ref(), node, interval_ns).map(Some)
     }
 
     fn scan(&self, scan: &ScanNode) -> Result<OperatorValue> {
@@ -561,7 +635,7 @@ impl<'a> Executor<'a> {
             )?;
             let mut scanned = result.into_rows();
             for row in &scanned {
-                expanded_series.insert(row.row().series().clone());
+                expanded_series.insert(row.row().shared_series());
                 check_limit(
                     expanded_series.len(),
                     scan_limits.max_series_expansion(),
@@ -663,7 +737,7 @@ impl<'a> Executor<'a> {
             .evaluation_time
             .checked_sub(window.duration_ns)
             .ok_or_else(|| execution_error("instant lookback lower bound overflows"))?;
-        let mut latest: BTreeMap<SeriesKey, (Timestamp, u64, f64)> = BTreeMap::new();
+        let mut latest: BTreeMap<Arc<SeriesKey>, (Timestamp, u64, f64)> = BTreeMap::new();
         for row in rows {
             let timestamp = row.row().timestamp();
             if timestamp <= lower || timestamp > window.evaluation_time {
@@ -673,9 +747,7 @@ impl<'a> Executor<'a> {
                 continue;
             };
             let candidate = (timestamp, row.ingest_seq().get(), value);
-            let entry = latest
-                .entry(row.row().series().clone())
-                .or_insert(candidate);
+            let entry = latest.entry(row.row().shared_series()).or_insert(candidate);
             if (candidate.0, candidate.1) > (entry.0, entry.1) {
                 *entry = candidate;
             }
@@ -689,7 +761,7 @@ impl<'a> Executor<'a> {
             .into_iter()
             .filter_map(|(series, (source_timestamp, _, value))| {
                 (!is_stale_nan(value)).then_some(InstantSample {
-                    series,
+                    series: (*series).clone(),
                     evaluation_timestamp: output_timestamp,
                     source_timestamp,
                     value,
@@ -715,7 +787,7 @@ impl<'a> Executor<'a> {
             .evaluation_time
             .checked_sub(window.duration_ns)
             .ok_or_else(|| execution_error("range-vector lower bound overflows"))?;
-        let mut grouped: BTreeMap<SeriesKey, Vec<FloatSample>> = BTreeMap::new();
+        let mut grouped: BTreeMap<Arc<SeriesKey>, Vec<FloatSample>> = BTreeMap::new();
         let mut sample_count = 0usize;
         for row in rows {
             let timestamp = row.row().timestamp();
@@ -737,14 +809,17 @@ impl<'a> Executor<'a> {
                 "range-vector samples",
             )?;
             grouped
-                .entry(row.row().series().clone())
+                .entry(row.row().shared_series())
                 .or_default()
                 .push(FloatSample::new(timestamp, value));
         }
         Ok(OperatorValue::RangeVector(RangeVectorValue {
             series: grouped
                 .into_iter()
-                .map(|(series, samples)| RangeSeries { series, samples })
+                .map(|(series, samples)| RangeSeries {
+                    series: (*series).clone(),
+                    samples,
+                })
                 .collect(),
             window,
         }))

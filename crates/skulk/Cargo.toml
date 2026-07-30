@@ -68,6 +68,15 @@ harness = false
 name = "ingest_bench"
 harness = false
 
+[[bench]]
+name = "query_bench"
+harness = false
+
+[[example]]
+name = "query_footprint"
+path = "examples/query_footprint.rs"
+required-features = ["promql", "sql-ts"]
+
 [[test]]
 name = "build_script_contract"
 path = "build_support.rs"

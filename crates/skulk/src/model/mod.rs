@@ -167,6 +167,10 @@ impl WideRow {
         self.series_id
     }
 
+    pub(crate) fn shared_series(&self) -> Arc<SeriesKey> {
+        Arc::clone(&self.series)
+    }
+
     /// Returns the nanosecond timestamp.
     pub const fn timestamp(&self) -> Timestamp {
         self.timestamp

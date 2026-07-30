@@ -5,7 +5,15 @@ use alopex_skulk::query::exec::{Executor, TableValue};
 use alopex_skulk::query::plan::{plan_sql, PlanContext};
 use alopex_skulk::query::sqlts::parse;
 use alopex_skulk::query::sqlts::typecheck::typecheck;
+use alopex_skulk::query::QueryEngine;
+use alopex_skulk::store::reader::{
+    FloatSeriesScanResult, ScanRequest, ScanResult, ScanTimeRange, StorageReader,
+};
 use alopex_skulk::store::recovery::{RecoveryConfig, RecoveryStore};
+use alopex_skulk::store::schema::MeasurementSchema;
+use alopex_skulk::Result;
+use std::cell::Cell;
+use std::sync::Arc;
 
 const SECOND: i64 = 1_000_000_000;
 
@@ -52,6 +60,238 @@ fn assert_float(value: &TableValue, expected: f64) {
         (*actual - expected).abs() <= expected.abs().max(1.0) * 1e-12,
         "expected {expected}, got {actual}"
     );
+}
+
+struct TrackingReader<'a> {
+    inner: &'a RecoveryStore,
+    row_scans: Cell<usize>,
+    float_series_scans: Cell<usize>,
+}
+
+impl<'a> TrackingReader<'a> {
+    fn new(inner: &'a RecoveryStore) -> Self {
+        Self {
+            inner,
+            row_scans: Cell::new(0),
+            float_series_scans: Cell::new(0),
+        }
+    }
+}
+
+impl StorageReader for TrackingReader<'_> {
+    fn scan(&self, request: &ScanRequest) -> Result<ScanResult> {
+        self.row_scans.set(self.row_scans.get() + 1);
+        self.inner.scan(request)
+    }
+
+    fn try_scan_float_series(
+        &self,
+        request: &ScanRequest,
+        field: &str,
+    ) -> Result<Option<Arc<FloatSeriesScanResult>>> {
+        self.float_series_scans
+            .set(self.float_series_scans.get() + 1);
+        self.inner.try_scan_float_series(request, field)
+    }
+
+    fn measurement_schema(&self, measurement: &str) -> Result<MeasurementSchema> {
+        self.inner.measurement_schema(measurement)
+    }
+}
+
+struct RowOnlyReader<'a> {
+    inner: &'a RecoveryStore,
+}
+
+impl StorageReader for RowOnlyReader<'_> {
+    fn scan(&self, request: &ScanRequest) -> Result<ScanResult> {
+        self.inner.scan(request)
+    }
+
+    fn measurement_schema(&self, measurement: &str) -> Result<MeasurementSchema> {
+        self.inner.measurement_schema(measurement)
+    }
+}
+
+#[test]
+fn sql_time_bucket_float_average_uses_the_lightweight_series_scan() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut store =
+        RecoveryStore::open(root.path(), RecoveryConfig::default()).expect("open store");
+    for (timestamp, value) in [(SECOND, 1.0), (11 * SECOND, 3.0), (21 * SECOND, 5.0)] {
+        ingest(&mut store, "edge", timestamp, value, 1, value, "up");
+    }
+    let reader = TrackingReader::new(&store);
+    let result = QueryEngine::new(&reader)
+        .query_sql(
+            "SELECT TIME_BUCKET('10 seconds', time) AS bucket, \
+             AVG(value) AS average FROM metrics \
+             WHERE time > NOW() - INTERVAL '30 seconds' \
+             GROUP BY bucket",
+            30 * SECOND,
+        )
+        .expect("time-bucket average");
+
+    assert_eq!(
+        result
+            .batches()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        3
+    );
+    assert_eq!(reader.float_series_scans.get(), 1);
+    assert_eq!(
+        reader.row_scans.get(),
+        0,
+        "optimized aggregate must not materialize WideRow values"
+    );
+}
+
+#[test]
+fn recovery_store_reuses_float_scan_until_storage_generation_changes() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut store =
+        RecoveryStore::open(root.path(), RecoveryConfig::default()).expect("open store");
+    ingest(&mut store, "edge", SECOND, 1.0, 1, 1.0, "up");
+    store.flush_all().expect("flush cached row");
+    let request =
+        ScanRequest::new("metrics", ScanTimeRange::all()).with_field_projection(["value"]);
+
+    let first = store
+        .try_scan_float_series(&request, "value")
+        .expect("first float scan")
+        .expect("float-compatible field");
+    let second = store
+        .try_scan_float_series(&request, "value")
+        .expect("second float scan")
+        .expect("float-compatible field");
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "unchanged storage generation should reuse decoded float points"
+    );
+
+    ingest(&mut store, "edge", 2 * SECOND, 2.0, 1, 2.0, "up");
+    let changed = store
+        .try_scan_float_series(&request, "value")
+        .expect("changed float scan")
+        .expect("float-compatible field");
+    assert!(!Arc::ptr_eq(&second, &changed));
+    assert_eq!(
+        changed
+            .series()
+            .iter()
+            .map(|series| series.points().len())
+            .sum::<usize>(),
+        2
+    );
+}
+
+#[test]
+fn lightweight_float_scan_matches_row_path_for_sparse_latest_write() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut store =
+        RecoveryStore::open(root.path(), RecoveryConfig::default()).expect("open store");
+    ingest(&mut store, "edge", SECOND, 10.0, 1, 1.0, "original");
+    store.flush_all().expect("flush original");
+    store
+        .ingest(WideRow::new(
+            SeriesKey::new(
+                "metrics",
+                Tags::from([("host".to_string(), "edge".to_string())]),
+            ),
+            SECOND,
+            Fields::from([(
+                "status".to_string(),
+                FieldValue::String("sparse overwrite".to_string()),
+            )]),
+        ))
+        .expect("ingest sparse overwrite");
+
+    let sql = "SELECT TIME_BUCKET('10 seconds', time) AS bucket, \
+               AVG(value) AS average FROM metrics GROUP BY bucket";
+    let logical = plan(&store, sql);
+    let optimized = Executor::new(&store)
+        .execute_table(&logical)
+        .expect("optimized sparse aggregate");
+    let row_reader = RowOnlyReader { inner: &store };
+    let row_path = Executor::new(&row_reader)
+        .execute_table(&logical)
+        .expect("row sparse aggregate");
+
+    assert_eq!(optimized, row_path);
+    assert_eq!(optimized.rows().len(), 1);
+    assert_eq!(optimized.rows()[0][1], TableValue::Null);
+}
+
+#[test]
+fn lightweight_float_aggregates_match_row_path_across_series_and_negative_buckets() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut store =
+        RecoveryStore::open(root.path(), RecoveryConfig::default()).expect("open store");
+    for row in [
+        ("edge-a", -11, 1.0),
+        ("edge-a", -1, 3.0),
+        ("edge-b", 1, 5.0),
+        ("edge-b", 9, 7.0),
+        ("edge-a", 11, 9.0),
+    ] {
+        ingest(
+            &mut store,
+            row.0,
+            row.1 * SECOND,
+            row.2,
+            1,
+            row.2,
+            "durable",
+        );
+    }
+    store.flush_all().expect("flush durable rows");
+    ingest(&mut store, "edge-b", 9 * SECOND, 11.0, 1, 11.0, "latest");
+
+    let sql = "SELECT TIME_BUCKET('10 seconds', time) AS bucket, \
+               AVG(value) AS average, SUM(value) AS total, \
+               MIN(value) AS minimum, MAX(value) AS maximum, \
+               COUNT(value) AS samples FROM metrics GROUP BY bucket";
+    let logical = plan(&store, sql);
+    let optimized = Executor::new(&store)
+        .execute_table(&logical)
+        .expect("optimized float aggregates");
+    let row_reader = RowOnlyReader { inner: &store };
+    let row_path = Executor::new(&row_reader)
+        .execute_table(&logical)
+        .expect("row float aggregates");
+
+    assert_eq!(optimized, row_path);
+    assert_eq!(optimized.rows().len(), 4);
+}
+
+#[test]
+fn non_float_time_bucket_average_falls_back_to_row_scan() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut store =
+        RecoveryStore::open(root.path(), RecoveryConfig::default()).expect("open store");
+    ingest(&mut store, "edge", SECOND, 1.0, 4, 1.0, "up");
+    let reader = TrackingReader::new(&store);
+
+    let result = QueryEngine::new(&reader)
+        .query_sql(
+            "SELECT TIME_BUCKET('10 seconds', time) AS bucket, \
+             AVG(events) AS average FROM metrics GROUP BY bucket",
+            30 * SECOND,
+        )
+        .expect("integer average fallback");
+
+    assert_eq!(
+        result
+            .batches()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        1
+    );
+    assert_eq!(reader.float_series_scans.get(), 1);
+    assert_eq!(reader.row_scans.get(), 1);
 }
 
 #[test]
