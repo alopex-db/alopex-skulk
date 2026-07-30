@@ -1,4 +1,7 @@
+use std::fs;
 use std::path::{Path, PathBuf};
+
+pub(crate) const NIM_PARSER_CONTRACT_VERSION: &str = "0.2.0";
 
 pub(crate) const VENDORED_TARGETS: [&str; 4] = [
     "x86_64-unknown-linux-gnu",
@@ -49,6 +52,25 @@ pub(crate) fn resolve_library_dir(
 
     let vendored = manifest_dir.join("nim-parser/vendor").join(target);
     Ok(vendored.join(filename).is_file().then_some(vendored))
+}
+
+pub(crate) fn validate_contract_version_file(library_dir: &Path) -> Result<(), String> {
+    let path = library_dir.join("CONTRACT_VERSION");
+    let actual = fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "failed to read Nim parser contract version `{}`: {error}",
+            path.display()
+        )
+    })?;
+    let actual = actual.trim();
+    if actual == NIM_PARSER_CONTRACT_VERSION {
+        Ok(())
+    } else {
+        Err(format!(
+            "Nim parser artifact `{}` declares contract `{actual}`, but Skulk supports `{NIM_PARSER_CONTRACT_VERSION}`",
+            library_dir.display()
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +193,25 @@ mod tests {
             .unwrap(),
             None
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn contract_version_file_must_exist_and_match_the_supported_version() {
+        let root = scratch_dir("contract-version");
+        assert!(validate_contract_version_file(&root).is_err());
+
+        fs::write(root.join("CONTRACT_VERSION"), "9.9.9\n").unwrap();
+        let mismatch = validate_contract_version_file(&root).unwrap_err();
+        assert!(mismatch.contains("9.9.9"));
+        assert!(mismatch.contains(NIM_PARSER_CONTRACT_VERSION));
+
+        fs::write(
+            root.join("CONTRACT_VERSION"),
+            format!("{NIM_PARSER_CONTRACT_VERSION}\n"),
+        )
+        .unwrap();
+        validate_contract_version_file(&root).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 }

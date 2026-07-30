@@ -5,15 +5,15 @@
 //! 1. `SKULK_NIM_PARSER_LIB_DIR` (development / CI override)
 //! 2. `crates/skulk/nim-parser/vendor/<target-triple>/`
 //!
-//! Missing artifacts are tolerated until the Nim parser lands (spec task 3.1):
-//! nothing links against the library before the FFI bridge exists. Once it
-//! does, the final executable's build script receives the directory via
-//! `DEP_SKULK_NIM_PARSER_LIBDIR` and is responsible for setting an rpath
-//! (same convention as alopex-cli with alopex-sql).
+//! Frontend-enabled builds require both the target artifact and its declared
+//! contract version. Core-only builds return before resolving either one.
 
 mod build_support;
 
-use build_support::{nim_lib_filename_for, resolve_library_dir};
+use build_support::{
+    nim_lib_filename_for, resolve_library_dir, validate_contract_version_file,
+    NIM_PARSER_CONTRACT_VERSION,
+};
 use std::env;
 use std::path::PathBuf;
 
@@ -37,11 +37,6 @@ fn main() {
         .unwrap_or(&vendored_dir)
         .join(lib_filename);
     println!("cargo:rerun-if-changed={}", lib_path.display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        vendored_dir.join("CONTRACT_VERSION").display()
-    );
-
     let lib_dir = resolve_library_dir(
         &manifest_dir,
         &target,
@@ -49,9 +44,18 @@ fn main() {
         override_dir.as_deref(),
     )
     .unwrap_or_else(|error| panic!("{error} (target={target})"));
-    let Some(lib_dir) = lib_dir else {
-        return;
-    };
+    let lib_dir = lib_dir.unwrap_or_else(|| {
+        panic!(
+            "Nim query parser artifact `{}` is required when `promql` or `sql-ts` is enabled \
+             (target={target})",
+            lib_path.display()
+        )
+    });
+    let contract_path = lib_dir.join("CONTRACT_VERSION");
+    println!("cargo:rerun-if-changed={}", contract_path.display());
+    validate_contract_version_file(&lib_dir)
+        .unwrap_or_else(|error| panic!("{error} (target={target})"));
+    println!("cargo:rustc-env=SKULK_NIM_PARSER_CONTRACT_VERSION={NIM_PARSER_CONTRACT_VERSION}");
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     if target_os != "windows" {
