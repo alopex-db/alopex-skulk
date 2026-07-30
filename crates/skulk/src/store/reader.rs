@@ -124,7 +124,8 @@ impl TagPredicate {
         &self.value
     }
 
-    fn prepare(&self) -> Result<PreparedTagPredicate> {
+    /// Compiles and validates this predicate once for repeated row evaluation.
+    pub fn prepare(&self) -> Result<PreparedTagPredicate> {
         if self.name.is_empty() {
             return Err(TsmError::InvalidInput(
                 "tag predicate name must be non-empty".into(),
@@ -172,14 +173,26 @@ enum PreparedTagPredicateOp {
     NotRegex(Regex),
 }
 
-struct PreparedTagPredicate {
+/// A validated tag predicate ready for repeated matching.
+pub struct PreparedTagPredicate {
     name: String,
     operation: PreparedTagPredicateOp,
 }
 
 impl PreparedTagPredicate {
-    fn matches(&self, tags: &Tags) -> bool {
+    /// Returns the tag name inspected by this predicate.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Matches canonical tags, treating an absent tag as the empty string.
+    pub fn matches(&self, tags: &Tags) -> bool {
         let value = tags.get(&self.name).map_or("", String::as_str);
+        self.matches_value(value)
+    }
+
+    /// Matches one already-resolved label value.
+    pub fn matches_value(&self, value: &str) -> bool {
         match &self.operation {
             PreparedTagPredicateOp::Equal(expected) => value == expected,
             PreparedTagPredicateOp::NotEqual(expected) => value != expected,
@@ -399,6 +412,11 @@ pub struct ScanResult {
 }
 
 impl ScanResult {
+    /// Creates a scan result for custom local or distributed reader implementations.
+    pub const fn new(rows: Vec<SequencedRow>, stats: ScanStats) -> Self {
+        Self { rows, stats }
+    }
+
     /// Returns the rows that survived exact timestamp filtering.
     pub fn rows(&self) -> &[SequencedRow] {
         &self.rows
