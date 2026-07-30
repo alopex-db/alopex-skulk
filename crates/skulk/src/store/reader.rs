@@ -127,6 +127,20 @@ impl TagPredicate {
 
     /// Compiles and validates this predicate once for repeated row evaluation.
     pub fn prepare(&self) -> Result<PreparedTagPredicate> {
+        self.prepare_with_limits(MAX_TAG_REGEX_BYTES, MAX_TAG_REGEX_AUTOMATON_BYTES)
+    }
+
+    /// Compiles this predicate using query-specific regex source and automaton limits.
+    pub fn prepare_with_limits(
+        &self,
+        max_regex_bytes: usize,
+        max_regex_automaton_bytes: usize,
+    ) -> Result<PreparedTagPredicate> {
+        if max_regex_bytes == 0 || max_regex_automaton_bytes == 0 {
+            return Err(TsmError::InvalidInput(
+                "tag regular-expression limits must be non-zero".to_string(),
+            ));
+        }
         if self.name.is_empty() {
             return Err(TsmError::InvalidInput(
                 "tag predicate name must be non-empty".into(),
@@ -136,22 +150,25 @@ impl TagPredicate {
             TagPredicateOp::Equal => PreparedTagPredicateOp::Equal(self.value.clone()),
             TagPredicateOp::NotEqual => PreparedTagPredicateOp::NotEqual(self.value.clone()),
             TagPredicateOp::Regex | TagPredicateOp::NotRegex => {
-                if self.value.len() > MAX_TAG_REGEX_BYTES {
+                if self.value.len() > max_regex_bytes {
                     return Err(TsmError::ResourceLimit(format!(
-                        "tag regular expression has {} bytes, limit is {MAX_TAG_REGEX_BYTES}",
+                        "tag regular expression has {} bytes, limit is {max_regex_bytes}",
                         self.value.len()
                     )));
                 }
                 let anchored = format!(r"\A(?:{})\z", self.value);
                 let regex = RegexBuilder::new(&anchored)
-                    .size_limit(MAX_TAG_REGEX_AUTOMATON_BYTES)
-                    .dfa_size_limit(MAX_TAG_REGEX_AUTOMATON_BYTES)
+                    .size_limit(max_regex_automaton_bytes)
+                    .dfa_size_limit(max_regex_automaton_bytes)
                     .build()
-                    .map_err(|error| {
-                        TsmError::InvalidInput(format!(
-                            "invalid tag regular expression '{}': {error}",
+                    .map_err(|error| match error {
+                        regex::Error::CompiledTooBig(limit) => TsmError::ResourceLimit(format!(
+                            "tag regular expression exceeded the {limit}-byte compiled-size limit"
+                        )),
+                        other => TsmError::InvalidInput(format!(
+                            "invalid tag regular expression '{}': {other}",
                             self.value
-                        ))
+                        )),
                     })?;
                 if self.op == TagPredicateOp::Regex {
                     PreparedTagPredicateOp::Regex(regex)
@@ -217,6 +234,7 @@ pub struct ScanRequest {
     time_range: ScanTimeRange,
     field_projection: Option<BTreeSet<String>>,
     tag_predicates: Vec<TagPredicate>,
+    decode_limits: Option<ScanDecodeLimits>,
 }
 
 impl ScanRequest {
@@ -227,6 +245,7 @@ impl ScanRequest {
             time_range,
             field_projection: None,
             tag_predicates: Vec::new(),
+            decode_limits: None,
         }
     }
 
@@ -249,6 +268,12 @@ impl ScanRequest {
         self
     }
 
+    /// Narrows post-pruning decode limits for this request.
+    pub fn with_decode_limits(mut self, limits: ScanDecodeLimits) -> Self {
+        self.decode_limits = Some(limits);
+        self
+    }
+
     /// Returns the requested measurement name.
     pub fn measurement(&self) -> &str {
         &self.measurement
@@ -267,6 +292,38 @@ impl ScanRequest {
     /// Returns the conjunctive tag predicates.
     pub fn tag_predicates(&self) -> &[TagPredicate] {
         &self.tag_predicates
+    }
+
+    /// Returns query-specific decode limits, when narrower limits were requested.
+    pub const fn decode_limits(&self) -> Option<ScanDecodeLimits> {
+        self.decode_limits
+    }
+}
+
+/// Query-specific limits charged after pruning and before Parquet decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanDecodeLimits {
+    max_decoded_rows: usize,
+    max_decoded_bytes: usize,
+}
+
+impl ScanDecodeLimits {
+    /// Creates post-pruning decode limits; zero prohibits that resource.
+    pub const fn new(max_decoded_rows: usize, max_decoded_bytes: usize) -> Self {
+        Self {
+            max_decoded_rows,
+            max_decoded_bytes,
+        }
+    }
+
+    /// Returns the post-pruning row limit.
+    pub const fn max_decoded_rows(self) -> usize {
+        self.max_decoded_rows
+    }
+
+    /// Returns the projected compressed-byte limit.
+    pub const fn max_decoded_bytes(self) -> usize {
+        self.max_decoded_bytes
     }
 }
 
@@ -317,6 +374,17 @@ impl StorageReaderConfig {
     /// Returns the maximum projected compressed bytes passed to the decoder.
     pub const fn max_decoded_bytes(&self) -> usize {
         self.max_decoded_bytes
+    }
+
+    fn constrained_by(self, limits: Option<ScanDecodeLimits>) -> Self {
+        let Some(limits) = limits else {
+            return self;
+        };
+        Self {
+            batch_rows: self.batch_rows,
+            max_decoded_rows: self.max_decoded_rows.min(limits.max_decoded_rows()),
+            max_decoded_bytes: self.max_decoded_bytes.min(limits.max_decoded_bytes()),
+        }
     }
 }
 
@@ -499,6 +567,7 @@ impl StorageReader for ManifestStorageReader<'_> {
 
         let mut stats = ScanStats::default();
         let mut rows = Vec::new();
+        let config = self.config.constrained_by(request.decode_limits());
         for active_file in self
             .manifest
             .active_files()
@@ -521,7 +590,7 @@ impl StorageReader for ManifestStorageReader<'_> {
                 &self.segments_dir,
                 request,
                 &tag_predicates,
-                self.config,
+                config,
                 &mut stats,
                 &mut rows,
             )?;

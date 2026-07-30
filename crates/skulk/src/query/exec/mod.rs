@@ -2,8 +2,10 @@
 
 mod aggregate;
 mod functions;
+pub mod limits;
 
 pub use aggregate::{TableColumn, TableResult, TableValue};
+pub use limits::ExecutionLimits as ExecutorConfig;
 
 use crate::model::{FieldValue, SeriesKey, Timestamp};
 use crate::query::plan::{
@@ -12,10 +14,12 @@ use crate::query::plan::{
 };
 use crate::query::{LabelMatcher, MatchOp};
 use crate::store::reader::{
-    PreparedTagPredicate, ScanRequest, ScanTimeRange, StorageReader, TagPredicate, TagPredicateOp,
+    PreparedTagPredicate, ScanDecodeLimits, ScanRequest, ScanTimeRange, StorageReader,
+    TagPredicate, TagPredicateOp,
 };
 use crate::store::seq::SequencedRow;
 use crate::{Result, TsmError};
+use limits::{ParsingLimits, QueryExecutionContext, QueryLimits};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Prometheus's exact IEEE-754 staleness marker bit pattern.
@@ -77,62 +81,6 @@ impl EvaluationRange {
             .ok_or_else(|| TsmError::ResourceLimit("range step count overflows".to_string()))?;
         usize::try_from(count)
             .map_err(|_| TsmError::ResourceLimit("range step count exceeds usize".to_string()))
-    }
-}
-
-/// Allocation limits applied at executor operator boundaries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExecutorConfig {
-    max_intermediate_rows: usize,
-    max_output_samples: usize,
-    max_range_steps: usize,
-}
-
-impl ExecutorConfig {
-    /// Embedded defaults, bounded independently from StorageReader decode limits.
-    pub const DEFAULT: Self = Self {
-        max_intermediate_rows: 1_000_000,
-        max_output_samples: 1_000_000,
-        max_range_steps: 100_000,
-    };
-
-    /// Creates a configuration whose limits must all be non-zero.
-    pub fn new(
-        max_intermediate_rows: usize,
-        max_output_samples: usize,
-        max_range_steps: usize,
-    ) -> Result<Self> {
-        if max_intermediate_rows == 0 || max_output_samples == 0 || max_range_steps == 0 {
-            return Err(TsmError::InvalidInput(
-                "executor row, output, and range-step limits must be non-zero".to_string(),
-            ));
-        }
-        Ok(Self {
-            max_intermediate_rows,
-            max_output_samples,
-            max_range_steps,
-        })
-    }
-
-    /// Returns the per-operator input row/sample limit.
-    pub const fn max_intermediate_rows(self) -> usize {
-        self.max_intermediate_rows
-    }
-
-    /// Returns the complete query output sample limit.
-    pub const fn max_output_samples(self) -> usize {
-        self.max_output_samples
-    }
-
-    /// Returns the maximum number of inclusive range evaluations.
-    pub const fn max_range_steps(self) -> usize {
-        self.max_range_steps
-    }
-}
-
-impl Default for ExecutorConfig {
-    fn default() -> Self {
-        Self::DEFAULT
     }
 }
 
@@ -276,7 +224,7 @@ pub enum ExecutionValue {
 /// Logical-plan executor depending only on the read-only StorageReader contract.
 pub struct Executor<'a> {
     reader: &'a dyn StorageReader,
-    config: ExecutorConfig,
+    context: QueryExecutionContext,
 }
 
 impl<'a> Executor<'a> {
@@ -284,13 +232,23 @@ impl<'a> Executor<'a> {
     pub fn new(reader: &'a dyn StorageReader) -> Self {
         Self {
             reader,
-            config: ExecutorConfig::default(),
+            context: QueryExecutionContext::with_default_timeout(QueryLimits::DEFAULT),
         }
     }
 
     /// Creates an executor with explicit non-zero limits.
-    pub const fn with_config(reader: &'a dyn StorageReader, config: ExecutorConfig) -> Self {
-        Self { reader, config }
+    pub fn with_config(reader: &'a dyn StorageReader, config: ExecutorConfig) -> Self {
+        Self {
+            reader,
+            context: QueryExecutionContext::with_default_timeout(
+                QueryLimits::DEFAULT.with_execution(config),
+            ),
+        }
+    }
+
+    /// Creates an executor sharing one query-wide limit/deadline/cancellation context.
+    pub fn with_context(reader: &'a dyn StorageReader, context: QueryExecutionContext) -> Self {
+        Self { reader, context }
     }
 
     /// Evaluates the currently implemented operator subset.
@@ -299,7 +257,8 @@ impl<'a> Executor<'a> {
         plan: &LogicalPlan,
         output_timestamp: Timestamp,
     ) -> Result<ExecutionValue> {
-        match self.evaluate_node(&plan.root, output_timestamp)? {
+        self.context.check()?;
+        let result = match self.evaluate_node(&plan.root, output_timestamp)? {
             OperatorValue::Scalar(value) => Ok(ExecutionValue::Scalar(ScalarSample {
                 timestamp: output_timestamp,
                 value,
@@ -312,7 +271,9 @@ impl<'a> Executor<'a> {
                     "logical plan did not produce its public result type",
                 ))
             }
-        }
+        };
+        self.context.check()?;
+        result
     }
 
     /// Executes a schema-preserving SQL table plan.
@@ -368,7 +329,7 @@ impl<'a> Executor<'a> {
         let step_count = range.step_count()?;
         check_limit(
             step_count,
-            self.config.max_range_steps,
+            self.context.limits().execution().max_range_steps(),
             "range evaluation steps",
         )?;
 
@@ -376,6 +337,7 @@ impl<'a> Executor<'a> {
         let mut output_samples = 0usize;
         let mut timestamp = range.start;
         loop {
+            self.context.check()?;
             let mut step_plan = plan_at_start.clone();
             rebase_node(&mut step_plan.root, range.start, timestamp)?;
             let vector = self.execute_instant(&step_plan, timestamp)?;
@@ -384,7 +346,7 @@ impl<'a> Executor<'a> {
             })?;
             check_limit(
                 output_samples,
-                self.config.max_output_samples,
+                self.context.limits().execution().max_output_samples(),
                 "range output samples",
             )?;
             for sample in vector {
@@ -402,6 +364,7 @@ impl<'a> Executor<'a> {
             }
             timestamp = next;
         }
+        self.context.check()?;
         Ok(matrix
             .into_iter()
             .map(|((series, drop_metric_name), samples)| MatrixSeries {
@@ -413,7 +376,8 @@ impl<'a> Executor<'a> {
     }
 
     fn evaluate_node(&self, node: &PlanNode, output_timestamp: Timestamp) -> Result<OperatorValue> {
-        match node {
+        self.context.check()?;
+        let result = match node {
             PlanNode::Scan(scan) => self.scan(scan),
             PlanNode::Filter(filter) => {
                 let input = self.evaluate_node(&filter.input, output_timestamp)?;
@@ -438,7 +402,7 @@ impl<'a> Executor<'a> {
                 let vector = functions::evaluate(function.function, range, output_timestamp);
                 check_limit(
                     vector.len(),
-                    self.config.max_output_samples,
+                    self.context.limits().execution().max_output_samples(),
                     "range-function output samples",
                 )?;
                 Ok(OperatorValue::InstantVector(vector))
@@ -466,7 +430,7 @@ impl<'a> Executor<'a> {
                 if let OperatorValue::InstantVector(vector) = &output {
                     check_limit(
                         vector.len(),
-                        self.config.max_output_samples,
+                        self.context.limits().execution().max_output_samples(),
                         "aggregate output samples",
                     )?;
                 }
@@ -493,10 +457,13 @@ impl<'a> Executor<'a> {
             PlanNode::String(_) => Err(unsupported_operator(
                 "standalone string plan nodes are not executable values",
             )),
-        }
+        };
+        self.context.check()?;
+        result
     }
 
     fn scan(&self, scan: &ScanNode) -> Result<OperatorValue> {
+        self.context.check()?;
         if !scan.resolution.is_raw() {
             return Err(unsupported_operator(format!(
                 "StorageReader has no v0.4 adapter for resolution `{}`",
@@ -515,38 +482,98 @@ impl<'a> Executor<'a> {
         };
         measurements.sort();
         measurements.dedup();
+        let scan_limits = self.context.limits().scan();
+        check_limit(
+            measurements.len(),
+            scan_limits.max_series_expansion(),
+            "measurement expansion",
+        )?;
         let measurement_predicates = scan
             .measurement
             .matchers
             .iter()
-            .map(|matcher| to_tag_predicate(matcher)?.prepare())
+            .map(|matcher| {
+                let limits = self.context.limits().parsing();
+                to_tag_predicate(matcher)?.prepare_with_limits(
+                    limits.max_regex_bytes(),
+                    limits.max_regex_automaton_bytes(),
+                )
+            })
             .collect::<Result<Vec<PreparedTagPredicate>>>()?;
         let predicates = scan
             .tag_equalities
             .iter()
             .map(to_tag_predicate)
             .collect::<Result<Vec<_>>>()?;
+        let parsing_limits = self.context.limits().parsing();
+        for predicate in &predicates {
+            predicate.prepare_with_limits(
+                parsing_limits.max_regex_bytes(),
+                parsing_limits.max_regex_automaton_bytes(),
+            )?;
+        }
 
         let mut rows = Vec::new();
+        let mut expanded_series = BTreeSet::new();
+        let mut decoded_rows = 0usize;
+        let mut decoded_bytes = 0usize;
         for measurement in measurements {
+            self.context.check()?;
             if !measurement_predicates
                 .iter()
                 .all(|predicate| predicate.matches_value(&measurement))
             {
                 continue;
             }
-            let mut request = ScanRequest::new(measurement, time_range);
+            let decode_limits = ScanDecodeLimits::new(
+                scan_limits.max_decoded_rows().saturating_sub(decoded_rows),
+                scan_limits
+                    .max_decoded_bytes()
+                    .saturating_sub(decoded_bytes),
+            );
+            let mut request =
+                ScanRequest::new(measurement, time_range).with_decode_limits(decode_limits);
             if let Some(fields) = &scan.field_projection {
                 request = request.with_field_projection(fields.iter().cloned());
             }
             request = request.with_tag_predicates(predicates.clone());
-            let mut scanned = self.reader.scan(&request)?.into_rows();
+            let result = self.reader.scan(&request)?;
+            self.context.check()?;
+            decoded_rows = decoded_rows
+                .checked_add(result.stats().decoded_rows())
+                .ok_or_else(|| {
+                    TsmError::ResourceLimit("query decoded row count overflows".to_string())
+                })?;
+            decoded_bytes = decoded_bytes
+                .checked_add(result.stats().decoded_bytes())
+                .ok_or_else(|| {
+                    TsmError::ResourceLimit("query decoded byte count overflows".to_string())
+                })?;
+            check_limit(
+                decoded_rows,
+                scan_limits.max_decoded_rows(),
+                "query decoded rows",
+            )?;
+            check_limit(
+                decoded_bytes,
+                scan_limits.max_decoded_bytes(),
+                "query decoded bytes",
+            )?;
+            let mut scanned = result.into_rows();
+            for row in &scanned {
+                expanded_series.insert(row.row().series().clone());
+                check_limit(
+                    expanded_series.len(),
+                    scan_limits.max_series_expansion(),
+                    "series expansion",
+                )?;
+            }
             let row_count = rows.len().checked_add(scanned.len()).ok_or_else(|| {
                 TsmError::ResourceLimit("scan result row count overflows".to_string())
             })?;
             check_limit(
                 row_count,
-                self.config.max_intermediate_rows,
+                self.context.limits().execution().max_intermediate_rows(),
                 "scan result rows",
             )?;
             rows.append(&mut scanned);
@@ -566,7 +593,10 @@ impl<'a> Executor<'a> {
         let prepared = predicates
             .iter()
             .filter_map(|predicate| match predicate {
-                PlanPredicate::Label(matcher) => Some(prepare_label_matcher(matcher)),
+                PlanPredicate::Label(matcher) => Some(prepare_label_matcher(
+                    matcher,
+                    self.context.limits().parsing(),
+                )),
                 PlanPredicate::Expression(_) => None,
             })
             .collect::<Result<Vec<_>>>()?;
@@ -591,7 +621,7 @@ impl<'a> Executor<'a> {
         rows.rows = filtered;
         check_limit(
             rows.rows.len(),
-            self.config.max_intermediate_rows,
+            self.context.limits().execution().max_intermediate_rows(),
             "filtered rows",
         )?;
         Ok(OperatorValue::Rows(rows))
@@ -652,7 +682,7 @@ impl<'a> Executor<'a> {
         }
         check_limit(
             latest.len(),
-            self.config.max_intermediate_rows,
+            self.context.limits().execution().max_intermediate_rows(),
             "instant grouped series",
         )?;
         let vector = latest
@@ -669,7 +699,7 @@ impl<'a> Executor<'a> {
             .collect::<Vec<_>>();
         check_limit(
             vector.len(),
-            self.config.max_output_samples,
+            self.context.limits().execution().max_output_samples(),
             "instant output samples",
         )?;
         Ok(OperatorValue::InstantVector(vector))
@@ -703,7 +733,7 @@ impl<'a> Executor<'a> {
             })?;
             check_limit(
                 sample_count,
-                self.config.max_intermediate_rows,
+                self.context.limits().execution().max_intermediate_rows(),
                 "range-vector samples",
             )?;
             grouped
@@ -758,13 +788,17 @@ impl PreparedSeriesMatcher {
 
 /// Evaluates one label matcher, treating a missing label as the empty string.
 pub fn label_matches(matcher: &LabelMatcher, series: &SeriesKey) -> Result<bool> {
-    Ok(prepare_label_matcher(matcher)?.matches(series))
+    Ok(prepare_label_matcher(matcher, ParsingLimits::DEFAULT)?.matches(series))
 }
 
-fn prepare_label_matcher(matcher: &LabelMatcher) -> Result<PreparedSeriesMatcher> {
+fn prepare_label_matcher(
+    matcher: &LabelMatcher,
+    limits: ParsingLimits,
+) -> Result<PreparedSeriesMatcher> {
     Ok(PreparedSeriesMatcher {
         name: matcher.name.clone(),
-        predicate: to_tag_predicate(matcher)?.prepare()?,
+        predicate: to_tag_predicate(matcher)?
+            .prepare_with_limits(limits.max_regex_bytes(), limits.max_regex_automaton_bytes())?,
     })
 }
 

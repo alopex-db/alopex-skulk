@@ -1,5 +1,8 @@
 //! HTTP-independent query facade and metadata enumeration.
 
+use super::exec::limits::{
+    CancellationToken, QueryExecutionContext, QueryLimits, DEFAULT_QUERY_TIMEOUT,
+};
 use super::exec::{
     EvaluationRange, ExecutionValue, Executor, ExecutorConfig, MatrixSeries, RangeSeries,
     TableResult, TableValue,
@@ -8,7 +11,7 @@ use super::plan::{LogicalPlan, PlanDataType, PlanValueType};
 use super::{LabelMatcher, MatchOp, QueryResult};
 use crate::model::{SeriesKey, Tags, Timestamp};
 use crate::store::reader::{
-    ScanRequest, ScanTimeRange, StorageReader, TagPredicate, TagPredicateOp,
+    ScanDecodeLimits, ScanRequest, ScanTimeRange, StorageReader, TagPredicate, TagPredicateOp,
 };
 use crate::{Result, TsmError};
 use arrow_array::builder::StringDictionaryBuilder;
@@ -20,6 +23,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Conjunctive label matchers and an inclusive time range for metadata calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +56,8 @@ impl MetadataRequest {
 /// and metadata enumeration.
 pub struct QueryEngine<'a, R: StorageReader> {
     reader: &'a R,
-    executor_config: ExecutorConfig,
+    limits: QueryLimits,
+    default_timeout: Duration,
 }
 
 impl<'a, R: StorageReader> QueryEngine<'a, R> {
@@ -60,7 +65,8 @@ impl<'a, R: StorageReader> QueryEngine<'a, R> {
     pub fn new(reader: &'a R) -> Self {
         Self {
             reader,
-            executor_config: ExecutorConfig::default(),
+            limits: QueryLimits::DEFAULT,
+            default_timeout: DEFAULT_QUERY_TIMEOUT,
         }
     }
 
@@ -68,15 +74,62 @@ impl<'a, R: StorageReader> QueryEngine<'a, R> {
     pub const fn with_executor_config(reader: &'a R, executor_config: ExecutorConfig) -> Self {
         Self {
             reader,
-            executor_config,
+            limits: QueryLimits::DEFAULT.with_execution(executor_config),
+            default_timeout: DEFAULT_QUERY_TIMEOUT,
         }
+    }
+
+    /// Creates an engine with one query-wide limit set and non-zero default timeout.
+    pub fn with_governance(
+        reader: &'a R,
+        limits: QueryLimits,
+        default_timeout: Duration,
+    ) -> Result<Self> {
+        QueryExecutionContext::with_timeout(limits, default_timeout, CancellationToken::new())?;
+        Ok(Self {
+            reader,
+            limits,
+            default_timeout,
+        })
+    }
+
+    /// Returns the query-wide defaults injected into every stage.
+    pub const fn limits(&self) -> QueryLimits {
+        self.limits
+    }
+
+    /// Returns the default per-query wall-clock budget.
+    pub const fn default_timeout(&self) -> Duration {
+        self.default_timeout
+    }
+
+    fn default_context(&self) -> Result<QueryExecutionContext> {
+        QueryExecutionContext::with_timeout(
+            self.limits,
+            self.default_timeout,
+            CancellationToken::new(),
+        )
     }
 
     /// Executes a pre-built logical plan without requiring a text-query feature.
     pub fn execute(&self, plan: &LogicalPlan, evaluation_time: Timestamp) -> Result<QueryResult> {
-        let value = Executor::with_config(self.reader, self.executor_config)
-            .evaluate(plan, evaluation_time)?;
-        materialize_execution(value)
+        self.execute_with_context(plan, evaluation_time, &self.default_context()?)
+    }
+
+    /// Executes a pre-built plan with caller-visible deadline and cancellation.
+    pub fn execute_with_context(
+        &self,
+        plan: &LogicalPlan,
+        evaluation_time: Timestamp,
+        context: &QueryExecutionContext,
+    ) -> Result<QueryResult> {
+        context.check()?;
+        let value =
+            Executor::with_context(self.reader, context.clone()).evaluate(plan, evaluation_time)?;
+        context.check()?;
+        let result = materialize_execution(value)?;
+        context.check()?;
+        Ok(result)
     }
 
     /// Executes an instant-vector or scalar plan at every inclusive range step.
@@ -85,25 +138,42 @@ impl<'a, R: StorageReader> QueryEngine<'a, R> {
         plan_at_start: &LogicalPlan,
         range: EvaluationRange,
     ) -> Result<QueryResult> {
+        self.execute_range_with_context(plan_at_start, range, &self.default_context()?)
+    }
+
+    /// Executes a range schedule with caller-visible deadline and cancellation.
+    pub fn execute_range_with_context(
+        &self,
+        plan_at_start: &LogicalPlan,
+        range: EvaluationRange,
+        context: &QueryExecutionContext,
+    ) -> Result<QueryResult> {
+        context.check()?;
         if plan_at_start.output_type == PlanValueType::Scalar {
-            return self.execute_scalar_range(plan_at_start, range);
+            return self.execute_scalar_range(plan_at_start, range, context);
         }
-        let matrix = Executor::with_config(self.reader, self.executor_config)
+        let matrix = Executor::with_context(self.reader, context.clone())
             .execute_range(plan_at_start, range)?;
-        materialize_matrix(matrix)
+        context.check()?;
+        let result = materialize_matrix(matrix)?;
+        context.check()?;
+        Ok(result)
     }
 
     fn execute_scalar_range(
         &self,
         plan: &LogicalPlan,
         range: EvaluationRange,
+        context: &QueryExecutionContext,
     ) -> Result<QueryResult> {
-        let executor = Executor::with_config(self.reader, self.executor_config);
+        let executor = Executor::with_context(self.reader, context.clone());
+        let execution_limits = context.limits().execution();
         let mut points = Vec::new();
         let mut timestamp = range.start();
         loop {
-            if points.len() >= self.executor_config.max_range_steps()
-                || points.len() >= self.executor_config.max_output_samples()
+            context.check()?;
+            if points.len() >= execution_limits.max_range_steps()
+                || points.len() >= execution_limits.max_output_samples()
             {
                 return Err(TsmError::ResourceLimit(
                     "scalar range output exceeds executor limits".to_string(),
@@ -130,15 +200,30 @@ impl<'a, R: StorageReader> QueryEngine<'a, R> {
             }
             timestamp = next;
         }
+        context.check()?;
         Ok(QueryResult::Matrix(vec![long_batch(points)?]))
     }
 
     /// Parses, plans, and executes one PromQL instant query.
     #[cfg(feature = "promql")]
     pub fn query_promql(&self, expression: &str, at: Timestamp) -> Result<QueryResult> {
-        let expression = super::promql::parse(expression)?;
+        self.query_promql_with_context(expression, at, &self.default_context()?)
+    }
+
+    /// Executes PromQL instant text with explicit query governance.
+    #[cfg(feature = "promql")]
+    pub fn query_promql_with_context(
+        &self,
+        expression: &str,
+        at: Timestamp,
+        context: &QueryExecutionContext,
+    ) -> Result<QueryResult> {
+        context.check()?;
+        let expression = super::promql::parse_with_limits(expression, context.limits().parsing())?;
+        context.check()?;
         let plan = super::plan::plan_promql(&expression, super::plan::PlanContext::instant(at))?;
-        self.execute(&plan, at)
+        context.check()?;
+        self.execute_with_context(&plan, at, context)
     }
 
     /// Parses, plans, and executes one PromQL range query.
@@ -150,20 +235,60 @@ impl<'a, R: StorageReader> QueryEngine<'a, R> {
         end: Timestamp,
         step_ns: i64,
     ) -> Result<QueryResult> {
+        self.query_promql_range_with_context(
+            expression,
+            start,
+            end,
+            step_ns,
+            &self.default_context()?,
+        )
+    }
+
+    /// Executes PromQL range text with explicit query governance.
+    #[cfg(feature = "promql")]
+    pub fn query_promql_range_with_context(
+        &self,
+        expression: &str,
+        start: Timestamp,
+        end: Timestamp,
+        step_ns: i64,
+        context: &QueryExecutionContext,
+    ) -> Result<QueryResult> {
+        context.check()?;
         let range = EvaluationRange::new(start, end, step_ns)?;
-        let expression = super::promql::parse(expression)?;
+        let expression = super::promql::parse_with_limits(expression, context.limits().parsing())?;
+        context.check()?;
         let plan = super::plan::plan_promql(&expression, super::plan::PlanContext::instant(start))?;
-        self.execute_range(&plan, range)
+        context.check()?;
+        self.execute_range_with_context(&plan, range, context)
     }
 
     /// Lists canonical series matching all labels and the inclusive time range.
     pub fn series(&self, request: &MetadataRequest) -> Result<Vec<SeriesKey>> {
-        collect_series(self.reader, request).map(|series| series.into_iter().collect())
+        self.series_with_context(request, &self.default_context()?)
+    }
+
+    /// Lists canonical series with explicit query governance.
+    pub fn series_with_context(
+        &self,
+        request: &MetadataRequest,
+        context: &QueryExecutionContext,
+    ) -> Result<Vec<SeriesKey>> {
+        collect_series(self.reader, request, context).map(|series| series.into_iter().collect())
     }
 
     /// Lists label names present on matching series, including `__name__`.
     pub fn label_names(&self, request: &MetadataRequest) -> Result<Vec<String>> {
-        let series = collect_series(self.reader, request)?;
+        self.label_names_with_context(request, &self.default_context()?)
+    }
+
+    /// Lists label names with explicit query governance.
+    pub fn label_names_with_context(
+        &self,
+        request: &MetadataRequest,
+        context: &QueryExecutionContext,
+    ) -> Result<Vec<String>> {
+        let series = collect_series(self.reader, request, context)?;
         let mut names = BTreeSet::new();
         if !series.is_empty() {
             names.insert("__name__".to_string());
@@ -176,12 +301,22 @@ impl<'a, R: StorageReader> QueryEngine<'a, R> {
 
     /// Lists values present for one label on matching series.
     pub fn label_values(&self, label_name: &str, request: &MetadataRequest) -> Result<Vec<String>> {
+        self.label_values_with_context(label_name, request, &self.default_context()?)
+    }
+
+    /// Lists values for one label with explicit query governance.
+    pub fn label_values_with_context(
+        &self,
+        label_name: &str,
+        request: &MetadataRequest,
+        context: &QueryExecutionContext,
+    ) -> Result<Vec<String>> {
         if label_name.is_empty() {
             return Err(TsmError::InvalidInput(
                 "metadata label name must be non-empty".to_string(),
             ));
         }
-        let series = collect_series(self.reader, request)?;
+        let series = collect_series(self.reader, request, context)?;
         let values: BTreeSet<String> = if label_name == "__name__" {
             series
                 .iter()
@@ -199,18 +334,37 @@ impl<'a, R: StorageReader> QueryEngine<'a, R> {
     /// Parses, typechecks, plans, and executes one SQL-TS query.
     #[cfg(feature = "sql-ts")]
     pub fn query_sql(&self, text: &str, at: Timestamp) -> Result<QueryResult> {
-        let query = super::sqlts::parse(text)?;
+        self.query_sql_with_context(text, at, &self.default_context()?)
+    }
+
+    /// Executes SQL-TS text with explicit query governance.
+    #[cfg(feature = "sql-ts")]
+    pub fn query_sql_with_context(
+        &self,
+        text: &str,
+        at: Timestamp,
+        context: &QueryExecutionContext,
+    ) -> Result<QueryResult> {
+        context.check()?;
+        let query = super::sqlts::parse_with_limits(text, context.limits().parsing())?;
+        context.check()?;
         let schema = StorageReader::measurement_schema(self.reader, &query.measurement)?;
+        context.check()?;
         let typed = super::sqlts::typecheck::typecheck(query, &schema)?;
+        context.check()?;
         let plan = super::plan::plan_sql(&typed, super::plan::PlanContext::instant(at))?;
-        self.execute(&plan, at)
+        context.check()?;
+        self.execute_with_context(&plan, at, context)
     }
 }
 
 fn collect_series<R: StorageReader>(
     reader: &R,
     request: &MetadataRequest,
+    context: &QueryExecutionContext,
 ) -> Result<BTreeSet<SeriesKey>> {
+    context.check()?;
+    let parsing_limits = context.limits().parsing();
     let mut measurement_predicates = Vec::new();
     let mut tag_predicates = Vec::new();
     for matcher in request.matchers() {
@@ -220,31 +374,82 @@ fn collect_series<R: StorageReader>(
             matcher.value.clone(),
         );
         if matcher.name == "__name__" {
-            measurement_predicates.push(predicate.prepare()?);
+            measurement_predicates.push(predicate.prepare_with_limits(
+                parsing_limits.max_regex_bytes(),
+                parsing_limits.max_regex_automaton_bytes(),
+            )?);
         } else {
+            predicate.prepare_with_limits(
+                parsing_limits.max_regex_bytes(),
+                parsing_limits.max_regex_automaton_bytes(),
+            )?;
             tag_predicates.push(predicate);
         }
     }
 
     let mut series = BTreeSet::new();
-    for measurement in StorageReader::measurement_names(reader)? {
+    let measurements = StorageReader::measurement_names(reader)?;
+    let scan_limits = context.limits().scan();
+    if measurements.len() > scan_limits.max_series_expansion() {
+        return Err(TsmError::ResourceLimit(format!(
+            "metadata measurement expansion {} exceeds limit {}",
+            measurements.len(),
+            scan_limits.max_series_expansion()
+        )));
+    }
+    let mut decoded_rows = 0usize;
+    let mut decoded_bytes = 0usize;
+    for measurement in measurements {
+        context.check()?;
         if !measurement_predicates
             .iter()
             .all(|predicate| predicate.matches_value(&measurement))
         {
             continue;
         }
+        let decode_limits = ScanDecodeLimits::new(
+            scan_limits.max_decoded_rows().saturating_sub(decoded_rows),
+            scan_limits
+                .max_decoded_bytes()
+                .saturating_sub(decoded_bytes),
+        );
         let scan = ScanRequest::new(measurement, request.time_range())
             .with_field_projection(std::iter::empty::<String>())
-            .with_tag_predicates(tag_predicates.clone());
-        series.extend(
-            reader
-                .scan(&scan)?
-                .into_rows()
-                .into_iter()
-                .map(|row| row.row().series().clone()),
-        );
+            .with_tag_predicates(tag_predicates.clone())
+            .with_decode_limits(decode_limits);
+        let result = reader.scan(&scan)?;
+        context.check()?;
+        decoded_rows = decoded_rows
+            .checked_add(result.stats().decoded_rows())
+            .ok_or_else(|| {
+                TsmError::ResourceLimit("metadata decoded row count overflows".to_string())
+            })?;
+        decoded_bytes = decoded_bytes
+            .checked_add(result.stats().decoded_bytes())
+            .ok_or_else(|| {
+                TsmError::ResourceLimit("metadata decoded byte count overflows".to_string())
+            })?;
+        if decoded_rows > scan_limits.max_decoded_rows()
+            || decoded_bytes > scan_limits.max_decoded_bytes()
+        {
+            return Err(TsmError::ResourceLimit(format!(
+                "metadata decode used {decoded_rows} rows/{decoded_bytes} bytes; limits are {}/{}",
+                scan_limits.max_decoded_rows(),
+                scan_limits.max_decoded_bytes()
+            )));
+        }
+        for row in result.into_rows() {
+            series.insert(row.row().series().clone());
+            if series.len() > scan_limits.max_series_expansion() {
+                return Err(TsmError::ResourceLimit(format!(
+                    "metadata series expansion {} exceeds limit {}",
+                    series.len(),
+                    scan_limits.max_series_expansion()
+                )));
+            }
+        }
     }
+    context.check()?;
     Ok(series)
 }
 

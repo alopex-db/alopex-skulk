@@ -21,6 +21,14 @@ pub enum TsmError {
     #[error("resource limit exceeded: {0}")]
     ResourceLimit(String),
 
+    /// A query exceeded its configured monotonic deadline.
+    #[error("query execution timed out")]
+    Timeout,
+
+    /// Cooperative cancellation was requested for a query.
+    #[error("query execution was cancelled")]
+    Cancelled,
+
     /// A text query could not be parsed.
     #[error("{language} parse error at line {line}, column {column}, offset {offset}: {message}")]
     Parse {

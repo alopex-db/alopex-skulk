@@ -1,3 +1,4 @@
+use super::exec::limits::ParsingLimits;
 use crate::{Result, TsmError};
 use serde::de::DeserializeOwned;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
@@ -5,7 +6,6 @@ use std::io::Cursor;
 use std::slice;
 use std::sync::{Once, OnceLock};
 
-pub(crate) const MAX_QUERY_INPUT_BYTES: usize = 1 << 20;
 const MAX_AST_PAYLOAD_BYTES: usize = 8 << 20;
 const MAX_DIAGNOSTIC_BYTES: usize = 64 << 10;
 const MAX_MESSAGEPACK_DEPTH: usize = 512;
@@ -59,11 +59,15 @@ impl ParserLanguage {
     }
 }
 
-pub(crate) fn parse<T>(language: ParserLanguage, input: &str) -> Result<T>
+pub(crate) fn parse_with_limits<T>(
+    language: ParserLanguage,
+    input: &str,
+    limits: ParsingLimits,
+) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    validate_input(input)?;
+    validate_input(input, limits.max_input_bytes())?;
     checked_contract_version()?;
 
     let input = CString::new(input).map_err(|_| {
@@ -140,10 +144,10 @@ fn validate_contract_version(actual: &str) -> std::result::Result<(), String> {
     }
 }
 
-fn validate_input(input: &str) -> Result<()> {
-    if input.len() > MAX_QUERY_INPUT_BYTES {
+fn validate_input(input: &str, max_input_bytes: usize) -> Result<()> {
+    if input.len() > max_input_bytes {
         return Err(TsmError::ResourceLimit(format!(
-            "query input is {} bytes; limit is {MAX_QUERY_INPUT_BYTES} bytes",
+            "query input is {} bytes; limit is {max_input_bytes} bytes",
             input.len()
         )));
     }
@@ -320,12 +324,13 @@ mod tests {
 
     #[test]
     fn input_validation_runs_without_ffi_or_panics() {
+        let max_input_bytes = ParsingLimits::DEFAULT.max_input_bytes();
         assert!(matches!(
-            validate_input(&"x".repeat(MAX_QUERY_INPUT_BYTES + 1)),
+            validate_input(&"x".repeat(max_input_bytes + 1), max_input_bytes),
             Err(TsmError::ResourceLimit(_))
         ));
         assert!(matches!(
-            validate_input("x\0y"),
+            validate_input("x\0y", max_input_bytes),
             Err(TsmError::InvalidInput(_))
         ));
     }

@@ -1,21 +1,17 @@
 //! PromQL wire-AST mapping, validation, and public expression types.
 
 use super::nimffi::{self, ParserLanguage};
+use crate::query::exec::limits::ParsingLimits;
 use crate::query::{LabelMatcher, MatchOp};
 use crate::{Result, TsmError};
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 
 /// Maximum UTF-8 byte length accepted before calling the Nim parser.
-pub const MAX_PROMQL_INPUT_BYTES: usize = nimffi::MAX_QUERY_INPUT_BYTES;
+pub const MAX_PROMQL_INPUT_BYTES: usize = ParsingLimits::DEFAULT.max_input_bytes();
 
 /// Maximum UTF-8 byte length of one regular-expression matcher.
-pub const MAX_PROMQL_REGEX_BYTES: usize = 32 << 10;
-
-const MAX_PROMQL_AST_DEPTH: usize = 64;
-const MAX_PROMQL_AST_NODES: usize = 65_536;
-const REGEX_COMPILED_SIZE_LIMIT: usize = 2 << 20;
-const REGEX_DFA_SIZE_LIMIT: usize = 2 << 20;
+pub const MAX_PROMQL_REGEX_BYTES: usize = ParsingLimits::DEFAULT.max_regex_bytes();
 
 /// A one-based line/column and zero-based UTF-8 byte offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -310,9 +306,14 @@ pub enum PromExprKind {
 
 /// Parses and validates one PromQL expression through the vendored Nim parser.
 pub fn parse(input: &str) -> Result<PromExpr> {
-    let wire: WireExpr = nimffi::parse(ParserLanguage::PromQl, input)?;
+    parse_with_limits(input, ParsingLimits::DEFAULT)
+}
+
+/// Parses with one query-wide set of input, AST, and regex limits.
+pub fn parse_with_limits(input: &str, limits: ParsingLimits) -> Result<PromExpr> {
+    let wire: WireExpr = nimffi::parse_with_limits(ParserLanguage::PromQl, input, limits)?;
     let mut nodes = 0;
-    map_expression(wire, 1, &mut nodes)
+    map_expression(wire, 1, &mut nodes, limits)
 }
 
 /// Returns the checked runtime MessagePack contract version.
@@ -320,16 +321,23 @@ pub fn parser_contract_version() -> Result<&'static str> {
     nimffi::checked_contract_version()
 }
 
-fn map_expression(wire: WireExpr, depth: usize, nodes: &mut usize) -> Result<PromExpr> {
-    if depth > MAX_PROMQL_AST_DEPTH {
+fn map_expression(
+    wire: WireExpr,
+    depth: usize,
+    nodes: &mut usize,
+    limits: ParsingLimits,
+) -> Result<PromExpr> {
+    if depth > limits.max_ast_depth() {
         return Err(TsmError::ResourceLimit(format!(
-            "PromQL AST depth exceeds {MAX_PROMQL_AST_DEPTH}"
+            "PromQL AST depth exceeds {}",
+            limits.max_ast_depth()
         )));
     }
     *nodes += 1;
-    if *nodes > MAX_PROMQL_AST_NODES {
+    if *nodes > limits.max_ast_nodes() {
         return Err(TsmError::ResourceLimit(format!(
-            "PromQL AST node count exceeds {MAX_PROMQL_AST_NODES}"
+            "PromQL AST node count exceeds {}",
+            limits.max_ast_nodes()
         )));
     }
 
@@ -343,7 +351,7 @@ fn map_expression(wire: WireExpr, depth: usize, nodes: &mut usize) -> Result<Pro
             let offset = map_offset(offset, span)?;
             let matchers = matchers
                 .into_iter()
-                .map(map_matcher)
+                .map(|matcher| map_matcher(matcher, limits))
                 .collect::<Result<Vec<_>>>()?;
             (
                 PromExprKind::VectorSelector {
@@ -359,7 +367,7 @@ fn map_expression(wire: WireExpr, depth: usize, nodes: &mut usize) -> Result<Pro
             range,
             offset,
         } => {
-            let selector = map_expression(*selector, depth + 1, nodes)?;
+            let selector = map_expression(*selector, depth + 1, nodes, limits)?;
             if !matches!(selector.kind, PromExprKind::VectorSelector { .. }) {
                 return Err(TsmError::FfiContract(
                     "MatrixSelector must contain a VectorSelector".to_string(),
@@ -403,7 +411,7 @@ fn map_expression(wire: WireExpr, depth: usize, nodes: &mut usize) -> Result<Pro
             };
             let args = args
                 .into_iter()
-                .map(|argument| map_expression(argument, depth + 1, nodes))
+                .map(|argument| map_expression(argument, depth + 1, nodes, limits))
                 .collect::<Result<Vec<_>>>()?;
             validate_function_arguments(function, &args, span)?;
             (
@@ -428,7 +436,7 @@ fn map_expression(wire: WireExpr, depth: usize, nodes: &mut usize) -> Result<Pro
                     "aggregate has `without=true` but no grouping labels".to_string(),
                 ));
             }
-            let expr = map_expression(*expr, depth + 1, nodes)?;
+            let expr = map_expression(*expr, depth + 1, nodes, limits)?;
             if expr.value_type != PromValueType::InstantVector {
                 return Err(type_error(
                     span,
@@ -449,8 +457,8 @@ fn map_expression(wire: WireExpr, depth: usize, nodes: &mut usize) -> Result<Pro
             )
         }
         WireExprKind::BinaryOp { left, op, right } => {
-            let left = map_expression(*left, depth + 1, nodes)?;
-            let right = map_expression(*right, depth + 1, nodes)?;
+            let left = map_expression(*left, depth + 1, nodes, limits)?;
+            let right = map_expression(*right, depth + 1, nodes, limits)?;
             let value_type = binary_value_type(left.value_type, right.value_type, span)?;
             (
                 PromExprKind::Binary {
@@ -462,7 +470,7 @@ fn map_expression(wire: WireExpr, depth: usize, nodes: &mut usize) -> Result<Pro
             )
         }
         WireExprKind::UnaryOp { op, expr } => {
-            let expr = map_expression(*expr, depth + 1, nodes)?;
+            let expr = map_expression(*expr, depth + 1, nodes, limits)?;
             let value_type = match expr.value_type {
                 PromValueType::Scalar | PromValueType::InstantVector => expr.value_type,
                 other => {
@@ -481,7 +489,7 @@ fn map_expression(wire: WireExpr, depth: usize, nodes: &mut usize) -> Result<Pro
             )
         }
         WireExprKind::Paren { expr } => {
-            let expr = map_expression(*expr, depth + 1, nodes)?;
+            let expr = map_expression(*expr, depth + 1, nodes, limits)?;
             let value_type = expr.value_type;
             (
                 PromExprKind::Paren {
@@ -499,11 +507,11 @@ fn map_expression(wire: WireExpr, depth: usize, nodes: &mut usize) -> Result<Pro
     })
 }
 
-fn map_matcher(wire: WireLabelMatcher) -> Result<PromLabelMatcher> {
+fn map_matcher(wire: WireLabelMatcher, limits: ParsingLimits) -> Result<PromLabelMatcher> {
     let span = map_span(wire.span)?;
     let op: MatchOp = wire.op.into();
     let compiled_regex = match op {
-        MatchOp::Regex | MatchOp::NotRegex => Some(compile_regex(&wire.value, span)?),
+        MatchOp::Regex | MatchOp::NotRegex => Some(compile_regex(&wire.value, span, limits)?),
         MatchOp::Equal | MatchOp::NotEqual => None,
     };
     Ok(PromLabelMatcher {
@@ -513,18 +521,19 @@ fn map_matcher(wire: WireLabelMatcher) -> Result<PromLabelMatcher> {
     })
 }
 
-fn compile_regex(pattern: &str, span: PromSpan) -> Result<Regex> {
-    if pattern.len() > MAX_PROMQL_REGEX_BYTES {
+fn compile_regex(pattern: &str, span: PromSpan, limits: ParsingLimits) -> Result<Regex> {
+    if pattern.len() > limits.max_regex_bytes() {
         return Err(TsmError::ResourceLimit(format!(
-            "PromQL regex is {} bytes; limit is {MAX_PROMQL_REGEX_BYTES} bytes",
-            pattern.len()
+            "PromQL regex is {} bytes; limit is {} bytes",
+            pattern.len(),
+            limits.max_regex_bytes()
         )));
     }
 
     let anchored = format!(r"\A(?s:{pattern})\z");
     RegexBuilder::new(&anchored)
-        .size_limit(REGEX_COMPILED_SIZE_LIMIT)
-        .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
+        .size_limit(limits.max_regex_automaton_bytes())
+        .dfa_size_limit(limits.max_regex_automaton_bytes())
         .build()
         .map_err(|error| match error {
             regex::Error::CompiledTooBig(limit) => TsmError::ResourceLimit(format!(

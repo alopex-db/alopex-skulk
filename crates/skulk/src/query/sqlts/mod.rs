@@ -4,14 +4,12 @@ pub mod typecheck;
 
 use super::nimffi::{self, ParserLanguage};
 use super::TSFunction;
+use crate::query::exec::limits::ParsingLimits;
 use crate::{Result, TsmError};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
 use std::time::Duration;
-
-const MAX_SQL_AST_DEPTH: usize = 64;
-const MAX_SQL_AST_NODES: usize = 65_536;
 
 /// A one-based SQL source location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -371,7 +369,13 @@ pub struct ClassifiedPredicate {
 
 /// Parses one SQL-TS SELECT through the shared Nim FFI bridge.
 pub fn parse(input: &str) -> Result<SqlTsQuery> {
-    let statements: Vec<WireStatement> = nimffi::parse(ParserLanguage::SqlTs, input)?;
+    parse_with_limits(input, ParsingLimits::DEFAULT)
+}
+
+/// Parses with one query-wide set of input and AST limits.
+pub fn parse_with_limits(input: &str, limits: ParsingLimits) -> Result<SqlTsQuery> {
+    let statements: Vec<WireStatement> =
+        nimffi::parse_with_limits(ParserLanguage::SqlTs, input, limits)?;
     if statements.len() != 1 {
         return Err(unsupported(
             SqlSpan::unknown(),
@@ -381,9 +385,12 @@ pub fn parse(input: &str) -> Result<SqlTsQuery> {
             ),
         ));
     }
-    map_statement(statements.into_iter().next().ok_or_else(|| {
-        TsmError::FfiContract("single SQL statement disappeared during mapping".to_string())
-    })?)
+    map_statement(
+        statements.into_iter().next().ok_or_else(|| {
+            TsmError::FfiContract("single SQL statement disappeared during mapping".to_string())
+        })?,
+        limits,
+    )
 }
 
 impl SqlSpan {
@@ -395,7 +402,7 @@ impl SqlSpan {
     }
 }
 
-fn map_statement(statement: WireStatement) -> Result<SqlTsQuery> {
+fn map_statement(statement: WireStatement, limits: ParsingLimits) -> Result<SqlTsQuery> {
     let span = map_span(statement.span)?;
     let variant = tagged_variant(&statement.kind)?.to_string();
     if variant != "Select" {
@@ -441,11 +448,11 @@ fn map_statement(statement: WireStatement) -> Result<SqlTsQuery> {
     let projections = select
         .projection
         .into_iter()
-        .map(|item| map_projection(item, &mut nodes))
+        .map(|item| map_projection(item, &mut nodes, limits))
         .collect::<Result<Vec<_>>>()?;
     let selection = select
         .selection
-        .map(|expr| map_expr(expr, 1, &mut nodes))
+        .map(|expr| map_expr_with_limits(expr, 1, &mut nodes, limits))
         .transpose()?;
     let predicates = selection
         .as_ref()
@@ -457,16 +464,19 @@ fn map_statement(statement: WireStatement) -> Result<SqlTsQuery> {
         .unwrap_or_default()
         .into_iter()
         .map(|expr| {
-            let expr = map_expr(expr, 1, &mut nodes)?;
+            let expr = map_expr_with_limits(expr, 1, &mut nodes, limits)?;
             resolve_group_by(expr, &aliases, projections.len())
         })
         .collect::<Result<Vec<_>>>()?;
     let order_by = select
         .order_by
         .into_iter()
-        .map(|order| map_order_by(order, &aliases, projections.len(), &mut nodes))
+        .map(|order| map_order_by(order, &aliases, projections.len(), &mut nodes, limits))
         .collect::<Result<Vec<_>>>()?;
-    let limit = select.limit.map(map_limit).transpose()?;
+    let limit = select
+        .limit
+        .map(|limit| map_limit(limit, &mut nodes, limits))
+        .transpose()?;
 
     Ok(SqlTsQuery {
         measurement,
@@ -502,7 +512,7 @@ fn map_from_item(value: Value) -> Result<(String, Option<String>)> {
     Ok((table.name, table.alias))
 }
 
-fn map_projection(value: Value, nodes: &mut usize) -> Result<SqlProjection> {
+fn map_projection(value: Value, nodes: &mut usize, limits: ParsingLimits) -> Result<SqlProjection> {
     match tagged_variant(&value)? {
         "Wildcard" => {
             let wildcard: WireWildcard = decode_tagged(value, "wildcard projection")?;
@@ -513,7 +523,7 @@ fn map_projection(value: Value, nodes: &mut usize) -> Result<SqlProjection> {
         "Expr" => {
             let projection: WireExprProjection = decode_tagged(value, "expression projection")?;
             Ok(SqlProjection::Expr {
-                expr: map_expr(projection.expr, 1, nodes)?,
+                expr: map_expr_with_limits(projection.expr, 1, nodes, limits)?,
                 alias: projection.alias,
                 span: map_span(projection.span)?,
             })
@@ -524,16 +534,23 @@ fn map_projection(value: Value, nodes: &mut usize) -> Result<SqlProjection> {
     }
 }
 
-fn map_expr(wire: WireExpr, depth: usize, nodes: &mut usize) -> Result<SqlExpr> {
-    if depth > MAX_SQL_AST_DEPTH {
+fn map_expr_with_limits(
+    wire: WireExpr,
+    depth: usize,
+    nodes: &mut usize,
+    limits: ParsingLimits,
+) -> Result<SqlExpr> {
+    if depth > limits.max_ast_depth() {
         return Err(TsmError::ResourceLimit(format!(
-            "SQL-TS AST depth exceeds {MAX_SQL_AST_DEPTH}"
+            "SQL-TS AST depth exceeds {}",
+            limits.max_ast_depth()
         )));
     }
     *nodes += 1;
-    if *nodes > MAX_SQL_AST_NODES {
+    if *nodes > limits.max_ast_nodes() {
         return Err(TsmError::ResourceLimit(format!(
-            "SQL-TS AST node count exceeds {MAX_SQL_AST_NODES}"
+            "SQL-TS AST node count exceeds {}",
+            limits.max_ast_nodes()
         )));
     }
 
@@ -554,16 +571,31 @@ fn map_expr(wire: WireExpr, depth: usize, nodes: &mut usize) -> Result<SqlExpr> 
         "BinaryOp" => {
             let payload: WireBinaryExpr = decode_tagged(wire.kind, "binary expression")?;
             SqlExprKind::Binary {
-                left: Box::new(map_expr(payload.left, depth + 1, nodes)?),
+                left: Box::new(map_expr_with_limits(
+                    payload.left,
+                    depth + 1,
+                    nodes,
+                    limits,
+                )?),
                 op: payload.op.into(),
-                right: Box::new(map_expr(payload.right, depth + 1, nodes)?),
+                right: Box::new(map_expr_with_limits(
+                    payload.right,
+                    depth + 1,
+                    nodes,
+                    limits,
+                )?),
             }
         }
         "UnaryOp" => {
             let payload: WireUnaryExpr = decode_tagged(wire.kind, "unary expression")?;
             SqlExprKind::Unary {
                 op: payload.op.into(),
-                expr: Box::new(map_expr(payload.operand, depth + 1, nodes)?),
+                expr: Box::new(map_expr_with_limits(
+                    payload.operand,
+                    depth + 1,
+                    nodes,
+                    limits,
+                )?),
             }
         }
         "FunctionCall" => {
@@ -571,7 +603,7 @@ fn map_expr(wire: WireExpr, depth: usize, nodes: &mut usize) -> Result<SqlExpr> 
             let arguments = payload
                 .args
                 .into_iter()
-                .map(|argument| map_expr(argument, depth + 1, nodes))
+                .map(|argument| map_expr_with_limits(argument, depth + 1, nodes, limits))
                 .collect::<Result<Vec<_>>>()?;
             SqlExprKind::Function(map_function(
                 &payload.name,
@@ -584,20 +616,42 @@ fn map_expr(wire: WireExpr, depth: usize, nodes: &mut usize) -> Result<SqlExpr> 
         "Between" => {
             let payload: WireBetweenExpr = decode_tagged(wire.kind, "BETWEEN expression")?;
             SqlExprKind::Between {
-                expr: Box::new(map_expr(payload.expr, depth + 1, nodes)?),
-                low: Box::new(map_expr(payload.low, depth + 1, nodes)?),
-                high: Box::new(map_expr(payload.high, depth + 1, nodes)?),
+                expr: Box::new(map_expr_with_limits(
+                    payload.expr,
+                    depth + 1,
+                    nodes,
+                    limits,
+                )?),
+                low: Box::new(map_expr_with_limits(payload.low, depth + 1, nodes, limits)?),
+                high: Box::new(map_expr_with_limits(
+                    payload.high,
+                    depth + 1,
+                    nodes,
+                    limits,
+                )?),
                 negated: payload.negated,
             }
         }
         "Like" => {
             let payload: WirePatternExpr = decode_tagged(wire.kind, "pattern expression")?;
             SqlExprKind::Pattern {
-                expr: Box::new(map_expr(payload.expr, depth + 1, nodes)?),
-                pattern: Box::new(map_expr(payload.pattern, depth + 1, nodes)?),
+                expr: Box::new(map_expr_with_limits(
+                    payload.expr,
+                    depth + 1,
+                    nodes,
+                    limits,
+                )?),
+                pattern: Box::new(map_expr_with_limits(
+                    payload.pattern,
+                    depth + 1,
+                    nodes,
+                    limits,
+                )?),
                 escape: payload
                     .escape
-                    .map(|escape| map_expr(escape, depth + 1, nodes).map(Box::new))
+                    .map(|escape| {
+                        map_expr_with_limits(escape, depth + 1, nodes, limits).map(Box::new)
+                    })
                     .transpose()?,
                 negated: payload.negated,
                 kind: payload.kind.into(),
@@ -606,11 +660,16 @@ fn map_expr(wire: WireExpr, depth: usize, nodes: &mut usize) -> Result<SqlExpr> 
         "InList" => {
             let payload: WireInListExpr = decode_tagged(wire.kind, "IN-list expression")?;
             SqlExprKind::InList {
-                expr: Box::new(map_expr(payload.expr, depth + 1, nodes)?),
+                expr: Box::new(map_expr_with_limits(
+                    payload.expr,
+                    depth + 1,
+                    nodes,
+                    limits,
+                )?),
                 list: payload
                     .list
                     .into_iter()
-                    .map(|item| map_expr(item, depth + 1, nodes))
+                    .map(|item| map_expr_with_limits(item, depth + 1, nodes, limits))
                     .collect::<Result<Vec<_>>>()?,
                 negated: payload.negated,
             }
@@ -618,7 +677,12 @@ fn map_expr(wire: WireExpr, depth: usize, nodes: &mut usize) -> Result<SqlExpr> 
         "IsNull" => {
             let payload: WireIsNullExpr = decode_tagged(wire.kind, "IS NULL expression")?;
             SqlExprKind::IsNull {
-                expr: Box::new(map_expr(payload.expr, depth + 1, nodes)?),
+                expr: Box::new(map_expr_with_limits(
+                    payload.expr,
+                    depth + 1,
+                    nodes,
+                    limits,
+                )?),
                 negated: payload.negated,
             }
         }
@@ -968,9 +1032,10 @@ fn map_order_by(
     aliases: &[(String, usize)],
     projection_count: usize,
     nodes: &mut usize,
+    limits: ParsingLimits,
 ) -> Result<SqlOrderBy> {
     let span = map_span(wire.span)?;
-    let expression = map_expr(wire.expr, 1, nodes)?;
+    let expression = map_expr_with_limits(wire.expr, 1, nodes, limits)?;
     let key = if let Some((alias, projection_index)) = alias_reference(&expression, aliases) {
         SqlOrderKey::ProjectionAlias {
             alias,
@@ -1035,9 +1100,8 @@ fn projection_ordinal(
     Ok(Some((ordinal, ordinal - 1)))
 }
 
-fn map_limit(wire: WireExpr) -> Result<u64> {
-    let mut nodes = 0;
-    let expression = map_expr(wire, 1, &mut nodes)?;
+fn map_limit(wire: WireExpr, nodes: &mut usize, limits: ParsingLimits) -> Result<u64> {
+    let expression = map_expr_with_limits(wire, 1, nodes, limits)?;
     let SqlExprKind::Literal(SqlLiteral::Number(raw)) = &expression.kind else {
         return Err(type_error(
             expression.span,
