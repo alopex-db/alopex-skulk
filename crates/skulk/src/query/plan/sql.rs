@@ -4,8 +4,8 @@ use super::{
     AggregateCall, AggregateInput, AggregateKind, AggregateNode, AggregationStage, FilterNode,
     LimitNode, LogicalPlan, MeasurementSelection, PatternMatchKind, PlanContext, PlanExpression,
     PlanExpressionKind, PlanNode, PlanPredicate, PlanTimeRange, PlanValueType, ProjectNode,
-    ProjectionExpression, ScalarBinaryKind, ScalarUnaryKind, ScanNode, SeriesGroupKind,
-    SeriesGroupNode, SortKey, SortNode, TimeBound,
+    ProjectionExpression, ScalarBinaryKind, ScalarUnaryKind, ScanNode, ScanResolution,
+    SeriesGroupKind, SeriesGroupNode, SortKey, SortNode, TimeBound,
 };
 use crate::query::sqlts::typecheck::{TypedProjection, TypedSqlTsQuery};
 use crate::query::sqlts::{
@@ -63,6 +63,7 @@ pub fn plan_sql(query: &TypedSqlTsQuery, context: PlanContext) -> Result<Logical
         time_range,
         tag_equalities,
         field_projection,
+        resolution: ScanResolution::raw(),
     });
     let source = if residual.is_empty() {
         scan

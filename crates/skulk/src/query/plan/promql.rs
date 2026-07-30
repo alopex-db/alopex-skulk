@@ -4,7 +4,8 @@ use super::{
     AggregateCall, AggregateInput, AggregateKind, AggregateNode, AggregationStage, ArithmeticKind,
     BinaryNode, FilterNode, LogicalPlan, MeasurementSelection, PlanContext, PlanNode,
     PlanPredicate, PlanTimeRange, PlanValueType, RangeFunctionKind, RangeFunctionNode, ScanNode,
-    SeriesGroupKind, SeriesGroupNode, SeriesGrouping, SeriesWindow, SeriesWindowKind,
+    ScanResolution, SeriesGroupKind, SeriesGroupNode, SeriesGrouping, SeriesWindow,
+    SeriesWindowKind,
 };
 use crate::query::promql::{
     AggregationOp, BinaryOp, PromDuration, PromExpr, PromExprKind, PromFunction, PromLabelMatcher,
@@ -193,6 +194,7 @@ fn plan_selector(
         field_projection: Some(BTreeSet::from([
             field.unwrap_or_else(|| DEFAULT_FIELD.to_string())
         ])),
+        resolution: ScanResolution::raw(),
     });
     let input = if residual.is_empty() {
         scan

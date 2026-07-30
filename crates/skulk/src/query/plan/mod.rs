@@ -4,6 +4,13 @@ use crate::query::LabelMatcher;
 use crate::{Result, TsmError};
 use std::collections::BTreeSet;
 
+mod resolution;
+
+pub use resolution::{
+    select_plan_resolutions, Resolution, ResolutionCapability, ResolutionCatalog,
+    ResolutionRequirements, ScanResolution,
+};
+
 #[cfg(feature = "promql")]
 mod promql;
 
@@ -187,6 +194,8 @@ pub struct ScanNode {
     pub tag_equalities: Vec<LabelMatcher>,
     /// Exact field columns to decode, or `None` for every field.
     pub field_projection: Option<BTreeSet<String>>,
+    /// Physical data resolution selected for this scan.
+    pub resolution: ScanResolution,
 }
 
 /// A language-independent residual predicate.
@@ -246,7 +255,7 @@ pub enum SeriesGroupKind {
 }
 
 /// Supported range-vector transformations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RangeFunctionKind {
     /// Counter rate with reset correction and extrapolation.
     Rate,
@@ -276,7 +285,7 @@ pub struct RangeFunctionNode {
 }
 
 /// Shared aggregation identities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AggregateKind {
     /// Sum.
     Sum,
