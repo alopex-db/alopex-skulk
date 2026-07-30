@@ -1,67 +1,85 @@
 # Alopex Skulk
 
-Alopex Skulk - High-performance Time Series Storage Engine for Rust.
+`alopex-skulk` 0.4.0 is an embedded time-series storage, ingest, and query
+engine. It stores wide, multi-field rows in Arrow memory batches and Parquet
+files, acknowledges durable batches through a local WAL, and exposes an
+HTTP-independent query API.
 
-[![Crates.io](https://img.shields.io/crates/v/alopex-skulk.svg)](https://crates.io/crates/alopex-skulk)
-[![Documentation](https://docs.rs/alopex-skulk/badge.svg)](https://docs.rs/alopex-skulk)
-[![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](LICENSE)
+## What 0.4.0 Provides
 
-## Features
+- PromQL instant and range queries.
+- SQL-TS projection, filtering, ordering, limits, standard aggregates, and
+  `TIME_BUCKET`, `RATE`, `DELTA`, `DERIVATIVE`, `FIRST`, and `LAST`.
+- A public `StorageReader` boundary with pending/durable
+  latest-write-wins merge, time/tag pruning, field projection, and schema
+  validation.
+- Arrow-backed `QueryResult` values plus bounded series/label metadata calls.
+- Conservative raw/rollup resolution selection; v0.4 ships raw data only.
+- Configurable one-hour out-of-order window with observable reject/warn/drop
+  outcomes and an explicit backfill override.
 
-- **Time Series Optimized**: Designed specifically for time-stamped data
-- **Columnar Storage**: TSM (Time-Structured Merge Tree) file format
-- **Memory Efficient**: Adaptive compression with run-length encoding
-- **High Throughput**: Optimized for high-volume write workloads
-- **Integration Ready**: Built on top of `alopex-core`
+The default features are `promql` and `sql-ts`. They use the Alopex Nim parser
+through a versioned C ABI and MessagePack AST. The Rust crate owns semantic
+validation, planning, execution, and storage.
 
-## Installation
-
-Add to your `Cargo.toml`:
+For a pure-Rust core without a parser artifact:
 
 ```toml
 [dependencies]
-alopex-skulk = "0.1"
+alopex-skulk = { version = "0.4", default-features = false }
 ```
 
-## Architecture
+For both text frontends:
 
-Skulk implements a TSM-based storage engine with:
+```toml
+[dependencies]
+alopex-skulk = "0.4"
+```
 
-- **MemTable**: In-memory buffer for recent writes
-- **Partitions**: Time-based data partitioning
-- **TSM Files**: Columnar storage format with block-level compression
-- **Compaction**: Background merge operations for optimal read performance
-
-## Usage
+## Query Example
 
 ```rust
-use alopex_skulk::tsm::PartitionManager;
+use alopex_skulk::query::QueryEngine;
+use alopex_skulk::store::recovery::{RecoveryConfig, RecoveryStore};
 
-// Create a partition manager
-let manager = PartitionManager::new(config)?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let now = 1_700_000_000_000_000_000_i64;
+    let store = RecoveryStore::open("./skulk-data-v4", RecoveryConfig::default())?;
+    let engine = QueryEngine::new(&store);
 
-// Write time series data
-manager.write(measurement, timestamp, value)?;
-
-// Query data
-let results = manager.query(measurement, time_range)?;
+    let result = engine.query_sql(
+        "SELECT TIME_BUCKET('1 hour', time) AS bucket, \
+         AVG(value) AS average FROM cpu \
+         WHERE time > NOW() - INTERVAL '24 hours' GROUP BY bucket",
+        now,
+    )?;
+    println!("{} Arrow batches", result.batches().len());
+    Ok(())
+}
 ```
+
+PromQL reads wide field `value` by default; select another field with the
+reserved `__field__` matcher.
+
+## Native Parser Artifact
+
+The published source currently vendors the parser for
+`x86_64-unknown-linux-gnu`. Frontend-enabled builds for other targets must set
+`SKULK_NIM_PARSER_LIB_DIR` to a directory containing the target shared library
+and a matching `CONTRACT_VERSION`. Downstream Linux/macOS executables must
+propagate `DEP_SKULK_NIM_PARSER_LIBDIR` into an rpath from their final
+`build.rs`; Windows must place the DLL beside the executable or on `PATH`.
+Core-only builds have no Nim, `cc`, or `*-sys` requirement.
+
+Full target, build, rpath, compatibility, and unsupported-syntax details are in
+the [repository README](https://github.com/alopex-db/alopex-skulk#readme).
 
 ## Requirements
 
-- Rust 1.82.0 or later (MSRV)
-- `alopex-core` 0.3.0 or later
+- Rust 1.82 or later.
+- Nim 2.2 only when producing a parser artifact for a target that is not
+  already vendored.
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT License ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
-
-## Related Projects
-
-- [alopex-core](https://crates.io/crates/alopex-core) - Core storage engine
-- [alopex-chirps](https://crates.io/crates/alopex-chirps) - Distributed cluster coordination
+Apache-2.0 OR MIT
