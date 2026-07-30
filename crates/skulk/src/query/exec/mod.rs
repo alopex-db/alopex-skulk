@@ -1,6 +1,9 @@
 //! Storage-independent logical-plan execution core.
 
+mod aggregate;
 mod functions;
+
+pub use aggregate::{TableColumn, TableResult, TableValue};
 
 use crate::model::{FieldValue, SeriesKey, Timestamp};
 use crate::query::plan::{
@@ -238,13 +241,36 @@ impl MatrixSeries {
     }
 }
 
+/// One numeric scalar at a PromQL evaluation timestamp.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScalarSample {
+    timestamp: Timestamp,
+    value: f64,
+}
+
+impl ScalarSample {
+    /// Returns the query evaluation timestamp.
+    pub const fn timestamp(self) -> Timestamp {
+        self.timestamp
+    }
+
+    /// Returns the scalar value.
+    pub const fn value(self) -> f64 {
+        self.value
+    }
+}
+
 /// Public execution values produced by the v0.4 operator pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecutionValue {
+    /// One numeric scalar at the evaluation timestamp.
+    Scalar(ScalarSample),
     /// One selected value per series.
     InstantVector(Vec<InstantSample>),
     /// Raw window samples per series for range functions.
     RangeVector(Vec<RangeSeries>),
+    /// One typed SQL table.
+    Table(TableResult),
 }
 
 /// Logical-plan executor depending only on the read-only StorageReader contract.
@@ -274,10 +300,32 @@ impl<'a> Executor<'a> {
         output_timestamp: Timestamp,
     ) -> Result<ExecutionValue> {
         match self.evaluate_node(&plan.root, output_timestamp)? {
+            OperatorValue::Scalar(value) => Ok(ExecutionValue::Scalar(ScalarSample {
+                timestamp: output_timestamp,
+                value,
+            })),
             OperatorValue::InstantVector(vector) => Ok(ExecutionValue::InstantVector(vector)),
             OperatorValue::RangeVector(range) => Ok(ExecutionValue::RangeVector(range.series)),
-            OperatorValue::Rows(_) => Err(execution_error(
-                "a Scan or Filter cannot be a final query result",
+            OperatorValue::Table(table) => Ok(ExecutionValue::Table(table)),
+            OperatorValue::Rows(_) | OperatorValue::Groups(_) | OperatorValue::AggregateRows(_) => {
+                Err(execution_error(
+                    "logical plan did not produce its public result type",
+                ))
+            }
+        }
+    }
+
+    /// Executes a schema-preserving SQL table plan.
+    pub fn execute_table(&self, plan: &LogicalPlan) -> Result<TableResult> {
+        if plan.output_type != PlanValueType::Table {
+            return Err(execution_error(
+                "table execution requires a Table logical plan",
+            ));
+        }
+        match self.evaluate(plan, 0)? {
+            ExecutionValue::Table(table) => Ok(table),
+            _ => Err(execution_error(
+                "table execution produced a non-table value",
             )),
         }
     }
@@ -295,9 +343,11 @@ impl<'a> Executor<'a> {
         }
         match self.evaluate(plan, evaluation_timestamp)? {
             ExecutionValue::InstantVector(vector) => Ok(vector),
-            ExecutionValue::RangeVector(_) => {
-                Err(execution_error("instant execution produced a range vector"))
-            }
+            ExecutionValue::Scalar(_)
+            | ExecutionValue::RangeVector(_)
+            | ExecutionValue::Table(_) => Err(execution_error(
+                "instant execution produced a non-vector value",
+            )),
         }
     }
 
@@ -375,9 +425,7 @@ impl<'a> Executor<'a> {
                     SeriesGroupKind::Window(window) => {
                         self.group_window(input, *window, output_timestamp)
                     }
-                    SeriesGroupKind::Keys(_) => Err(unsupported_operator(
-                        "SQL expression grouping is implemented in Task 11",
-                    )),
+                    SeriesGroupKind::Keys(keys) => aggregate::group_rows(input, keys),
                 }
             }
             PlanNode::RangeFunction(function) => {
@@ -395,14 +443,55 @@ impl<'a> Executor<'a> {
                 )?;
                 Ok(OperatorValue::InstantVector(vector))
             }
-            PlanNode::Aggregate(_)
-            | PlanNode::Binary(_)
-            | PlanNode::Project(_)
-            | PlanNode::Sort(_)
-            | PlanNode::Limit(_)
-            | PlanNode::Scalar(_)
-            | PlanNode::String(_) => Err(unsupported_operator(
-                "aggregate, arithmetic, scalar, and SQL operators are implemented in Task 11",
+            PlanNode::Aggregate(node) => {
+                let input = self.evaluate_node(&node.input, output_timestamp)?;
+                let mut parameters = Vec::with_capacity(node.calls.len());
+                for call in &node.calls {
+                    let value = if let Some(parameter) = &call.parameter {
+                        match self.evaluate_node(parameter, output_timestamp)? {
+                            OperatorValue::Scalar(value) => Some(value),
+                            _ => {
+                                return Err(execution_error(
+                                    "aggregate parameters must evaluate to scalars",
+                                ));
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    parameters.push(value);
+                }
+                let output =
+                    aggregate::evaluate_aggregate(input, node, &parameters, output_timestamp)?;
+                if let OperatorValue::InstantVector(vector) = &output {
+                    check_limit(
+                        vector.len(),
+                        self.config.max_output_samples,
+                        "aggregate output samples",
+                    )?;
+                }
+                Ok(output)
+            }
+            PlanNode::Binary(node) => {
+                let left = self.evaluate_node(&node.left, output_timestamp)?;
+                let right = self.evaluate_node(&node.right, output_timestamp)?;
+                aggregate::binary(left, node.op, right)
+            }
+            PlanNode::Project(node) => {
+                let input = self.evaluate_node(&node.input, output_timestamp)?;
+                aggregate::project(input, node)
+            }
+            PlanNode::Sort(node) => {
+                let input = self.evaluate_node(&node.input, output_timestamp)?;
+                aggregate::sort(input, &node.keys)
+            }
+            PlanNode::Limit(node) => {
+                let input = self.evaluate_node(&node.input, output_timestamp)?;
+                aggregate::limit(input, node.rows)
+            }
+            PlanNode::Scalar(value) => Ok(OperatorValue::Scalar(*value)),
+            PlanNode::String(_) => Err(unsupported_operator(
+                "standalone string plan nodes are not executable values",
             )),
         }
     }
@@ -464,18 +553,30 @@ impl<'a> Executor<'a> {
         };
         let prepared = predicates
             .iter()
-            .map(|predicate| match predicate {
-                PlanPredicate::Label(matcher) => prepare_label_matcher(matcher),
-                PlanPredicate::Expression(_) => Err(unsupported_operator(
-                    "SQL scalar filters are implemented in Task 11",
-                )),
+            .filter_map(|predicate| match predicate {
+                PlanPredicate::Label(matcher) => Some(prepare_label_matcher(matcher)),
+                PlanPredicate::Expression(_) => None,
             })
             .collect::<Result<Vec<_>>>()?;
-        rows.rows.retain(|row| {
-            prepared
+        let mut filtered = Vec::with_capacity(rows.rows.len());
+        for row in rows.rows {
+            if !prepared
                 .iter()
                 .all(|matcher| matcher.matches(row.row().series()))
-        });
+            {
+                continue;
+            }
+            let mut keep = true;
+            for predicate in predicates {
+                if let PlanPredicate::Expression(expression) = predicate {
+                    keep &= aggregate::expression_is_true(expression, &row)?;
+                }
+            }
+            if keep {
+                filtered.push(row);
+            }
+        }
+        rows.rows = filtered;
         check_limit(
             rows.rows.len(),
             self.config.max_intermediate_rows,
@@ -610,8 +711,12 @@ impl<'a> Executor<'a> {
 
 enum OperatorValue {
     Rows(RowSet),
+    Groups(aggregate::GroupSet),
+    AggregateRows(aggregate::AggregateSet),
+    Scalar(f64),
     InstantVector(Vec<InstantSample>),
     RangeVector(RangeVectorValue),
+    Table(TableResult),
 }
 
 struct RangeVectorValue {

@@ -2,12 +2,13 @@
 
 use super::{
     AggregateCall, AggregateInput, AggregateKind, AggregateNode, AggregationStage, FilterNode,
-    LimitNode, LogicalPlan, MeasurementSelection, PatternMatchKind, PlanContext, PlanExpression,
-    PlanExpressionKind, PlanNode, PlanPredicate, PlanTimeRange, PlanValueType, ProjectNode,
-    ProjectionExpression, ScalarBinaryKind, ScalarUnaryKind, ScanNode, ScanResolution,
-    SeriesGroupKind, SeriesGroupNode, SortKey, SortNode, TimeBound,
+    LimitNode, LogicalPlan, MeasurementSelection, PatternMatchKind, PlanColumn, PlanContext,
+    PlanDataType, PlanExpression, PlanExpressionKind, PlanNode, PlanPredicate, PlanTimeRange,
+    PlanValueType, ProjectNode, ProjectionExpression, ProjectionItem, ScalarBinaryKind,
+    ScalarUnaryKind, ScanNode, ScanResolution, SeriesGroupKind, SeriesGroupNode, SortKey, SortNode,
+    TimeBound,
 };
-use crate::query::sqlts::typecheck::{TypedProjection, TypedSqlTsQuery};
+use crate::query::sqlts::typecheck::{SqlValueType, TypedProjection, TypedSqlTsQuery};
 use crate::query::sqlts::{
     parse_duration, AggregateArgument, AggregateFunction, PatternKind, PredicateClass, SqlBinaryOp,
     SqlExpr, SqlExprKind, SqlFunction, SqlGroupBy, SqlLiteral, SqlOrderKey, SqlProjection, SqlSpan,
@@ -78,18 +79,28 @@ pub fn plan_sql(query: &TypedSqlTsQuery, context: PlanContext) -> Result<Logical
     let mut projections = Vec::new();
     let mut projection_references = Vec::new();
     let mut wildcard = false;
+    let mut wildcard_columns = Vec::new();
+    let mut projection_items = Vec::new();
     for (projection, typed) in query.query.projections.iter().zip(&query.projections) {
         match (projection, typed) {
-            (SqlProjection::Wildcard { .. }, TypedProjection::Wildcard { .. }) => {
+            (SqlProjection::Wildcard { .. }, TypedProjection::Wildcard { columns }) => {
                 wildcard = true;
+                projection_items.push(ProjectionItem::Wildcard);
+                wildcard_columns.extend(columns.iter().map(|column| PlanColumn {
+                    name: column.name.clone(),
+                    data_type: plan_data_type(column.data_type),
+                }));
                 projection_references.push(None);
             }
-            (SqlProjection::Expr { expr, alias, .. }, TypedProjection::Expr { .. }) => {
+            (SqlProjection::Expr { expr, alias, .. }, TypedProjection::Expr { data_type, .. }) => {
                 let expression = map_scalar_expression(expr, context, Some(&mut calls))?;
                 projection_references.push(Some(expression.clone()));
+                projection_items.push(ProjectionItem::Expression(projections.len()));
                 projections.push(ProjectionExpression {
                     expression,
                     alias: alias.clone(),
+                    output_name: projection_output_name(expr, alias.as_deref()),
+                    data_type: plan_data_type(*data_type),
                 });
             }
             _ => {
@@ -181,12 +192,49 @@ pub fn plan_sql(query: &TypedSqlTsQuery, context: PlanContext) -> Result<Logical
         input: Box::new(root),
         expressions: projections,
         wildcard,
+        wildcard_columns,
+        items: projection_items,
     });
 
     Ok(LogicalPlan {
         root,
         output_type: PlanValueType::Table,
     })
+}
+
+const fn plan_data_type(data_type: SqlValueType) -> PlanDataType {
+    match data_type {
+        SqlValueType::TimestampNanosecond => PlanDataType::TimestampNanosecond,
+        SqlValueType::Float64 => PlanDataType::Float64,
+        SqlValueType::Int64 => PlanDataType::Int64,
+        SqlValueType::UInt64 => PlanDataType::UInt64,
+        SqlValueType::Boolean => PlanDataType::Boolean,
+        SqlValueType::Utf8 => PlanDataType::Utf8,
+    }
+}
+
+fn projection_output_name(expression: &SqlExpr, alias: Option<&str>) -> String {
+    if let Some(alias) = alias {
+        return alias.to_string();
+    }
+    match &expression.kind {
+        SqlExprKind::Column { name, .. } => name.clone(),
+        SqlExprKind::Function(SqlFunction::Now) => "now".to_string(),
+        SqlExprKind::Function(SqlFunction::Aggregate { function, .. }) => {
+            format!("{function:?}").to_ascii_lowercase()
+        }
+        SqlExprKind::Function(SqlFunction::TimeSeries { function, .. }) => match function {
+            TSFunction::TimeBucket { .. } => "time_bucket",
+            TSFunction::Rate { .. } => "rate",
+            TSFunction::Delta { .. } => "delta",
+            TSFunction::Derivative { .. } => "derivative",
+            TSFunction::First { .. } => "first",
+            TSFunction::Last { .. } => "last",
+            TSFunction::HistogramQuantile { .. } => "histogram_quantile",
+        }
+        .to_string(),
+        _ => "expression".to_string(),
+    }
 }
 
 fn group_expression(

@@ -81,6 +81,32 @@ pub enum PlanValueType {
     Table,
 }
 
+/// Scalar data type retained by typed table projections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlanDataType {
+    /// Nanoseconds since the Unix epoch.
+    TimestampNanosecond,
+    /// IEEE-754 double precision.
+    Float64,
+    /// Signed 64-bit integer.
+    Int64,
+    /// Unsigned 64-bit integer.
+    UInt64,
+    /// Boolean.
+    Boolean,
+    /// UTF-8 string.
+    Utf8,
+}
+
+/// One typed table column planned from SQL schema inference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanColumn {
+    /// SQL-visible output name.
+    pub name: String,
+    /// Inferred scalar type.
+    pub data_type: PlanDataType,
+}
+
 /// A complete logical query plan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogicalPlan {
@@ -555,8 +581,21 @@ pub enum PatternMatchKind {
 pub struct ProjectionExpression {
     /// Expression after aggregate calls are replaced with result references.
     pub expression: PlanExpression,
-    /// Optional result alias.
+    /// Optional source alias retained for frontend introspection.
     pub alias: Option<String>,
+    /// Final SQL-visible output name, including aliases.
+    pub output_name: String,
+    /// Type inferred before logical planning.
+    pub data_type: PlanDataType,
+}
+
+/// One source-ordered item in a SQL projection list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProjectionItem {
+    /// Expand the typed wildcard columns at this position.
+    Wildcard,
+    /// Evaluate the explicit projection at the given expression index.
+    Expression(usize),
 }
 
 /// Result projection operator.
@@ -568,6 +607,10 @@ pub struct ProjectNode {
     pub expressions: Vec<ProjectionExpression>,
     /// Whether a wildcard is present.
     pub wildcard: bool,
+    /// Deterministically expanded wildcard columns and their inferred types.
+    pub wildcard_columns: Vec<PlanColumn>,
+    /// Wildcard and explicit-expression positions in original SELECT-list order.
+    pub items: Vec<ProjectionItem>,
 }
 
 /// One language-independent sort key.
