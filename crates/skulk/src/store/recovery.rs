@@ -1,7 +1,7 @@
 //! Integrated startup, WAL replay, and durable flush lifecycle.
 
 use crate::error::{Result, TsmError};
-use crate::model::WideRow;
+use crate::model::{Timestamp, WideRow};
 use crate::store::buffer::{
     BatchQualification, BatchValidator, FlushPolicy, MeasurementBuffer, MeasurementState,
 };
@@ -279,6 +279,18 @@ impl RecoveryStore {
         }
         drop(cutoffs);
         self.write_validated_batch(rows, qualification)
+    }
+
+    /// Returns the durable hard-reject cutoff used by the shared ingest policy.
+    ///
+    /// This exposes only the effective cutoff; O3 remains an ingestion-layer
+    /// concern and is not applied by direct storage APIs.
+    pub fn retention_reject_cutoff(
+        &self,
+        measurement: &str,
+        now: Timestamp,
+    ) -> Result<Option<Timestamp>> {
+        self.retention.reject_cutoff(measurement, now)
     }
 
     fn write_validated_batch(
