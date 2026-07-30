@@ -139,6 +139,7 @@ fn instant_window_is_open_lower_closed_upper_and_uses_latest_field_sample() {
     assert_eq!(vector[0].source_timestamp(), at - lookback + 1);
     assert_eq!(vector[0].evaluation_timestamp(), at);
     assert_eq!(vector[0].value(), 3.0);
+    assert!(!vector[0].metric_name_is_dropped());
     assert_eq!(vector[1].series().tags()["host"], "upper");
     assert_eq!(vector[1].source_timestamp(), at);
 

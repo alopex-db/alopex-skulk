@@ -1,5 +1,7 @@
 //! Storage-independent logical-plan execution core.
 
+mod functions;
+
 use crate::model::{FieldValue, SeriesKey, Timestamp};
 use crate::query::plan::{
     LogicalPlan, PlanNode, PlanPredicate, PlanTimeRange, PlanValueType, ScanNode, SeriesGroupKind,
@@ -161,6 +163,7 @@ pub struct InstantSample {
     evaluation_timestamp: Timestamp,
     source_timestamp: Timestamp,
     value: f64,
+    drop_metric_name: bool,
 }
 
 impl InstantSample {
@@ -174,7 +177,8 @@ impl InstantSample {
         self.evaluation_timestamp
     }
 
-    /// Returns the timestamp of the selected stored sample.
+    /// Returns the selected stored timestamp, or the evaluation timestamp for
+    /// a computed function result.
     pub const fn source_timestamp(&self) -> Timestamp {
         self.source_timestamp
     }
@@ -182,6 +186,11 @@ impl InstantSample {
     /// Returns the selected floating-point value.
     pub const fn value(&self) -> f64 {
         self.value
+    }
+
+    /// Returns whether PromQL result materialization must omit `__name__`.
+    pub const fn metric_name_is_dropped(&self) -> bool {
+        self.drop_metric_name
     }
 }
 
@@ -209,6 +218,7 @@ impl RangeSeries {
 pub struct MatrixSeries {
     series: SeriesKey,
     samples: Vec<FloatSample>,
+    drop_metric_name: bool,
 }
 
 impl MatrixSeries {
@@ -220,6 +230,11 @@ impl MatrixSeries {
     /// Returns samples timestamped at range-query evaluation steps.
     pub fn samples(&self) -> &[FloatSample] {
         &self.samples
+    }
+
+    /// Returns whether PromQL result materialization must omit `__name__`.
+    pub const fn metric_name_is_dropped(&self) -> bool {
+        self.drop_metric_name
     }
 }
 
@@ -260,7 +275,7 @@ impl<'a> Executor<'a> {
     ) -> Result<ExecutionValue> {
         match self.evaluate_node(&plan.root, output_timestamp)? {
             OperatorValue::InstantVector(vector) => Ok(ExecutionValue::InstantVector(vector)),
-            OperatorValue::RangeVector(series) => Ok(ExecutionValue::RangeVector(series)),
+            OperatorValue::RangeVector(range) => Ok(ExecutionValue::RangeVector(range.series)),
             OperatorValue::Rows(_) => Err(execution_error(
                 "a Scan or Filter cannot be a final query result",
             )),
@@ -307,7 +322,7 @@ impl<'a> Executor<'a> {
             "range evaluation steps",
         )?;
 
-        let mut matrix: BTreeMap<SeriesKey, Vec<FloatSample>> = BTreeMap::new();
+        let mut matrix: BTreeMap<(SeriesKey, bool), Vec<FloatSample>> = BTreeMap::new();
         let mut output_samples = 0usize;
         let mut timestamp = range.start;
         loop {
@@ -324,7 +339,7 @@ impl<'a> Executor<'a> {
             )?;
             for sample in vector {
                 matrix
-                    .entry(sample.series)
+                    .entry((sample.series, sample.drop_metric_name))
                     .or_default()
                     .push(FloatSample::new(timestamp, sample.value));
             }
@@ -339,7 +354,11 @@ impl<'a> Executor<'a> {
         }
         Ok(matrix
             .into_iter()
-            .map(|(series, samples)| MatrixSeries { series, samples })
+            .map(|((series, drop_metric_name), samples)| MatrixSeries {
+                series,
+                samples,
+                drop_metric_name,
+            })
             .collect())
     }
 
@@ -361,9 +380,21 @@ impl<'a> Executor<'a> {
                     )),
                 }
             }
-            PlanNode::RangeFunction(_) => Err(unsupported_operator(
-                "range-vector functions are implemented in Task 10",
-            )),
+            PlanNode::RangeFunction(function) => {
+                let input = self.evaluate_node(&function.input, output_timestamp)?;
+                let OperatorValue::RangeVector(range) = input else {
+                    return Err(execution_error(
+                        "range-vector functions require a RangeVector input",
+                    ));
+                };
+                let vector = functions::evaluate(function.function, range, output_timestamp);
+                check_limit(
+                    vector.len(),
+                    self.config.max_output_samples,
+                    "range-function output samples",
+                )?;
+                Ok(OperatorValue::InstantVector(vector))
+            }
             PlanNode::Aggregate(_)
             | PlanNode::Binary(_)
             | PlanNode::Project(_)
@@ -519,6 +550,7 @@ impl<'a> Executor<'a> {
                     evaluation_timestamp: output_timestamp,
                     source_timestamp,
                     value,
+                    drop_metric_name: false,
                 })
             })
             .collect::<Vec<_>>();
@@ -566,19 +598,25 @@ impl<'a> Executor<'a> {
                 .or_default()
                 .push(FloatSample::new(timestamp, value));
         }
-        Ok(OperatorValue::RangeVector(
-            grouped
+        Ok(OperatorValue::RangeVector(RangeVectorValue {
+            series: grouped
                 .into_iter()
                 .map(|(series, samples)| RangeSeries { series, samples })
                 .collect(),
-        ))
+            window,
+        }))
     }
 }
 
 enum OperatorValue {
     Rows(RowSet),
     InstantVector(Vec<InstantSample>),
-    RangeVector(Vec<RangeSeries>),
+    RangeVector(RangeVectorValue),
+}
+
+struct RangeVectorValue {
+    series: Vec<RangeSeries>,
+    window: SeriesWindow,
 }
 
 struct RowSet {
