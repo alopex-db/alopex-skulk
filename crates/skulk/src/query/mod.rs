@@ -6,6 +6,9 @@ mod nimffi;
 #[cfg(feature = "promql")]
 pub mod promql;
 
+#[cfg(feature = "sql-ts")]
+pub mod sqlts;
+
 mod types;
 
 pub use types::{LabelMatcher, MatchOp, QueryResult, QueryResultKind, TSFunction};

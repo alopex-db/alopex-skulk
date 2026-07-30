@@ -1,8 +1,3 @@
-// The SQL-only feature compiles the shared bridge before task 4.2 adds its
-// wire-AST consumer. Keep that matrix warning-free without weakening other
-// feature combinations.
-#![cfg_attr(all(feature = "sql-ts", not(feature = "promql")), allow(dead_code))]
-
 use crate::{Result, TsmError};
 use serde::de::DeserializeOwned;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
@@ -46,7 +41,6 @@ static INIT: Once = Once::new();
 static CONTRACT_VERSION: OnceLock<std::result::Result<String, String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // SqlTs is consumed by task 4.2; the shared bridge lands first.
 pub(crate) enum ParserLanguage {
     #[cfg(feature = "promql")]
     PromQl,
