@@ -21,8 +21,8 @@ links = "skulk_nim_parser"
 # Text query frontends (spec skulk-v0-4, rulings D1/D2). The core profile
 # (--no-default-features) stays pure Rust with zero C/Nim artifacts.
 default = ["promql", "sql-ts"]
-promql = ["dep:rmp-serde"]
-sql-ts = ["dep:rmp-serde"]
+promql = ["dep:rmp", "dep:rmp-serde"]
+sql-ts = ["dep:rmp", "dep:rmp-serde"]
 
 [dependencies]
 # Serialization
@@ -45,7 +45,9 @@ parquet = { version = "=55.2.0", default-features = false, features = ["arrow", 
 regex = { version = "1.11", default-features = false, features = ["std", "perf", "unicode"] }
 
 # Nim parser FFI bridge payloads (feature-gated; not part of the core profile)
-rmp-serde = { version = "1.3", optional = true }
+# Keep the MessagePack stack on Edition 2021 for the declared Rust 1.82 MSRV.
+rmp = { version = "=0.8.14", optional = true }
+rmp-serde = { version = "=1.3.0", optional = true }
 
 # Error handling
 thiserror = { workspace = true }

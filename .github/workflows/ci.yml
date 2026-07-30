@@ -10,6 +10,8 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
   RUST_BACKTRACE: 1
+  ALOPEX_NIM_PARSER_REF: 17d6c5b12cd3f5b1ce0ab8b4f7b983ee955df795
+  NIM_SQL_PARSER_DIR: .ci/alopex/crates/alopex-sql/nim-sql-parser
 
 jobs:
   # Check code formatting
@@ -71,6 +73,49 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # Linux uses the checked-in, checksum-verified parser artifact. macOS
+      # and Windows build the same pinned Nim source used by Alopex CI.
+      - name: Checkout Alopex Nim parser source
+        if: runner.os != 'Linux'
+        uses: actions/checkout@v4
+        with:
+          repository: alopex-db/alopex
+          ref: ${{ env.ALOPEX_NIM_PARSER_REF }}
+          path: .ci/alopex
+          persist-credentials: false
+
+      - name: Setup Nim
+        if: runner.os != 'Linux'
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.x'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Nim SQL parser library
+        if: runner.os != 'Linux'
+        shell: bash
+        run: bash .ci/alopex/scripts/build-nim-parser.sh --backend host
+
+      - name: Run Nim SQL parser tests
+        if: runner.os != 'Linux'
+        shell: bash
+        run: bash .ci/alopex/scripts/test-nim-parser.sh --backend host
+
+      - name: Configure Nim SQL parser for Skulk
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          parser_dir="${GITHUB_WORKSPACE}/${NIM_SQL_PARSER_DIR}"
+          cp \
+            "${GITHUB_WORKSPACE}/crates/skulk/nim-parser/vendor/x86_64-unknown-linux-gnu/CONTRACT_VERSION" \
+            "${parser_dir}/CONTRACT_VERSION"
+          echo "SKULK_NIM_PARSER_LIB_DIR=${parser_dir}" >> "$GITHUB_ENV"
+
+      - name: Add Nim SQL parser to PATH
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "${GITHUB_WORKSPACE}/${NIM_SQL_PARSER_DIR}" >> "$GITHUB_PATH"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
