@@ -10,7 +10,7 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
   RUST_BACKTRACE: 1
-  ALOPEX_NIM_PARSER_REF: 17d6c5b12cd3f5b1ce0ab8b4f7b983ee955df795
+  ALOPEX_NIM_PARSER_REF: v0.8.1
   NIM_SQL_PARSER_DIR: .ci/alopex/crates/alopex-sql/nim-sql-parser
 
 jobs:
