@@ -17,6 +17,7 @@ use arrow_schema::{ArrowError, DataType, Field};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Per-batch and aggregate row allocation limits for minimal reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +105,7 @@ impl ParquetReader {
         let mut rows = Vec::with_capacity(expected_rows);
         for active_file in files {
             let before = rows.len();
+            let mut series_cache = DecodedSeriesCache::default();
             let file = File::open(segments_dir.join(active_file.name()))?;
             let reader = ParquetRecordBatchReaderBuilder::try_new(file)
                 .map_err(parquet_error)?
@@ -111,7 +113,12 @@ impl ParquetReader {
                 .build()
                 .map_err(parquet_error)?;
             for batch in reader {
-                decode_batch(measurement, &batch.map_err(arrow_error)?, &mut rows)?;
+                decode_batch_with_series_cache(
+                    measurement,
+                    &batch.map_err(arrow_error)?,
+                    &mut series_cache,
+                    &mut rows,
+                )?;
                 if rows.len() > self.config.max_total_rows {
                     return Err(TsmError::ResourceLimit(
                         "decoded rows exceed reader limit".into(),
@@ -163,9 +170,87 @@ impl ParquetReader {
     }
 }
 
-fn decode_batch(
+#[derive(Default)]
+pub(crate) struct DecodedSeriesCache {
+    last: Option<Arc<SeriesKey>>,
+}
+
+pub(crate) struct DecodedFloatSample {
+    pub(crate) series: Arc<SeriesKey>,
+    pub(crate) timestamp: i64,
+    pub(crate) ingest_seq: IngestSeq,
+    pub(crate) value: Option<f64>,
+}
+
+pub(crate) fn decode_float_batch_with_series_cache(
+    measurement: &str,
+    field_name: &str,
+    batch: &RecordBatch,
+    series_cache: &mut DecodedSeriesCache,
+    output: &mut Vec<DecodedFloatSample>,
+) -> Result<bool> {
+    let schema = batch.schema();
+    let time_index = schema.index_of(TIME_COLUMN).map_err(arrow_error)?;
+    let sequence_index = schema.index_of(INGEST_SEQ_COLUMN).map_err(arrow_error)?;
+    validate_system_kind(schema.field(time_index), TIME_COLUMN_KIND)?;
+    validate_system_kind(schema.field(sequence_index), INGEST_SEQ_COLUMN_KIND)?;
+    let field_index = schema.index_of(field_name).ok();
+    if let Some(field_index) = field_index {
+        let field = schema.field(field_index);
+        if field
+            .metadata()
+            .get(COLUMN_KIND_METADATA_KEY)
+            .map(String::as_str)
+            != Some(FIELD_COLUMN_KIND)
+            || field.data_type() != &DataType::Float64
+        {
+            return Ok(false);
+        }
+    }
+
+    let times = batch
+        .column(time_index)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .ok_or_else(|| TsmError::Corruption("Parquet time column is not timestamp(ns)".into()))?;
+    let sequences = batch
+        .column(sequence_index)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| TsmError::Corruption("Parquet ingest sequence is not u64".into()))?;
+    let values = field_index
+        .map(|field_index| {
+            batch
+                .column(field_index)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| TsmError::Corruption("Parquet float field is not float64".into()))
+        })
+        .transpose()?;
+    let tags = tag_columns(schema.fields(), time_index, sequence_index)?;
+
+    for row_index in 0..batch.num_rows() {
+        if times.is_null(row_index) || sequences.is_null(row_index) {
+            return Err(TsmError::Corruption(
+                "Parquet system columns contain null".into(),
+            ));
+        }
+        output.push(DecodedFloatSample {
+            series: decoded_series(measurement, batch, &tags, row_index, series_cache)?,
+            timestamp: times.value(row_index),
+            ingest_seq: IngestSeq::new(sequences.value(row_index)),
+            value: values
+                .filter(|values| !values.is_null(row_index))
+                .map(|values| values.value(row_index)),
+        });
+    }
+    Ok(true)
+}
+
+pub(crate) fn decode_batch_with_series_cache(
     measurement: &str,
     batch: &RecordBatch,
+    series_cache: &mut DecodedSeriesCache,
     output: &mut Vec<SequencedRow>,
 ) -> Result<()> {
     let schema = batch.schema();
@@ -184,7 +269,7 @@ fn decode_batch(
         .downcast_ref::<UInt64Array>()
         .ok_or_else(|| TsmError::Corruption("Parquet ingest sequence is not u64".into()))?;
 
-    let mut tags = Vec::new();
+    let tags = tag_columns(schema.fields(), time_index, sequence_index)?;
     let mut fields = Vec::new();
     for (index, field) in schema.fields().iter().enumerate() {
         if index == time_index || index == sequence_index {
@@ -195,9 +280,7 @@ fn decode_batch(
             .get(COLUMN_KIND_METADATA_KEY)
             .map(String::as_str)
         {
-            Some(TAG_COLUMN_KIND) if field.data_type() == &DataType::Utf8 => {
-                tags.push((index, field.name().clone()));
-            }
+            Some(TAG_COLUMN_KIND) if field.data_type() == &DataType::Utf8 => {}
             Some(FIELD_COLUMN_KIND) => fields.push((index, field.name().clone())),
             _ => {
                 return Err(TsmError::Corruption(format!(
@@ -214,17 +297,8 @@ fn decode_batch(
                 "Parquet system columns contain null".into(),
             ));
         }
-        let mut row_tags = Tags::new();
-        for (index, name) in &tags {
-            let values = batch
-                .column(*index)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| TsmError::Corruption("tag column is not Utf8".into()))?;
-            if !values.is_null(row_index) {
-                row_tags.insert(name.clone(), values.value(row_index).to_owned());
-            }
-        }
+        let series = decoded_series(measurement, batch, &tags, row_index, series_cache)?;
+        let series_id = series.id();
         let mut row_fields = Fields::new();
         for (index, name) in &fields {
             if let Some(value) = decode_field(batch, *index, row_index)? {
@@ -233,14 +307,94 @@ fn decode_batch(
         }
         output.push(SequencedRow::new(
             IngestSeq::new(sequences.value(row_index)),
-            WideRow::new(
-                SeriesKey::new(measurement, row_tags),
-                times.value(row_index),
-                row_fields,
-            ),
+            WideRow::with_shared_series(series, series_id, times.value(row_index), row_fields),
         ));
     }
     Ok(())
+}
+
+fn tag_columns(
+    fields: &arrow_schema::Fields,
+    time_index: usize,
+    sequence_index: usize,
+) -> Result<Vec<(usize, String)>> {
+    let mut tags = Vec::new();
+    for (index, field) in fields.iter().enumerate() {
+        if index == time_index || index == sequence_index {
+            continue;
+        }
+        match field
+            .metadata()
+            .get(COLUMN_KIND_METADATA_KEY)
+            .map(String::as_str)
+        {
+            Some(TAG_COLUMN_KIND) if field.data_type() == &DataType::Utf8 => {
+                tags.push((index, field.name().clone()));
+            }
+            Some(FIELD_COLUMN_KIND) => {}
+            _ => {
+                return Err(TsmError::Corruption(format!(
+                    "Parquet column '{}' has invalid Skulk metadata",
+                    field.name()
+                )));
+            }
+        }
+    }
+    Ok(tags)
+}
+
+fn decoded_series(
+    measurement: &str,
+    batch: &RecordBatch,
+    tags: &[(usize, String)],
+    row_index: usize,
+    cache: &mut DecodedSeriesCache,
+) -> Result<Arc<SeriesKey>> {
+    if let Some(series) = &cache.last {
+        if series.measurement() == measurement
+            && series_matches_row(series, batch, tags, row_index)?
+        {
+            return Ok(Arc::clone(series));
+        }
+    }
+
+    let mut row_tags = Tags::new();
+    for (index, name) in tags {
+        let values = batch
+            .column(*index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| TsmError::Corruption("tag column is not Utf8".into()))?;
+        if !values.is_null(row_index) {
+            row_tags.insert(name.clone(), values.value(row_index).to_owned());
+        }
+    }
+    let series = Arc::new(SeriesKey::new(measurement, row_tags));
+    cache.last = Some(Arc::clone(&series));
+    Ok(series)
+}
+
+fn series_matches_row(
+    series: &SeriesKey,
+    batch: &RecordBatch,
+    tags: &[(usize, String)],
+    row_index: usize,
+) -> Result<bool> {
+    if series.tags().len() > tags.len() {
+        return Ok(false);
+    }
+    for (index, name) in tags {
+        let values = batch
+            .column(*index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| TsmError::Corruption("tag column is not Utf8".into()))?;
+        let actual = (!values.is_null(row_index)).then(|| values.value(row_index));
+        if series.tags().get(name).map(String::as_str) != actual {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn decode_field(batch: &RecordBatch, column: usize, row: usize) -> Result<Option<FieldValue>> {

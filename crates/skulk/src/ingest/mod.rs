@@ -7,7 +7,7 @@ pub mod line_protocol;
 pub mod remote_write;
 
 use crate::error::{Result, TsmError};
-use crate::model::{FieldValue, SeriesId, WideRow};
+use crate::model::{FieldValue, SeriesId, Timestamp, WideRow};
 use crate::store::buffer::{
     BatchQualification, BatchValidator, ColumnRole, MeasurementState, INGEST_SEQ_COLUMN,
     TIME_COLUMN,
@@ -16,6 +16,7 @@ use crate::store::recovery::RecoveryStore;
 use crate::store::seq::IngestSeq;
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
+use std::time::Duration;
 
 const DEFAULT_MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_EXPANDED_BYTES: usize = 64 * 1024 * 1024;
@@ -29,6 +30,7 @@ const DEFAULT_MAX_BUFFERED_ROWS: usize = 131_072;
 const DEFAULT_MAX_BUFFERED_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_WAL_BYTES: usize = 512 * 1024 * 1024;
 const RESERVED_PREFIX: &str = "_skulk_";
+const DEFAULT_O3_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 /// Protocol-specific position used to correlate acceptance and rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -41,6 +43,86 @@ pub enum SourceLocation {
     Item(usize),
     /// A Prometheus TimeSeries index.
     Series(usize),
+}
+
+/// Action for a timestamp older than the configured O3 wall-clock window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TooOldPolicy {
+    /// Reject the individual row with an O3-specific reason.
+    Reject,
+    /// Accept the row and expose a structured warning.
+    AcceptWithWarning,
+    /// Drop the row and increment the observable dropped count.
+    Drop,
+}
+
+/// Process-local O3 policy shared by every protocol at the ingestion boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct O3Config {
+    allowed_window: Duration,
+    too_old_policy: TooOldPolicy,
+    allow_backfill: bool,
+}
+
+impl O3Config {
+    /// One-hour, reject-too-old, non-backfill process default.
+    pub const DEFAULT: Self = Self {
+        allowed_window: DEFAULT_O3_WINDOW,
+        too_old_policy: TooOldPolicy::Reject,
+        allow_backfill: false,
+    };
+
+    /// Creates an O3 policy whose wall-clock window fits the timestamp domain.
+    pub fn new(
+        allowed_window: Duration,
+        too_old_policy: TooOldPolicy,
+        allow_backfill: bool,
+    ) -> Result<Self> {
+        if allowed_window.as_nanos() > i64::MAX as u128 {
+            return Err(TsmError::InvalidInput(
+                "O3 allowed window exceeds timestamp range".into(),
+            ));
+        }
+        Ok(Self {
+            allowed_window,
+            too_old_policy,
+            allow_backfill,
+        })
+    }
+
+    /// Returns the wall-clock age accepted without applying `too_old_policy`.
+    pub const fn allowed_window(self) -> Duration {
+        self.allowed_window
+    }
+
+    /// Returns the action for rows older than the allowed window.
+    pub const fn too_old_policy(self) -> TooOldPolicy {
+        self.too_old_policy
+    }
+
+    /// Returns whether O3 checks are disabled for an observed backfill session.
+    pub const fn allow_backfill(self) -> bool {
+        self.allow_backfill
+    }
+
+    fn cutoff(self, now: Timestamp) -> Timestamp {
+        now.saturating_sub(self.allowed_window.as_nanos() as i64)
+    }
+}
+
+impl Default for O3Config {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Machine-readable source of an ingestion timestamp-policy decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestPolicyBasis {
+    /// The process-local out-of-order wall-clock window.
+    O3,
+    /// The durable measurement retention cutoff.
+    Retention,
 }
 
 #[derive(Debug)]
@@ -110,11 +192,24 @@ impl IngestBatch {
 pub struct IngestRejection {
     source: SourceLocation,
     reason: String,
+    policy_basis: Option<IngestPolicyBasis>,
 }
 
 impl IngestRejection {
     fn new(source: SourceLocation, reason: String) -> Self {
-        Self { source, reason }
+        Self {
+            source,
+            reason,
+            policy_basis: None,
+        }
+    }
+
+    fn policy(source: SourceLocation, reason: String, basis: IngestPolicyBasis) -> Self {
+        Self {
+            source,
+            reason,
+            policy_basis: Some(basis),
+        }
     }
 
     /// Returns the decoder-defined source position.
@@ -125,6 +220,56 @@ impl IngestRejection {
     /// Returns why the item was rejected.
     pub fn reason(&self) -> &str {
         &self.reason
+    }
+
+    /// Returns the timestamp-policy source, or `None` for decoder/schema rejection.
+    pub const fn policy_basis(&self) -> Option<IngestPolicyBasis> {
+        self.policy_basis
+    }
+}
+
+/// One accepted row whose O3 policy requested an observable warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestWarning {
+    source: SourceLocation,
+    basis: IngestPolicyBasis,
+    timestamp: Timestamp,
+    cutoff: Timestamp,
+}
+
+impl IngestWarning {
+    fn new(
+        source: SourceLocation,
+        basis: IngestPolicyBasis,
+        timestamp: Timestamp,
+        cutoff: Timestamp,
+    ) -> Self {
+        Self {
+            source,
+            basis,
+            timestamp,
+            cutoff,
+        }
+    }
+
+    /// Returns the decoder-defined source position.
+    pub const fn source(&self) -> SourceLocation {
+        self.source
+    }
+
+    /// Returns the policy that produced this warning.
+    pub const fn basis(&self) -> IngestPolicyBasis {
+        self.basis
+    }
+
+    /// Returns the accepted row timestamp.
+    pub const fn timestamp(&self) -> Timestamp {
+        self.timestamp
+    }
+
+    /// Returns the oldest timestamp accepted without a warning at evaluation time.
+    pub const fn cutoff(&self) -> Timestamp {
+        self.cutoff
     }
 }
 
@@ -152,6 +297,9 @@ impl AcceptedRow {
 pub struct IngestOutcome {
     accepted: Vec<AcceptedRow>,
     rejections: Vec<IngestRejection>,
+    warnings: Vec<IngestWarning>,
+    dropped: usize,
+    backfill_active: bool,
 }
 
 impl IngestOutcome {
@@ -173,6 +321,26 @@ impl IngestOutcome {
     /// Returns rejected items ordered by source location.
     pub fn rejections(&self) -> &[IngestRejection] {
         &self.rejections
+    }
+
+    /// Returns the number of accepted rows carrying an O3 warning.
+    pub fn warning_count(&self) -> usize {
+        self.warnings.len()
+    }
+
+    /// Returns structured warnings in decoder input order.
+    pub fn warnings(&self) -> &[IngestWarning] {
+        &self.warnings
+    }
+
+    /// Returns the number of rows intentionally dropped by O3 policy.
+    pub const fn dropped_count(&self) -> usize {
+        self.dropped
+    }
+
+    /// Returns whether O3 checks were disabled for this batch.
+    pub const fn backfill_active(&self) -> bool {
+        self.backfill_active
     }
 }
 
@@ -453,6 +621,15 @@ pub trait IngestSink {
         usize::MAX
     }
 
+    /// Returns the durable hard-reject cutoff for one measurement, if configured.
+    fn retention_reject_cutoff(
+        &self,
+        _measurement: &str,
+        _now: Timestamp,
+    ) -> Result<Option<Timestamp>> {
+        Ok(None)
+    }
+
     /// Writes rows already qualified by the caller's single admission walk.
     ///
     /// The default falls back to the re-validating path for sinks without a
@@ -486,6 +663,14 @@ impl IngestSink for RecoveryStore {
         self.wal_max_entry_bytes()
     }
 
+    fn retention_reject_cutoff(
+        &self,
+        measurement: &str,
+        now: Timestamp,
+    ) -> Result<Option<Timestamp>> {
+        RecoveryStore::retention_reject_cutoff(self, measurement, now)
+    }
+
     fn write_qualified_batch(
         &mut self,
         rows: Vec<WideRow>,
@@ -500,16 +685,99 @@ impl IngestSink for RecoveryStore {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowPolicyDecision {
+    Admit,
+    Warn {
+        cutoff: Timestamp,
+    },
+    Reject {
+        basis: IngestPolicyBasis,
+        cutoff: Timestamp,
+    },
+    Drop,
+}
+
+fn decide_row_policy(
+    timestamp: Timestamp,
+    now: Timestamp,
+    retention_cutoff: Option<Timestamp>,
+    o3_config: O3Config,
+) -> RowPolicyDecision {
+    if let Some(cutoff) = retention_cutoff {
+        if timestamp < cutoff {
+            return RowPolicyDecision::Reject {
+                basis: IngestPolicyBasis::Retention,
+                cutoff,
+            };
+        }
+    }
+    if o3_config.allow_backfill() {
+        return RowPolicyDecision::Admit;
+    }
+    let cutoff = o3_config.cutoff(now);
+    if timestamp >= cutoff {
+        return RowPolicyDecision::Admit;
+    }
+    match o3_config.too_old_policy() {
+        TooOldPolicy::Reject => RowPolicyDecision::Reject {
+            basis: IngestPolicyBasis::O3,
+            cutoff,
+        },
+        TooOldPolicy::AcceptWithWarning => RowPolicyDecision::Warn { cutoff },
+        TooOldPolicy::Drop => RowPolicyDecision::Drop,
+    }
+}
+
+fn policy_rejection_reason(
+    basis: IngestPolicyBasis,
+    timestamp: Timestamp,
+    cutoff: Timestamp,
+) -> String {
+    match basis {
+        IngestPolicyBasis::O3 => {
+            format!("O3 timestamp {timestamp} is older than wall-clock cutoff {cutoff}")
+        }
+        IngestPolicyBasis::Retention => {
+            format!("timestamp {timestamp} is older than retention cutoff {cutoff}")
+        }
+    }
+}
+
 /// Shared validation, admission, and durable-write service for all decoders.
 pub struct Ingestor<S> {
     sink: S,
     limits: IngestLimits,
+    o3_config: O3Config,
 }
 
 impl<S: IngestSink> Ingestor<S> {
     /// Creates an ingestion service around an injected durable sink.
     pub const fn new(sink: S, limits: IngestLimits) -> Self {
-        Self { sink, limits }
+        Self {
+            sink,
+            limits,
+            o3_config: O3Config::DEFAULT,
+        }
+    }
+
+    /// Creates an ingestion service with an explicit process-local O3 policy.
+    pub const fn with_o3_config(sink: S, limits: IngestLimits, o3_config: O3Config) -> Self {
+        Self {
+            sink,
+            limits,
+            o3_config,
+        }
+    }
+
+    /// Returns the O3 policy used by subsequent batches.
+    pub const fn o3_config(&self) -> O3Config {
+        self.o3_config
+    }
+
+    /// Replaces the process-local O3 policy without restarting or persisting it.
+    pub fn set_o3_config(&mut self, o3_config: O3Config) {
+        self.o3_config = o3_config;
     }
 
     /// Returns the underlying sink.
@@ -528,6 +796,9 @@ impl<S: IngestSink> Ingestor<S> {
     }
 
     /// Validates, admits, and durably writes one decoder batch.
+    ///
+    /// `now` is the ingest node's wall-clock time in Unix nanoseconds. O3
+    /// decisions never consult a series or measurement high-water mark.
     pub fn ingest(&mut self, batch: IngestBatch, now: i64) -> Result<IngestOutcome> {
         self.limits
             .validate_request_bytes(batch.encoded_bytes, batch.expanded_bytes)?;
@@ -542,8 +813,11 @@ impl<S: IngestSink> Ingestor<S> {
         let mut candidate_bytes = 0_usize;
         let mut valid = Vec::new();
         let mut rejections = batch.rejections;
+        let mut warnings = Vec::new();
+        let mut dropped = 0_usize;
         let max_entry_bytes = self.sink.max_entry_bytes();
         let mut validators: BTreeMap<String, BatchValidator<'_>> = BTreeMap::new();
+        let mut retention_cutoffs = BTreeMap::<String, Option<Timestamp>>::new();
         for candidate in batch.rows {
             if observed_series.insert(candidate.row.series_id()) {
                 ensure_at_most(
@@ -554,24 +828,82 @@ impl<S: IngestSink> Ingestor<S> {
             }
 
             let measurement = candidate.row.series().measurement();
-            let validator = match validators.get_mut(measurement) {
-                Some(validator) => validator,
-                None => validators.entry(measurement.to_owned()).or_insert_with(|| {
-                    BatchValidator::new(self.sink.measurement_state(measurement), max_entry_bytes)
-                }),
+            let retention_cutoff = match retention_cutoffs.get(measurement) {
+                Some(cutoff) => *cutoff,
+                None => {
+                    let cutoff = self.sink.retention_reject_cutoff(measurement, now)?;
+                    retention_cutoffs.insert(measurement.to_owned(), cutoff);
+                    cutoff
+                }
             };
-            let (row_bytes, admitted) =
-                qualify_row(&candidate.row, self.limits.row, validator, max_entry_bytes)?;
+            let policy = decide_row_policy(
+                candidate.row.timestamp(),
+                now,
+                retention_cutoff,
+                self.o3_config,
+            );
+            let excluded = matches!(
+                policy,
+                RowPolicyDecision::Reject { .. } | RowPolicyDecision::Drop
+            );
+            let (row_bytes, admitted) = if excluded {
+                qualify_row(&candidate.row, self.limits.row, None, max_entry_bytes)?
+            } else {
+                let validator = match validators.get_mut(measurement) {
+                    Some(validator) => validator,
+                    None => validators.entry(measurement.to_owned()).or_insert_with(|| {
+                        BatchValidator::new(
+                            self.sink.measurement_state(measurement),
+                            max_entry_bytes,
+                        )
+                    }),
+                };
+                qualify_row(
+                    &candidate.row,
+                    self.limits.row,
+                    Some(validator),
+                    max_entry_bytes,
+                )?
+            };
             candidate_bytes = checked_add(
                 candidate_bytes,
                 row_bytes,
                 "expanded row byte estimate overflow",
             )?;
-            match admitted {
-                Ok((buffer_bytes, wal_bytes)) => {
-                    valid.push((candidate, buffer_bytes, wal_bytes));
+            match policy {
+                RowPolicyDecision::Reject { basis, cutoff } => {
+                    rejections.push(IngestRejection::policy(
+                        candidate.source,
+                        policy_rejection_reason(basis, candidate.row.timestamp(), cutoff),
+                        basis,
+                    ));
                 }
-                Err(reason) => rejections.push(IngestRejection::new(candidate.source, reason)),
+                RowPolicyDecision::Drop => {
+                    dropped = checked_add(dropped, 1, "O3 dropped row count overflow")?;
+                }
+                RowPolicyDecision::Admit | RowPolicyDecision::Warn { .. } => {
+                    let Some(admitted) = admitted else {
+                        return Err(TsmError::Corruption(
+                            "admitted ingest row was not qualified".into(),
+                        ));
+                    };
+                    match admitted {
+                        Ok((buffer_bytes, wal_bytes)) => {
+                            if let RowPolicyDecision::Warn { cutoff } = policy {
+                                warnings.push(IngestWarning::new(
+                                    candidate.source,
+                                    IngestPolicyBasis::O3,
+                                    candidate.row.timestamp(),
+                                    cutoff,
+                                ));
+                            }
+                            valid.push((candidate, buffer_bytes, wal_bytes));
+                        }
+                        Err(reason) => {
+                            rejections.push(IngestRejection::new(candidate.source, reason));
+                        }
+                    }
+                }
             }
         }
         let qualification = BatchQualification(
@@ -591,6 +923,9 @@ impl<S: IngestSink> Ingestor<S> {
             return Ok(IngestOutcome {
                 accepted: Vec::new(),
                 rejections,
+                warnings,
+                dropped,
+                backfill_active: self.o3_config.allow_backfill(),
             });
         }
 
@@ -631,6 +966,9 @@ impl<S: IngestSink> Ingestor<S> {
         Ok(IngestOutcome {
             accepted,
             rejections,
+            warnings,
+            dropped,
+            backfill_active: self.o3_config.allow_backfill(),
         })
     }
 }
@@ -662,17 +1000,19 @@ fn validate_identifier(
 /// name validity (per-row rejection), and computes the expanded-, buffer-
 /// and WAL-byte estimates in one pass. Byte formulas are identical to
 /// `estimate_and_validate_row_resources`, `estimated_row_bytes` and
-/// `encoded_frame_size`.
+/// `encoded_frame_size`. A missing validator performs resource accounting
+/// only, so an O3/retention-excluded row cannot mutate batch qualification.
 #[allow(clippy::type_complexity)]
 fn qualify_row(
     row: &WideRow,
     limits: RowLimits,
-    validator: &mut BatchValidator<'_>,
+    validator: Option<&mut BatchValidator<'_>>,
     max_entry_bytes: usize,
-) -> Result<(usize, std::result::Result<(usize, usize), String>)> {
+) -> Result<(usize, Option<std::result::Result<(usize, usize), String>>)> {
     ensure_at_most("tags per row", row.series().tags().len(), limits.max_tags)?;
     ensure_at_most("fields per row", row.fields().len(), limits.max_fields)?;
 
+    let mut validator = validator;
     let measurement = row.series().measurement();
     let base = size_of::<i64>() + size_of::<u64>();
     let mut row_bytes = checked_add(base, measurement.len(), "row byte estimate overflow")?;
@@ -681,11 +1021,13 @@ fn qualify_row(
     let mut wal_bytes = 8 + 8 + 4 + measurement.len() + 4 + 4 + 8;
     let mut reject: Option<String> = None;
     let mut new_columns: Vec<(String, ColumnRole)> = Vec::new();
-    if let Err(reason) = validate_identifier("measurement", measurement, limits) {
-        reject.get_or_insert(reason);
-    }
-    if row.fields().is_empty() && reject.is_none() {
-        reject = Some("row must contain at least one field".into());
+    if validator.is_some() {
+        if let Err(reason) = validate_identifier("measurement", measurement, limits) {
+            reject.get_or_insert(reason);
+        }
+        if row.fields().is_empty() && reject.is_none() {
+            reject = Some("row must contain at least one field".into());
+        }
     }
     for (name, value) in row.series().tags() {
         ensure_at_most("tag value bytes", value.len(), limits.max_string_bytes)?;
@@ -706,6 +1048,9 @@ fn qualify_row(
             "WAL entry size overflow",
         )?;
         if reject.is_none() {
+            let Some(validator) = validator.as_deref_mut() else {
+                continue;
+            };
             if let Err(reason) = validate_identifier("tag", name, limits) {
                 reject = Some(reason);
             } else if row.fields().contains_key(name) {
@@ -737,6 +1082,9 @@ fn qualify_row(
         buffer_bytes = checked_add(buffer_bytes, buffer_size, "row byte estimate overflow")?;
         wal_bytes = checked_add(wal_bytes, wal_size, "WAL entry size overflow")?;
         if reject.is_none() {
+            let Some(validator) = validator.as_deref_mut() else {
+                continue;
+            };
             if let Err(reason) = validate_identifier("field", name, limits) {
                 reject = Some(reason);
             } else {
@@ -749,6 +1097,9 @@ fn qualify_row(
             }
         }
     }
+    let Some(validator) = validator else {
+        return Ok((row_bytes, None));
+    };
     if wal_bytes.saturating_sub(8) > max_entry_bytes {
         return Err(TsmError::ResourceLimit(format!(
             "encoded WAL entry is {} bytes, limit is {max_entry_bytes}",
@@ -762,7 +1113,7 @@ fn qualify_row(
             Ok((buffer_bytes, wal_bytes))
         }
     };
-    Ok((row_bytes, admitted))
+    Ok((row_bytes, Some(admitted)))
 }
 
 fn column_role_conflict(name: &str) -> TsmError {

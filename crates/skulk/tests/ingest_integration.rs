@@ -2,13 +2,15 @@ use alopex_skulk::ingest::json::JsonIngestDecoder;
 use alopex_skulk::ingest::line_protocol::LineProtocolDecoder;
 use alopex_skulk::ingest::remote_write::RemoteWriteDecoder;
 use alopex_skulk::ingest::{
-    AdmissionLimits, IngestLimits, Ingestor, RequestLimits, RowLimits, SourceLocation,
+    AdmissionLimits, IngestLimits, Ingestor, O3Config, RequestLimits, RowLimits, SourceLocation,
+    TooOldPolicy,
 };
 use alopex_skulk::model::FieldValue;
 use alopex_skulk::store::recovery::{RecoveryConfig, RecoveryStore};
 use alopex_skulk::store::seq::IngestSeq;
 use prost::Message;
 use snap::raw::Encoder;
+use std::time::Duration;
 
 const NOW: i64 = 10_000_000;
 
@@ -161,6 +163,49 @@ fn partial_success_and_real_store_backpressure_compose_across_protocols() {
         ingestor.sink().read_measurement("cpu").expect("cpu").len(),
         1
     );
+}
+
+#[test]
+fn three_protocols_share_one_o3_policy_at_the_ingestion_boundary() {
+    const HOUR: i64 = 3_600_000_000_000;
+    let wall_now = 10 * HOUR;
+    let too_old = wall_now - 2 * HOUR;
+    let root = tempfile::tempdir().expect("tempdir");
+    let limits = IngestLimits::default();
+    let store = RecoveryStore::open(root.path(), RecoveryConfig::default()).expect("open store");
+    let mut ingestor = Ingestor::with_o3_config(
+        store,
+        limits,
+        O3Config::new(Duration::from_secs(3_600), TooOldPolicy::Drop, false).expect("O3 config"),
+    );
+
+    let line_body = format!("weather value=1.0 {too_old}");
+    let line = LineProtocolDecoder::new(limits)
+        .decode(line_body.as_bytes(), wall_now)
+        .expect("line decode");
+    let line_outcome = ingestor.ingest(line, wall_now).expect("line O3");
+    assert_eq!(line_outcome.accepted_count(), 0);
+    assert_eq!(line_outcome.dropped_count(), 1);
+
+    let remote_body = remote_write_body("cpu_usage", "edge", &[(0.5, too_old / 1_000_000)]);
+    let remote = RemoteWriteDecoder::new(limits)
+        .decode("application/x-protobuf", "snappy", &remote_body)
+        .expect("remote decode");
+    let remote_outcome = ingestor.ingest(remote, wall_now).expect("remote O3");
+    assert_eq!(remote_outcome.accepted_count(), 0);
+    assert_eq!(remote_outcome.dropped_count(), 1);
+
+    let json_body = format!(
+        r#"{{"metrics":[{{"name":"events","fields":{{"count":3}},"timestamp":{too_old}}}]}}"#
+    );
+    let json = JsonIngestDecoder::new(limits)
+        .decode(json_body.as_bytes(), wall_now)
+        .expect("JSON decode");
+    let json_outcome = ingestor.ingest(json, wall_now).expect("JSON O3");
+    assert_eq!(json_outcome.accepted_count(), 0);
+    assert_eq!(json_outcome.dropped_count(), 1);
+
+    assert_eq!(ingestor.sink().pending_row_count(), 0);
 }
 
 fn remote_write_body(measurement: &str, host: &str, samples: &[(f64, i64)]) -> Vec<u8> {

@@ -27,7 +27,7 @@ impl SeriesId {
 }
 
 /// Measurement and tags that define one time-series identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SeriesKey {
     measurement: String,
     tags: Tags,
@@ -165,6 +165,10 @@ impl WideRow {
     /// Returns the stable identifier for this row's series.
     pub const fn series_id(&self) -> SeriesId {
         self.series_id
+    }
+
+    pub(crate) fn shared_series(&self) -> Arc<SeriesKey> {
+        Arc::clone(&self.series)
     }
 
     /// Returns the nanosecond timestamp.

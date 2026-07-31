@@ -1,7 +1,7 @@
 //! Integrated startup, WAL replay, and durable flush lifecycle.
 
 use crate::error::{Result, TsmError};
-use crate::model::WideRow;
+use crate::model::{Timestamp, WideRow};
 use crate::store::buffer::{
     BatchQualification, BatchValidator, FlushPolicy, MeasurementBuffer, MeasurementState,
 };
@@ -13,14 +13,20 @@ use crate::store::parquet_reader::{ParquetReader, ParquetReaderConfig};
 use crate::store::parquet_writer::{
     ParquetWriter, ParquetWriterConfig, PublishHook, PublishedParquet,
 };
+use crate::store::reader::{
+    merge_pending_float_series, merge_pending_rows, FloatSeriesScanResult, ManifestStorageReader,
+    ScanRequest, ScanResult, StorageReader, StorageReaderConfig,
+};
 use crate::store::retention::{
     current_timestamp_nanos, RetentionPolicy, RetentionResult, RetentionStore, TimePartition,
 };
+use crate::store::schema::{MeasurementSchema, SchemaResolver};
 use crate::store::seq::{IngestSeq, SequencedRow, Sequencer};
 use crate::store::wal::{Wal, WalConfig, WalEntry};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 static SEGMENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -31,6 +37,7 @@ pub struct RecoveryConfig {
     buffer: FlushPolicy,
     writer: ParquetWriterConfig,
     reader: ParquetReaderConfig,
+    storage_reader: StorageReaderConfig,
 }
 
 impl RecoveryConfig {
@@ -46,7 +53,14 @@ impl RecoveryConfig {
             buffer,
             writer,
             reader,
+            storage_reader: StorageReaderConfig::DEFAULT,
         }
+    }
+
+    /// Replaces the query scan policy while retaining durability policies.
+    pub const fn with_storage_reader(mut self, storage_reader: StorageReaderConfig) -> Self {
+        self.storage_reader = storage_reader;
+        self
     }
 }
 
@@ -92,8 +106,18 @@ pub struct RecoveryStore {
     sequencer: Sequencer,
     buffers: BTreeMap<String, MeasurementState>,
     pending: BTreeMap<String, Vec<SequencedRow>>,
+    schema: SchemaResolver,
+    float_scan_cache: Mutex<Option<FloatScanCacheEntry>>,
     replayed_row_count: usize,
     config: RecoveryConfig,
+}
+
+struct FloatScanCacheEntry {
+    manifest_generation: u64,
+    issued_through: Option<IngestSeq>,
+    request: ScanRequest,
+    field: String,
+    result: Arc<FloatSeriesScanResult>,
 }
 
 impl RecoveryStore {
@@ -147,6 +171,8 @@ impl RecoveryStore {
             sequencer,
             buffers,
             pending,
+            schema: SchemaResolver::new(),
+            float_scan_cache: Mutex::new(None),
             replayed_row_count,
             config,
         })
@@ -264,6 +290,18 @@ impl RecoveryStore {
         }
         drop(cutoffs);
         self.write_validated_batch(rows, qualification)
+    }
+
+    /// Returns the durable hard-reject cutoff used by the shared ingest policy.
+    ///
+    /// This exposes only the effective cutoff; O3 remains an ingestion-layer
+    /// concern and is not applied by direct storage APIs.
+    pub fn retention_reject_cutoff(
+        &self,
+        measurement: &str,
+        now: Timestamp,
+    ) -> Result<Option<Timestamp>> {
+        self.retention.reject_cutoff(measurement, now)
     }
 
     fn write_validated_batch(
@@ -470,6 +508,26 @@ impl RecoveryStore {
         self.buffers.get(measurement)
     }
 
+    /// Resolves the current durable-plus-pending schema for one measurement.
+    pub fn measurement_schema(&self, measurement: &str) -> Result<MeasurementSchema> {
+        self.schema.resolve(
+            &self.manifest.state()?,
+            self.manifest.segments_dir(),
+            measurement,
+            self.buffers.get(measurement),
+        )
+    }
+
+    /// Lists durable and pending measurement names in deterministic order.
+    pub fn measurement_names(&self) -> Result<Vec<String>> {
+        Ok(self.schema.measurement_names(
+            &self.manifest.state()?,
+            self.buffers
+                .iter()
+                .filter_map(|(name, state)| (state.row_count() > 0).then_some(name)),
+        ))
+    }
+
     /// Returns the WAL entry size limit for admission-time qualification.
     pub fn wal_max_entry_bytes(&self) -> usize {
         self.config.wal.max_entry_bytes()
@@ -500,5 +558,117 @@ impl RecoveryStore {
         }
         self.pending.clear();
         Ok(())
+    }
+
+    fn cached_float_scan(
+        &self,
+        manifest_generation: u64,
+        issued_through: Option<IngestSeq>,
+        request: &ScanRequest,
+        field: &str,
+    ) -> Result<Option<Arc<FloatSeriesScanResult>>> {
+        let cache = self.float_scan_cache.lock().map_err(|_| {
+            TsmError::Corruption("float-series scan cache lock is poisoned".to_string())
+        })?;
+        Ok(cache.as_ref().and_then(|entry| {
+            (entry.manifest_generation == manifest_generation
+                && entry.issued_through == issued_through
+                && entry.request == *request
+                && entry.field == field)
+                .then(|| Arc::clone(&entry.result))
+        }))
+    }
+
+    fn store_float_scan(
+        &self,
+        manifest_generation: u64,
+        issued_through: Option<IngestSeq>,
+        request: &ScanRequest,
+        field: &str,
+        result: Arc<FloatSeriesScanResult>,
+    ) -> Result<Arc<FloatSeriesScanResult>> {
+        let mut cache = self.float_scan_cache.lock().map_err(|_| {
+            TsmError::Corruption("float-series scan cache lock is poisoned".to_string())
+        })?;
+        *cache = Some(FloatScanCacheEntry {
+            manifest_generation,
+            issued_through,
+            request: request.clone(),
+            field: field.to_string(),
+            result: Arc::clone(&result),
+        });
+        Ok(result)
+    }
+}
+
+impl StorageReader for RecoveryStore {
+    fn scan(&self, request: &ScanRequest) -> Result<ScanResult> {
+        let manifest = self.manifest.state()?;
+        let durable = ManifestStorageReader::new(
+            &manifest,
+            self.manifest.segments_dir(),
+            self.config.storage_reader,
+        )
+        .scan(request)?;
+        let pending = self
+            .pending
+            .get(request.measurement())
+            .map_or(&[][..], Vec::as_slice);
+        merge_pending_rows(durable, pending, request)
+    }
+
+    fn try_scan_float_series(
+        &self,
+        request: &ScanRequest,
+        field: &str,
+    ) -> Result<Option<Arc<FloatSeriesScanResult>>> {
+        let manifest = self.manifest.state()?;
+        let issued_through = self.sequencer.highest_issued();
+        if let Some(cached) =
+            self.cached_float_scan(manifest.generation(), issued_through, request, field)?
+        {
+            return Ok(Some(cached));
+        }
+        let Some(durable) = ManifestStorageReader::new(
+            &manifest,
+            self.manifest.segments_dir(),
+            self.config.storage_reader,
+        )
+        .try_scan_float_series(request, field)?
+        else {
+            return Ok(None);
+        };
+        let pending = self
+            .pending
+            .get(request.measurement())
+            .map_or(&[][..], Vec::as_slice);
+        let result = if pending.is_empty() {
+            Some(durable)
+        } else {
+            let durable = match Arc::try_unwrap(durable) {
+                Ok(durable) => durable,
+                Err(shared) => (*shared).clone(),
+            };
+            merge_pending_float_series(durable, pending, request, field)?.map(Arc::new)
+        };
+        result
+            .map(|result| {
+                self.store_float_scan(
+                    manifest.generation(),
+                    issued_through,
+                    request,
+                    field,
+                    result,
+                )
+            })
+            .transpose()
+    }
+
+    fn measurement_names(&self) -> Result<Vec<String>> {
+        RecoveryStore::measurement_names(self)
+    }
+
+    fn measurement_schema(&self, measurement: &str) -> Result<MeasurementSchema> {
+        RecoveryStore::measurement_schema(self, measurement)
     }
 }

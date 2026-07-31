@@ -1,7 +1,7 @@
 //! Immutable Parquet compaction and ingest-sequence deduplication.
 
 use crate::error::{Result, TsmError};
-use crate::model::{Tags, Timestamp};
+use crate::model::{SeriesKey, Timestamp};
 use crate::store::buffer::{FlushPolicy, MeasurementBuffer};
 use crate::store::manifest::{ActiveFile, ManifestStore, ManifestUpdate};
 use crate::store::parquet_reader::{ParquetReader, ParquetReaderConfig};
@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 static COMPACTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -120,7 +121,7 @@ impl Compactor {
             measurement,
         )?;
         let input_row_count = rows.len();
-        let winners = deduplicate(rows);
+        let winners = deduplicate_latest(rows);
         let min_timestamp = winners
             .values()
             .map(|row| row.row().timestamp())
@@ -175,10 +176,12 @@ impl Compactor {
     }
 }
 
-fn deduplicate(rows: Vec<SequencedRow>) -> BTreeMap<(Tags, Timestamp), SequencedRow> {
+pub(crate) fn deduplicate_latest(
+    rows: impl IntoIterator<Item = SequencedRow>,
+) -> BTreeMap<(Arc<SeriesKey>, Timestamp), SequencedRow> {
     let mut winners = BTreeMap::new();
     for row in rows {
-        let key = (row.row().series().tags().clone(), row.row().timestamp());
+        let key = (row.row().shared_series(), row.row().timestamp());
         match winners.entry(key) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(row);

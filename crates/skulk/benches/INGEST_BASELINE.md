@@ -34,7 +34,7 @@ Fixes: borrow-based batch WAL append (zero row clones, O(1) syscalls per
 batch, streamed checkpoint, no entry residency), clone-free batch
 validation, per-measurement lightweight state instead of ingest-time Arrow
 building, request-local Line Protocol series cache. On-disk format
-unchanged; all 118 tests green including crash recovery I1-I6 and RTO/RPO.
+unchanged; all 119 tests green including crash recovery I1-I6 and RTO/RPO.
 
 Remaining gap, recorded honestly: the LP 150 K/s stretch floor and the
 published 500 K/s / p99 < 10 ms targets need the shared store path below
