@@ -2,8 +2,10 @@ use sha2::Digest;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[allow(dead_code)]
 pub(crate) const NIM_PARSER_CONTRACT_VERSION: &str = "0.2.0";
 
+#[allow(dead_code)]
 pub(crate) const VENDORED_TARGETS: [&str; 4] = [
     "x86_64-unknown-linux-gnu",
     "x86_64-apple-darwin",
@@ -22,10 +24,12 @@ pub(crate) fn nim_lib_filename_for(target_os: &str) -> Result<&'static str, Stri
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn is_vendored_target(target: &str) -> bool {
     VENDORED_TARGETS.contains(&target)
 }
 
+#[allow(dead_code)]
 pub(crate) fn resolve_library_dir(
     manifest_dir: &Path,
     target: &str,
@@ -55,6 +59,7 @@ pub(crate) fn resolve_library_dir(
     Ok(vendored.join(filename).is_file().then_some(vendored))
 }
 
+#[allow(dead_code)]
 pub(crate) fn validate_contract_version_file(library_dir: &Path) -> Result<(), String> {
     let path = library_dir.join("CONTRACT_VERSION");
     let actual = fs::read_to_string(&path).map_err(|error| {
@@ -177,13 +182,28 @@ pub(crate) fn resolve_parser_target(
     target: &str,
     root: &Path,
 ) -> Result<ParserTargetResolution, String> {
+    resolve_parser_target_with_override(descriptor, mode, target, root, None)
+}
+
+#[allow(dead_code)]
+pub(crate) fn resolve_parser_target_with_override(
+    descriptor: &ParserConsumerDescriptor,
+    mode: &str,
+    target: &str,
+    root: &Path,
+    override_dir: Option<&Path>,
+) -> Result<ParserTargetResolution, String> {
     let object = descriptor
         .value
         .as_object()
         .ok_or_else(|| "parser consumer descriptor must be a JSON object".to_string())?;
     let mode_object = required_object(object, mode_for_key(mode)?)?;
-    let vendor_root = root.join(required_string(mode_object, "vendor_root")?);
-    let target_root = vendor_root.join(target);
+    let target_root = if let Some(dir) = override_dir {
+        dir.to_path_buf()
+    } else {
+        root.join(required_string(mode_object, "vendor_root")?)
+            .join(target)
+    };
     let target_os = if target.ends_with("-windows-msvc") {
         "windows"
     } else if target.ends_with("-apple-darwin") {
@@ -614,6 +634,42 @@ mod tests {
         assert_eq!(resolved.source_ref, "v0.8.1");
         assert_eq!(resolved.contract_version, "0.2.0");
         assert_eq!(resolved.library_path, library);
+
+        let override_root = root.join("override");
+        fs::create_dir_all(&override_root).unwrap();
+        let override_library = override_root.join("libalopex_sql_parser.so");
+        fs::write(&override_library, b"override-parser-bytes").unwrap();
+        fs::write(override_root.join("CONTRACT_VERSION"), "0.2.0\n").unwrap();
+        let override_digest = hex_digest(&fs::read(&override_library).unwrap());
+        fs::write(
+            override_root.join("SHA256SUMS"),
+            format!("{override_digest}  libalopex_sql_parser.so\n"),
+        )
+        .unwrap();
+        let override_resolved = resolve_parser_target_with_override(
+            &descriptor,
+            "legacy",
+            "x86_64-unknown-linux-gnu",
+            &root,
+            Some(&override_root),
+        )
+        .unwrap();
+        assert_eq!(override_resolved.library_path, override_library);
+
+        fs::write(
+            override_root.join("SHA256SUMS"),
+            "00  libalopex_sql_parser.so\n",
+        )
+        .unwrap();
+        let error = resolve_parser_target_with_override(
+            &descriptor,
+            "legacy",
+            "x86_64-unknown-linux-gnu",
+            &root,
+            Some(&override_root),
+        )
+        .unwrap_err();
+        assert!(error.contains("SHA256SUMS"), "{error}");
         fs::remove_dir_all(root).unwrap();
     }
 

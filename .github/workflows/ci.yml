@@ -10,8 +10,8 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
   RUST_BACKTRACE: 1
-  ALOPEX_NIM_PARSER_REF: v0.8.1
   NIM_SQL_PARSER_DIR: .ci/alopex/crates/alopex-sql/nim-sql-parser
+  PARSER_CONSUMER_DESCRIPTOR: crates/skulk/nim-parser/parser-consumer.json
 
 jobs:
   # Check code formatting
@@ -74,14 +74,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Read parser consumer descriptor
+        id: parser-consumer
+        shell: bash
+        run: |
+          descriptor="${GITHUB_WORKSPACE}/${PARSER_CONSUMER_DESCRIPTOR}"
+          mode="$(jq -er '.active_mode' "$descriptor")"
+          [[ "$mode" == "legacy" ]] || {
+            echo "CI source acquisition requires legacy parser mode, got $mode" >&2
+            exit 1
+          }
+          echo "source-repository=$(jq -er '.legacy.source_repository' "$descriptor")" >> "$GITHUB_OUTPUT"
+          echo "source-ref=$(jq -er '.legacy.source_ref' "$descriptor")" >> "$GITHUB_OUTPUT"
+          echo "contract-version=$(jq -er '.legacy.contract_version' "$descriptor")" >> "$GITHUB_OUTPUT"
+
       # Linux uses the checked-in, checksum-verified parser artifact. macOS
       # and Windows build the same pinned Nim source used by Alopex CI.
       - name: Checkout Alopex Nim parser source
         if: runner.os != 'Linux'
         uses: actions/checkout@v4
         with:
-          repository: alopex-db/alopex
-          ref: ${{ env.ALOPEX_NIM_PARSER_REF }}
+          repository: ${{ steps.parser-consumer.outputs.source-repository }}
+          ref: ${{ steps.parser-consumer.outputs.source-ref }}
           path: .ci/alopex
           persist-credentials: false
 
@@ -107,9 +121,14 @@ jobs:
         shell: bash
         run: |
           parser_dir="${GITHUB_WORKSPACE}/${NIM_SQL_PARSER_DIR}"
-          cp \
-            "${GITHUB_WORKSPACE}/crates/skulk/nim-parser/vendor/x86_64-unknown-linux-gnu/CONTRACT_VERSION" \
-            "${parser_dir}/CONTRACT_VERSION"
+          test -f "${parser_dir}/CONTRACT_VERSION"
+          test -f "${parser_dir}/SHA256SUMS"
+          expected_contract="${{ steps.parser-consumer.outputs.contract-version }}"
+          actual_contract="$(tr -d '\r\n' < "${parser_dir}/CONTRACT_VERSION")"
+          [[ "$actual_contract" == "$expected_contract" ]] || {
+            echo "generated parser contract $actual_contract does not match descriptor $expected_contract" >&2
+            exit 1
+          }
           echo "SKULK_NIM_PARSER_LIB_DIR=${parser_dir}" >> "$GITHUB_ENV"
 
       - name: Add Nim SQL parser to PATH
