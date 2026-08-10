@@ -1,0 +1,25 @@
+{
+  "schema": "skulk-parser-consumer-v1",
+  "active_mode": "legacy",
+  "legacy": {
+    "source_repository": "alopex-db/alopex",
+    "source_ref": "v0.8.1",
+    "contract_version": "0.2.0",
+    "vendor_root": "vendor",
+    "contract_file": "CONTRACT_VERSION",
+    "sha256sums_file": "SHA256SUMS"
+  },
+  "public_release": {
+    "alopex_version": "0.8.4",
+    "contract_version": "0.4.0",
+    "vendor_root": "vendor/v0.8.4",
+    "contract_file": "CONTRACT_VERSION",
+    "sha256sums_file": "SHA256SUMS",
+    "manifest": "vendor/v0.8.4/parser-vendor-manifest-v0.8.4.json",
+    "envelope": "vendor/v0.8.4/parser-assets-v0.8.4.json",
+    "source": {
+      "tag": "v0.8.4",
+      "tag_sha": "9a0cea1d24e7672f59cae72d9218b9cc698d9162"
+    }
+  }
+}

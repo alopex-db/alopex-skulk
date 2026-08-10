@@ -1,3 +1,4 @@
+use sha2::Digest;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -71,6 +72,340 @@ pub(crate) fn validate_contract_version_file(library_dir: &Path) -> Result<(), S
             library_dir.display()
         ))
     }
+}
+
+/// Parsed but inactive parser-consumer configuration. Task 2.0.0 prepares
+/// this API; the current build script intentionally continues to use the
+/// legacy resolver above until the activation task is complete.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct ParserConsumerDescriptor {
+    value: serde_json::Value,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParserTargetResolution {
+    pub(crate) mode: String,
+    pub(crate) target: String,
+    pub(crate) library_path: PathBuf,
+    pub(crate) contract_version: String,
+    pub(crate) source_ref: String,
+    pub(crate) manifest_path: Option<PathBuf>,
+    pub(crate) envelope_path: Option<PathBuf>,
+}
+
+#[allow(dead_code)]
+pub(crate) fn load_parser_consumer_descriptor(
+    path: &Path,
+) -> Result<ParserConsumerDescriptor, String> {
+    let bytes = fs::read(path).map_err(|error| {
+        format!(
+            "failed to read parser consumer descriptor `{}`: {error}",
+            path.display()
+        )
+    })?;
+    let value = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "failed to parse parser consumer descriptor `{}`: {error}",
+            path.display()
+        )
+    })?;
+    validate_parser_consumer_descriptor(&value)?;
+    Ok(ParserConsumerDescriptor { value })
+}
+
+#[allow(dead_code)]
+pub(crate) fn validate_parser_consumer_descriptor(value: &serde_json::Value) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "parser consumer descriptor must be a JSON object".to_string())?;
+    if required_string(object, "schema")? != "skulk-parser-consumer-v1" {
+        return Err("parser consumer descriptor has an unsupported schema".to_string());
+    }
+    if required_string(object, "active_mode")? != "legacy" {
+        return Err("parser consumer descriptor must remain inactive in legacy mode".to_string());
+    }
+
+    let legacy = required_object(object, "legacy")?;
+    for key in [
+        "source_repository",
+        "source_ref",
+        "contract_version",
+        "vendor_root",
+        "contract_file",
+        "sha256sums_file",
+    ] {
+        required_string(legacy, key)?;
+    }
+    validate_relative_path(legacy, "vendor_root")?;
+    validate_relative_filename(legacy, "contract_file")?;
+    validate_relative_filename(legacy, "sha256sums_file")?;
+
+    let public = required_object(object, "public_release")?;
+    for key in [
+        "alopex_version",
+        "contract_version",
+        "vendor_root",
+        "contract_file",
+        "sha256sums_file",
+        "manifest",
+        "envelope",
+    ] {
+        required_string(public, key)
+            .map_err(|_| format!("public_release.{key} must be a non-empty string"))?;
+    }
+    validate_relative_path(public, "vendor_root")?;
+    validate_relative_path(public, "manifest")?;
+    validate_relative_path(public, "envelope")?;
+    let source = required_object(public, "source")
+        .map_err(|_| "public_release.source must be an object".to_string())?;
+    required_string(source, "tag")
+        .map_err(|_| "public_release.source.tag must be a non-empty string".to_string())?;
+    let tag_sha = required_string(source, "tag_sha")
+        .map_err(|_| "public_release.source.tag_sha must be a non-empty string".to_string())?;
+    if tag_sha.len() != 40 || !tag_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("public_release.source.tag_sha must be a 40-character hex SHA".to_string());
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn resolve_parser_target(
+    descriptor: &ParserConsumerDescriptor,
+    mode: &str,
+    target: &str,
+    root: &Path,
+) -> Result<ParserTargetResolution, String> {
+    let object = descriptor
+        .value
+        .as_object()
+        .ok_or_else(|| "parser consumer descriptor must be a JSON object".to_string())?;
+    let mode_object = required_object(object, mode_for_key(mode)?)?;
+    let vendor_root = root.join(required_string(mode_object, "vendor_root")?);
+    let target_root = vendor_root.join(target);
+    let target_os = if target.ends_with("-windows-msvc") {
+        "windows"
+    } else if target.ends_with("-apple-darwin") {
+        "macos"
+    } else if target.ends_with("-unknown-linux-gnu") {
+        "linux"
+    } else {
+        return Err(format!("unsupported parser target `{target}`"));
+    };
+    let library_path = target_root.join(nim_lib_filename_for(target_os)?);
+    if !library_path.is_file() {
+        return Err(format!(
+            "parser target `{target}` is missing library `{}`",
+            library_path.display()
+        ));
+    }
+    let contract_file = target_root.join(required_string(mode_object, "contract_file")?);
+    let contract_version = required_string(mode_object, "contract_version")?.to_string();
+    let actual_contract = fs::read_to_string(&contract_file)
+        .map_err(|error| format!("failed to read `{}`: {error}", contract_file.display()))?;
+    if actual_contract.trim() != contract_version {
+        return Err(format!(
+            "parser target `{target}` declares contract `{}`, expected `{contract_version}`",
+            actual_contract.trim()
+        ));
+    }
+    let sums_file = target_root.join(required_string(mode_object, "sha256sums_file")?);
+    let sums = fs::read_to_string(&sums_file)
+        .map_err(|error| format!("failed to read `{}`: {error}", sums_file.display()))?;
+    let expected_digest = hex_digest(
+        &fs::read(&library_path)
+            .map_err(|error| format!("failed to read `{}`: {error}", library_path.display()))?,
+    );
+    let library_name = library_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "parser library filename is not valid UTF-8".to_string())?;
+    if !sums.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some(expected_digest.as_str()) && fields.next() == Some(library_name)
+    }) {
+        return Err(format!(
+            "SHA256SUMS for `{target}` does not bind `{library_name}`"
+        ));
+    }
+
+    let (source_ref, manifest_path, envelope_path) = if mode == "legacy" {
+        (
+            required_string(mode_object, "source_ref")?.to_string(),
+            None,
+            None,
+        )
+    } else {
+        let manifest_path = root.join(required_string(mode_object, "manifest")?);
+        let envelope_path = root.join(required_string(mode_object, "envelope")?);
+        validate_public_release_identity(mode_object, target, &manifest_path, &envelope_path)?;
+        (
+            required_string(required_object(mode_object, "source")?, "tag")?.to_string(),
+            Some(manifest_path),
+            Some(envelope_path),
+        )
+    };
+
+    Ok(ParserTargetResolution {
+        mode: mode.to_string(),
+        target: target.to_string(),
+        library_path,
+        contract_version,
+        source_ref,
+        manifest_path,
+        envelope_path,
+    })
+}
+
+#[allow(dead_code)]
+fn validate_public_release_identity(
+    descriptor: &serde_json::Map<String, serde_json::Value>,
+    target: &str,
+    manifest_path: &Path,
+    envelope_path: &Path,
+) -> Result<(), String> {
+    let manifest_bytes = fs::read(manifest_path).map_err(|error| {
+        format!(
+            "public release manifest `{}` is required: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let envelope_bytes = fs::read(envelope_path).map_err(|error| {
+        format!(
+            "public release envelope `{}` is required: {error}",
+            envelope_path.display()
+        )
+    })?;
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| format!("invalid public release manifest: {error}"))?;
+    let envelope: serde_json::Value = serde_json::from_slice(&envelope_bytes)
+        .map_err(|error| format!("invalid public release envelope: {error}"))?;
+    let expected_version = required_string(descriptor, "alopex_version")?;
+    let expected_contract = required_string(descriptor, "contract_version")?;
+    if manifest
+        .get("alopex_version")
+        .and_then(|value| value.as_str())
+        != Some(expected_version)
+        || manifest
+            .get("contract_version")
+            .and_then(|value| value.as_str())
+            != Some(expected_contract)
+    {
+        return Err("public release manifest does not match descriptor identity".to_string());
+    }
+    if envelope
+        .get("alopex_version")
+        .and_then(|value| value.as_str())
+        != Some(expected_version)
+        || envelope
+            .get("contract_version")
+            .and_then(|value| value.as_str())
+            != Some(expected_contract)
+    {
+        return Err("public release envelope does not match descriptor identity".to_string());
+    }
+    let expected_source = required_object(descriptor, "source")?;
+    let envelope_source = envelope
+        .get("source")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| "public release envelope is missing source identity".to_string())?;
+    if envelope_source.get("tag").and_then(|value| value.as_str())
+        != expected_source.get("tag").and_then(|value| value.as_str())
+        || envelope_source
+            .get("tag_sha")
+            .and_then(|value| value.as_str())
+            != expected_source
+                .get("tag_sha")
+                .and_then(|value| value.as_str())
+    {
+        return Err(
+            "public release envelope source identity does not match descriptor".to_string(),
+        );
+    }
+    let target_record = manifest
+        .get("assets")
+        .and_then(|value| value.as_array())
+        .and_then(|assets| {
+            assets
+                .iter()
+                .find(|asset| asset.get("target").and_then(|value| value.as_str()) == Some(target))
+        })
+        .ok_or_else(|| format!("public release manifest has no target `{target}`"))?;
+    if target_record.get("target").and_then(|value| value.as_str()) != Some(target) {
+        return Err(format!(
+            "public release target identity mismatch for `{target}`"
+        ));
+    }
+    Ok(())
+}
+
+fn mode_for_key(mode: &str) -> Result<&'static str, String> {
+    match mode {
+        "legacy" => Ok("legacy"),
+        "public_release" => Ok("public_release"),
+        unsupported => Err(format!("unsupported parser consumer mode `{unsupported}`")),
+    }
+}
+
+fn required_object<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, String> {
+    object
+        .get(key)
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| format!("parser consumer descriptor requires object `{key}`"))
+}
+
+fn required_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<&'a str, String> {
+    object
+        .get(key)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("parser consumer descriptor requires non-empty string `{key}`"))
+}
+
+fn validate_relative_path(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<(), String> {
+    let value = required_string(object, key)?;
+    let path = Path::new(value);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(format!(
+            "parser consumer descriptor path `{key}` must be relative and contained"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_relative_filename(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<(), String> {
+    validate_relative_path(object, key)?;
+    let value = required_string(object, key)?;
+    if value.contains('/') || value.contains('\\') {
+        return Err(format!(
+            "parser consumer descriptor filename `{key}` must be a basename"
+        ));
+    }
+    Ok(())
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -227,5 +562,114 @@ mod tests {
 
         assert_eq!(descriptor["contract_version"], NIM_PARSER_CONTRACT_VERSION);
         assert_eq!(digest.len(), 32);
+    }
+
+    #[test]
+    fn inactive_descriptor_resolves_exact_legacy_target_identity() {
+        let root = scratch_dir("descriptor-legacy");
+        let target_dir = root.join("vendor/x86_64-unknown-linux-gnu");
+        fs::create_dir_all(&target_dir).unwrap();
+        let library = target_dir.join("libalopex_sql_parser.so");
+        fs::write(&library, b"legacy-parser-bytes").unwrap();
+        fs::write(target_dir.join("CONTRACT_VERSION"), "0.2.0\n").unwrap();
+        let digest = hex_digest(&fs::read(&library).unwrap());
+        fs::write(
+            target_dir.join("SHA256SUMS"),
+            format!("{digest}  libalopex_sql_parser.so\n"),
+        )
+        .unwrap();
+        let descriptor_path = root.join("parser-consumer.json");
+        fs::write(
+            &descriptor_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "skulk-parser-consumer-v1",
+                "active_mode": "legacy",
+                "legacy": {
+                    "source_repository": "alopex-db/alopex",
+                    "source_ref": "v0.8.1",
+                    "contract_version": "0.2.0",
+                    "vendor_root": "vendor",
+                    "contract_file": "CONTRACT_VERSION",
+                    "sha256sums_file": "SHA256SUMS"
+                },
+                "public_release": {
+                    "alopex_version": "0.8.4",
+                    "contract_version": "0.4.0",
+                    "vendor_root": "vendor/v0.8.4",
+                    "contract_file": "CONTRACT_VERSION",
+                    "sha256sums_file": "SHA256SUMS",
+                    "manifest": "vendor/v0.8.4/parser-vendor-manifest-v0.8.4.json",
+                    "envelope": "vendor/v0.8.4/parser-assets-v0.8.4.json",
+                    "source": {"tag": "v0.8.4", "tag_sha": "9a0cea1d24e7672f59cae72d9218b9cc698d9162"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let descriptor = load_parser_consumer_descriptor(&descriptor_path).unwrap();
+        let resolved =
+            resolve_parser_target(&descriptor, "legacy", "x86_64-unknown-linux-gnu", &root)
+                .unwrap();
+        assert_eq!(resolved.source_ref, "v0.8.1");
+        assert_eq!(resolved.contract_version, "0.2.0");
+        assert_eq!(resolved.library_path, library);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tracked_parser_consumer_descriptor_is_valid_and_stays_inactive() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("nim-parser")
+            .join("parser-consumer.json");
+        let descriptor = load_parser_consumer_descriptor(&path).unwrap();
+        assert_eq!(descriptor.value["active_mode"].as_str(), Some("legacy"));
+        assert_eq!(
+            descriptor.value["legacy"]["source_ref"].as_str(),
+            Some("v0.8.1")
+        );
+    }
+
+    #[test]
+    fn inactive_descriptor_rejects_public_release_without_envelope() {
+        let root = scratch_dir("descriptor-public-missing-envelope");
+        let descriptor_path = root.join("parser-consumer.json");
+        fs::write(
+            &descriptor_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "skulk-parser-consumer-v1",
+                "active_mode": "legacy",
+                "legacy": {
+                    "source_repository": "alopex-db/alopex",
+                    "source_ref": "v0.8.1",
+                    "contract_version": "0.2.0",
+                    "vendor_root": "vendor",
+                    "contract_file": "CONTRACT_VERSION",
+                    "sha256sums_file": "SHA256SUMS"
+                },
+                "public_release": {
+                    "alopex_version": "0.8.4",
+                    "contract_version": "0.4.0",
+                    "vendor_root": "vendor/v0.8.4",
+                    "contract_file": "CONTRACT_VERSION",
+                    "sha256sums_file": "SHA256SUMS",
+                    "manifest": "vendor/v0.8.4/parser-vendor-manifest-v0.8.4.json",
+                    "source": {"tag": "v0.8.4", "tag_sha": "9a0cea1d24e7672f59cae72d9218b9cc698d9162"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = load_parser_consumer_descriptor(&descriptor_path).unwrap_err();
+        assert!(error.contains("public_release.envelope"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn hex_digest(bytes: &[u8]) -> String {
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 }
