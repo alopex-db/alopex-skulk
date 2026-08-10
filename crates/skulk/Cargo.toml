@@ -57,7 +57,14 @@ crc32fast = { workspace = true }
 fs2 = "0.4"
 xxhash-rust = { workspace = true }
 
+[build-dependencies]
+# Keep build.rs independent from normal runtime dependencies.
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
 [dev-dependencies]
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }

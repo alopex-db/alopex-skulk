@@ -76,6 +76,7 @@ pub(crate) fn validate_contract_version_file(library_dir: &Path) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
     use std::fs;
     use std::path::PathBuf;
 
@@ -213,5 +214,18 @@ mod tests {
         .unwrap();
         validate_contract_version_file(&root).unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn build_support_test_target_can_use_descriptor_and_sha_dependencies() {
+        let descriptor = serde_json::json!({
+            "contract_version": NIM_PARSER_CONTRACT_VERSION,
+            "target": "x86_64-unknown-linux-gnu",
+        });
+        let encoded = serde_json::to_vec(&descriptor).unwrap();
+        let digest = sha2::Sha256::digest(&encoded);
+
+        assert_eq!(descriptor["contract_version"], NIM_PARSER_CONTRACT_VERSION);
+        assert_eq!(digest.len(), 32);
     }
 }
