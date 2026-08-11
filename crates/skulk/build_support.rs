@@ -259,7 +259,14 @@ pub(crate) fn resolve_parser_target_with_override(
     } else {
         let manifest_path = root.join(required_string(mode_object, "manifest")?);
         let envelope_path = root.join(required_string(mode_object, "envelope")?);
-        validate_public_release_identity(mode_object, target, &manifest_path, &envelope_path)?;
+        validate_public_release_identity(
+            mode_object,
+            target,
+            &manifest_path,
+            &envelope_path,
+            &library_path,
+            &expected_digest,
+        )?;
         (
             required_string(required_object(mode_object, "source")?, "tag")?.to_string(),
             Some(manifest_path),
@@ -284,6 +291,8 @@ fn validate_public_release_identity(
     target: &str,
     manifest_path: &Path,
     envelope_path: &Path,
+    library_path: &Path,
+    library_digest: &str,
 ) -> Result<(), String> {
     let manifest_bytes = fs::read(manifest_path).map_err(|error| {
         format!(
@@ -352,6 +361,74 @@ fn validate_public_release_identity(
                 .find(|asset| asset.get("target").and_then(|value| value.as_str()) == Some(target))
         })
         .ok_or_else(|| format!("public release manifest has no target `{target}`"))?;
+    let library_record = target_record
+        .get("library")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| format!("public release manifest has no library for `{target}`"))?;
+    if library_record
+        .get("sha256")
+        .and_then(|value| value.as_str())
+        != Some(library_digest)
+    {
+        return Err(format!(
+            "public release manifest library digest does not match `{target}`"
+        ));
+    }
+    let library_size = fs::metadata(library_path)
+        .map_err(|error| format!("failed to stat `{}`: {error}", library_path.display()))?
+        .len();
+    if library_record.get("size").and_then(|value| value.as_u64()) != Some(library_size) {
+        return Err(format!(
+            "public release manifest library size does not match `{target}`"
+        ));
+    }
+    let envelope_manifest = envelope
+        .get("manifest")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| "public release envelope is missing manifest binding".to_string())?;
+    let manifest_name = manifest_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "public release manifest filename is not valid UTF-8".to_string())?;
+    let manifest_digest = hex_digest(&manifest_bytes);
+    if envelope_manifest
+        .get("filename")
+        .and_then(|value| value.as_str())
+        != Some(manifest_name)
+        || envelope_manifest
+            .get("sha256")
+            .and_then(|value| value.as_str())
+            != Some(manifest_digest.as_str())
+        || envelope_manifest
+            .get("size")
+            .and_then(|value| value.as_u64())
+            != Some(manifest_bytes.len() as u64)
+    {
+        return Err(
+            "public release envelope manifest binding does not match local manifest".to_string(),
+        );
+    }
+    let envelope_asset = envelope
+        .get("assets")
+        .and_then(|value| value.as_array())
+        .and_then(|assets| {
+            assets
+                .iter()
+                .find(|asset| asset.get("target").and_then(|value| value.as_str()) == Some(target))
+        })
+        .ok_or_else(|| format!("public release envelope has no target `{target}`"))?;
+    let archive_record = target_record
+        .get("archive")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| format!("public release manifest has no archive for `{target}`"))?;
+    if envelope_asset.get("filename") != archive_record.get("filename")
+        || envelope_asset.get("sha256") != archive_record.get("sha256")
+        || envelope_asset.get("size") != archive_record.get("size")
+    {
+        return Err(format!(
+            "public release envelope archive binding does not match `{target}`"
+        ));
+    }
     if target_record.get("target").and_then(|value| value.as_str()) != Some(target) {
         return Err(format!(
             "public release target identity mismatch for `{target}`"
