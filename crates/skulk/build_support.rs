@@ -687,6 +687,21 @@ mod tests {
     }
 
     #[test]
+    fn staged_public_descriptor_resolves_every_target_offline() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("nim-parser");
+        let descriptor =
+            load_parser_consumer_descriptor(&root.join("parser-consumer.json")).unwrap();
+        for target in VENDORED_TARGETS {
+            let resolved = resolve_parser_target(&descriptor, "public_release", target, &root)
+                .unwrap_or_else(|error| panic!("{target}: {error}"));
+            assert_eq!(resolved.contract_version, "0.4.0");
+            assert_eq!(resolved.target, target);
+            assert!(resolved.manifest_path.is_some());
+            assert!(resolved.envelope_path.is_some());
+        }
+    }
+
+    #[test]
     fn inactive_descriptor_rejects_public_release_without_envelope() {
         let root = scratch_dir("descriptor-public-missing-envelope");
         let descriptor_path = root.join("parser-consumer.json");
