@@ -340,7 +340,7 @@ mod tests {
         assert!(validate_contract_version(EXPECTED_CONTRACT_VERSION).is_ok());
         assert_eq!(
             validate_contract_version("9.9.9").unwrap_err(),
-            "expected parser contract 0.2.0, got 9.9.9"
+            format!("expected parser contract {EXPECTED_CONTRACT_VERSION}, got 9.9.9")
         );
     }
 

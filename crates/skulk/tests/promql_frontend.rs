@@ -234,7 +234,10 @@ fn rejects_excessive_nesting_and_interior_nul_without_panicking() {
 
 #[test]
 fn verifies_the_runtime_parser_contract_version() {
-    assert_eq!(parser_contract_version().unwrap(), "0.2.0");
+    assert_eq!(
+        parser_contract_version().unwrap(),
+        env!("SKULK_NIM_PARSER_CONTRACT_VERSION")
+    );
 }
 
 proptest! {
