@@ -1,6 +1,6 @@
 {
   "schema": "skulk-parser-consumer-v1",
-  "active_mode": "legacy",
+  "active_mode": "public_release",
   "legacy": {
     "source_repository": "alopex-db/alopex",
     "source_ref": "v0.8.1",

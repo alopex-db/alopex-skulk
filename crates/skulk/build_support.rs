@@ -128,8 +128,9 @@ pub(crate) fn validate_parser_consumer_descriptor(value: &serde_json::Value) -> 
     if required_string(object, "schema")? != "skulk-parser-consumer-v1" {
         return Err("parser consumer descriptor has an unsupported schema".to_string());
     }
-    if required_string(object, "active_mode")? != "legacy" {
-        return Err("parser consumer descriptor must remain inactive in legacy mode".to_string());
+    let active_mode = required_string(object, "active_mode")?;
+    if !matches!(active_mode, "legacy" | "public_release") {
+        return Err("parser consumer descriptor has an unsupported active mode".to_string());
     }
 
     let legacy = required_object(object, "legacy")?;
@@ -751,16 +752,16 @@ mod tests {
     }
 
     #[test]
-    fn tracked_parser_consumer_descriptor_is_valid_and_stays_inactive() {
+    fn tracked_parser_consumer_descriptor_is_valid_and_active() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("nim-parser")
             .join("parser-consumer.json");
         let descriptor = load_parser_consumer_descriptor(&path).unwrap();
-        assert_eq!(descriptor.value["active_mode"].as_str(), Some("legacy"));
         assert_eq!(
-            descriptor.value["legacy"]["source_ref"].as_str(),
-            Some("v0.8.1")
+            descriptor.value["active_mode"].as_str(),
+            Some("public_release")
         );
+        assert!(descriptor.value["public_release"]["alopex_version"].is_string());
     }
 
     #[test]
