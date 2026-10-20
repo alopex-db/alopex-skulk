@@ -867,7 +867,7 @@ pub(super) fn sort(input: OperatorValue, keys: &[SortKey]) -> Result<OperatorVal
 
 fn compare_sort_keys(left: &[TableValue], right: &[TableValue], keys: &[SortKey]) -> Ordering {
     for ((left, right), key) in left.iter().zip(right).zip(keys) {
-        let nulls_first = key.nulls_first.map_or(key.descending, |value| value);
+        let nulls_first = key.nulls_first.unwrap_or(key.descending);
         let ordering = match (left.is_null(), right.is_null()) {
             (true, true) => Ordering::Equal,
             (true, false) => {
