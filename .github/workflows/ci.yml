@@ -139,6 +139,11 @@ jobs:
         run: cargo test --all-features
         working-directory: crates/skulk
 
+      - name: Run library tests with one harness thread
+        if: runner.os != 'Linux'
+        run: cargo test --lib --all-features -- --test-threads=1
+        working-directory: crates/skulk
+
       - name: Run doc tests
         run: cargo test --doc
         working-directory: crates/skulk

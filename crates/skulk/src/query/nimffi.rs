@@ -4,7 +4,8 @@ use serde::de::DeserializeOwned;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::io::Cursor;
 use std::slice;
-use std::sync::{Once, OnceLock};
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::OnceLock;
 
 const MAX_AST_PAYLOAD_BYTES: usize = 8 << 20;
 const MAX_DIAGNOSTIC_BYTES: usize = 64 << 10;
@@ -37,8 +38,21 @@ unsafe extern "C" {
     fn alopex_parser_version() -> *const c_char;
 }
 
-static INIT: Once = Once::new();
-static CONTRACT_VERSION: OnceLock<std::result::Result<String, String>> = OnceLock::new();
+// Nim's emulated TLS is registered by initialization only on that thread.
+// Keep the worker and its allocator alive for the process lifetime.
+static PARSER: OnceLock<std::result::Result<ParserWorker, String>> = OnceLock::new();
+
+struct ParserWorker {
+    version: String,
+    requests: SyncSender<ParseRequest>,
+}
+
+struct ParseRequest {
+    language: ParserLanguage,
+    input: CString,
+    length: c_int,
+    reply: SyncSender<Result<Vec<u8>>>,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ParserLanguage {
@@ -83,7 +97,23 @@ where
         ))
     })?;
 
-    initialize();
+    let (reply, response) = sync_channel(0);
+    parser_worker()?
+        .requests
+        .send(ParseRequest {
+            language,
+            input,
+            length,
+            reply,
+        })
+        .map_err(|_| TsmError::FfiContract("parser worker disconnected".to_string()))?;
+    let payload = response
+        .recv()
+        .map_err(|_| TsmError::FfiContract("parser worker disconnected".to_string()))??;
+    decode_payload(&payload)
+}
+
+fn parse_owned(language: ParserLanguage, input: &CStr, length: c_int) -> Result<Vec<u8>> {
     let raw = unsafe {
         match language {
             #[cfg(feature = "promql")]
@@ -95,7 +125,7 @@ where
     let result = OwnedParseResult(raw);
 
     match result.0.kind {
-        0 => decode_payload(result.success_payload()?),
+        0 => Ok(result.success_payload()?.to_vec()),
         1 => {
             let diagnostic = result.error_diagnostic()?;
             Err(diagnostic_to_error(language, diagnostic))
@@ -107,21 +137,44 @@ where
 }
 
 pub(crate) fn checked_contract_version() -> Result<&'static str> {
-    let checked = CONTRACT_VERSION.get_or_init(read_and_validate_contract_version);
-    match checked {
-        Ok(version) => Ok(version.as_str()),
+    Ok(parser_worker()?.version.as_str())
+}
+
+fn parser_worker() -> Result<&'static ParserWorker> {
+    match PARSER.get_or_init(start_parser_worker) {
+        Ok(worker) => Ok(worker),
         Err(message) => Err(TsmError::FfiContract(message.clone())),
     }
 }
 
-fn initialize() {
-    INIT.call_once(|| unsafe {
-        alopex_parser_init();
-    });
+fn start_parser_worker() -> std::result::Result<ParserWorker, String> {
+    let (requests, incoming) = sync_channel::<ParseRequest>(0);
+    let (startup, initialized) = sync_channel(0);
+    std::thread::Builder::new()
+        .name("skulk-nim-parser".to_string())
+        .spawn(move || {
+            // The library constructor initializes its loading thread; this
+            // initializer registers the worker's TLS before any FFI calls.
+            unsafe { alopex_parser_init() };
+            let version = read_and_validate_contract_version();
+            let valid = version.is_ok();
+            if startup.send(version).is_err() || !valid {
+                return;
+            }
+            for request in incoming {
+                let result = parse_owned(request.language, &request.input, request.length);
+                // A dropped caller must not end the process-wide parser worker.
+                let _ = request.reply.send(result);
+            }
+        })
+        .map_err(|error| format!("could not start parser worker: {error}"))?;
+    let version = initialized
+        .recv()
+        .map_err(|_| "parser worker disconnected during initialization".to_string())??;
+    Ok(ParserWorker { version, requests })
 }
 
 fn read_and_validate_contract_version() -> std::result::Result<String, String> {
-    initialize();
     let pointer = unsafe { alopex_parser_version() };
     if pointer.is_null() {
         return Err("alopex_parser_version returned a null pointer".to_string());
@@ -321,6 +374,63 @@ mod tests {
 
     #[derive(Debug, Deserialize, Serialize)]
     struct Nested(Vec<Nested>);
+
+    #[test]
+    fn parser_survives_short_lived_concurrent_callers_and_process_exit() {
+        const CHILD: &str = "SKULK_PARSER_THREAD_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "query::nimffi::tests::parser_survives_short_lived_concurrent_callers_and_process_exit",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "parser child failed: {status}");
+            return;
+        }
+
+        // Finish the initializing caller before starting other foreign threads.
+        std::thread::spawn(exercise_parser).join().unwrap();
+        for _ in 0..4 {
+            let callers: Vec<_> = (0..8)
+                .map(|_| std::thread::spawn(exercise_parser))
+                .collect();
+            for caller in callers {
+                caller.join().unwrap();
+            }
+        }
+    }
+
+    fn exercise_parser() {
+        let languages = [
+            #[cfg(feature = "promql")]
+            (ParserLanguage::PromQl, "up", "sum("),
+            #[cfg(feature = "sql-ts")]
+            (
+                ParserLanguage::SqlTs,
+                "SELECT value FROM cpu",
+                "SELECT FROM",
+            ),
+        ];
+        for (language, valid, invalid) in languages {
+            for _ in 0..8 {
+                let ast: serde_json::Value =
+                    parse_with_limits(language, valid, ParsingLimits::DEFAULT).unwrap();
+                assert!(!ast.is_null());
+                assert!(matches!(
+                    parse_with_limits::<serde_json::Value>(
+                        language,
+                        invalid,
+                        ParsingLimits::DEFAULT
+                    ),
+                    Err(TsmError::Parse { .. })
+                ));
+            }
+        }
+    }
 
     #[test]
     fn input_validation_runs_without_ffi_or_panics() {
